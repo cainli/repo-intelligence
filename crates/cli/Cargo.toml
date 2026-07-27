@@ -12,6 +12,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 repo-intelligence-analysis = { path = "../analysis" }
+repo-intelligence-config = { path = "../config" }
 repo-intelligence-graph = { path = "../graph" }
 repo-intelligence-mcp = { path = "../mcp" }
 repo-intelligence-model = { path = "../model" }

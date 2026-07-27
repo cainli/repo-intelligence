@@ -3,21 +3,13 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
+pub use repo_intelligence_config::{AnalysisConfig, IndexerConfig};
 use repo_intelligence_graph::GraphStore;
 use repo_intelligence_model::{
     ChangeOperation, ChangeRequest, Edge, EdgeKind, Entity, EntityKind, EvidenceClass, GraphPatch,
     ImpactFinding, ImpactReport, SearchQuery, TraverseQuery,
 };
-use repo_intelligence_source::discover;
-
-/// Default page size for `analyze_change` when the caller omits `limit`. Keeps a
-/// single high-fan-out change (e.g. removing a widely-referenced field) from
-/// producing millions of characters of JSON the client cannot consume.
-const DEFAULT_IMPACT_LIMIT: usize = 100;
-/// Hard ceiling on `limit` to bound worst-case result volume.
-const MAX_IMPACT_LIMIT: usize = 500;
-/// Upper bound on the internal search fan-out used to populate a page.
-const MAX_SEARCH_LIMIT: usize = 1_000;
+use repo_intelligence_source::discover_with_config;
 
 #[derive(Clone, Debug, Default)]
 pub struct ScanSummary {
@@ -69,6 +61,21 @@ impl WorkspaceIndexer {
         &self,
         root: &Path,
         store: &mut dyn GraphStore,
+        report: F,
+    ) -> Result<ScanSummary>
+    where
+        F: FnMut(ScanProgress),
+    {
+        self.scan_with_config(root, store, &IndexerConfig::default(), report)
+    }
+
+    /// 按 `IndexerConfig` 扫描并索引:发现阶段用 `config.discovery`,
+    /// 语义提取用 `config.semantics`。
+    pub fn scan_with_config<F>(
+        &self,
+        root: &Path,
+        store: &mut dyn GraphStore,
+        config: &IndexerConfig,
         mut report: F,
     ) -> Result<ScanSummary>
     where
@@ -82,7 +89,7 @@ impl WorkspaceIndexer {
             current_path: None,
             elapsed_ms: 0,
         });
-        let files = discover(root)?;
+        let files = discover_with_config(root, &config.discovery)?;
         report(ScanProgress {
             phase: ScanPhase::Discovering,
             processed: files.len(),
@@ -103,7 +110,7 @@ impl WorkspaceIndexer {
                 current_path: Some(file.relative_path.to_string_lossy().to_string()),
                 elapsed_ms: started.elapsed().as_millis(),
             });
-            let patch = repo_intelligence_semantics::extract(file)?;
+            let patch = repo_intelligence_semantics::extract_with_config(file, &config.semantics)?;
             summary.entities_indexed += patch.add_entities.len();
             summary.edges_indexed += patch.add_edges.len();
             combined.add_entities.extend(patch.add_entities);
@@ -282,11 +289,20 @@ fn segment_suffix_align(call_path: &str, endpoint_path: &str) -> bool {
 
 pub struct ImpactAnalyzer<'a> {
     store: &'a dyn GraphStore,
+    analysis: AnalysisConfig,
 }
 
 impl<'a> ImpactAnalyzer<'a> {
     pub fn new(store: &'a dyn GraphStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            analysis: AnalysisConfig::default(),
+        }
+    }
+
+    /// 用指定 `AnalysisConfig` 构造(分页上限等从配置读)。
+    pub fn with_config(store: &'a dyn GraphStore, analysis: AnalysisConfig) -> Self {
+        Self { store, analysis }
     }
 
     pub fn analyze(&self, change: &ChangeRequest) -> Result<ImpactReport> {
@@ -296,8 +312,8 @@ impl<'a> ImpactAnalyzer<'a> {
             .ok_or_else(|| anyhow!("change request is missing the source field"))?;
         let limit = change
             .limit
-            .unwrap_or(DEFAULT_IMPACT_LIMIT)
-            .clamp(1, MAX_IMPACT_LIMIT);
+            .unwrap_or(self.analysis.default_impact_limit)
+            .clamp(1, self.analysis.max_impact_limit);
         let offset = change.offset.unwrap_or(0);
         let depth = change
             .depth
@@ -310,7 +326,7 @@ impl<'a> ImpactAnalyzer<'a> {
         // bound (surfaced as an open question below).
         let matches = self
             .store
-            .search(SearchQuery::new(source_name).with_limit(MAX_SEARCH_LIMIT))?;
+            .search(SearchQuery::new(source_name).with_limit(self.analysis.max_search_limit))?;
         // Only exact-name matches are real impact targets; substring hits are
         // coincidence (e.g. a table named `customer_name_id`).
         let mut candidates: Vec<Entity> = matches
@@ -410,9 +426,10 @@ impl<'a> ImpactAnalyzer<'a> {
                 confidence,
             });
         }
-        if total >= MAX_SEARCH_LIMIT {
+        if total >= self.analysis.max_search_limit {
             report.open_questions.push(format!(
-                "Impact search reached the {MAX_SEARCH_LIMIT}-candidate cap; `total` is a lower bound and additional matches may exist beyond it."
+                "Impact search reached the {}-candidate cap; `total` is a lower bound and additional matches may exist beyond it.",
+                self.analysis.max_search_limit
             ));
         }
         if report.findings.is_empty() {

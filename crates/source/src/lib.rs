@@ -1,8 +1,10 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
+use repo_intelligence_config::DiscoveryConfig;
 use repo_intelligence_model::EntityId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,29 +57,29 @@ pub struct SourceFile {
     pub content: String,
 }
 
-/// Directory names always excluded from discovery (build artifacts, VCS, tooling
-/// worktrees, and this project's own index). Exposed so the MCP layer can echo
-/// it back in the scan health report.
-pub const EXCLUDED_DIRS: &[&str] = &[
-    "node_modules",
-    "target",
-    "build",
-    "dist",
-    ".gradle",
-    ".git",
-    ".claude",
-    ".repo-intelligence",
-];
+/// Directory names always excluded from discovery. Re-exported from the config
+/// crate (the builtin default) so the MCP layer can still echo it; a workspace
+/// `.repo-intelligence.toml` may append more via `excluded_dirs_extra`, resolved
+/// at scan time via `DiscoveryConfig::effective_excluded_dirs`.
+pub use repo_intelligence_config::DEFAULT_EXCLUDED_DIRS as EXCLUDED_DIRS;
 
 pub fn discover(root: &Path) -> Result<Vec<SourceFile>> {
+    discover_with_config(root, &DiscoveryConfig::default())
+}
+
+/// 按 `DiscoveryConfig` 发现源文件：排除 `effective_excluded_dirs()` 列出的目录，
+/// 跳过超过 `max_file_bytes` 的文件，忽略不支持的扩展名。
+pub fn discover_with_config(root: &Path, config: &DiscoveryConfig) -> Result<Vec<SourceFile>> {
+    let excluded: HashSet<String> = config.effective_excluded_dirs().into_iter().collect();
+    let max_bytes = config.max_file_bytes;
     let mut files = Vec::new();
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .git_ignore(true)
         .require_git(false)
-        .filter_entry(|entry| {
+        .filter_entry(move |entry| {
             let name = entry.file_name().to_str();
-            !name.is_some_and(|value| EXCLUDED_DIRS.contains(&value))
+            !name.is_some_and(|value| excluded.contains(value))
         })
         .build();
     for entry in walker {
@@ -91,7 +93,7 @@ pub fn discover(root: &Path) -> Result<Vec<SourceFile>> {
             continue;
         }
         let metadata = entry.metadata()?;
-        if metadata.len() > 2 * 1024 * 1024 {
+        if metadata.len() > max_bytes {
             continue;
         }
         let content = fs::read_to_string(path)

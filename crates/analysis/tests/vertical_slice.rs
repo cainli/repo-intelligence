@@ -1,6 +1,6 @@
 use std::fs;
 
-use repo_intelligence_analysis::{ImpactAnalyzer, ScanPhase, WorkspaceIndexer};
+use repo_intelligence_analysis::{ImpactAnalyzer, IndexerConfig, ScanPhase, WorkspaceIndexer};
 use repo_intelligence_graph::{GraphStore, SqliteGraphStore};
 use repo_intelligence_model::{
     ChangeRequest, EdgeKind, EntityKind, EvidenceClass, SearchQuery, TraverseQuery,
@@ -635,5 +635,75 @@ fn dependency_graph_links_module_to_declared_dependencies() {
             .iter()
             .any(|finding| finding.path.contains(&module.id)),
         "以 vue 为源的影响分析应 inbound 触达依赖它的 mos-websr 模块"
+    );
+}
+
+#[test]
+fn scan_with_config_honors_excluded_dirs_extra() {
+    // excluded_dirs_extra 是追加语义:builtin 不含 "generated",配置后该目录被排除。
+    // 这条端到端覆盖 analysis → discover 的 config 传递链。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("Keep.java"), "class Keep {}").unwrap();
+    fs::create_dir_all(dir.path().join("generated")).unwrap();
+    fs::write(dir.path().join("generated/Gen.java"), "class Gen {}").unwrap();
+
+    let mut cfg = IndexerConfig::default();
+    cfg.discovery.excluded_dirs_extra.push("generated".into());
+
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer
+        .scan_with_config(dir.path(), &mut store, &cfg, |_| {})
+        .unwrap();
+
+    assert!(
+        store
+            .search(SearchQuery::new("Gen").with_limit(10))
+            .unwrap()
+            .is_empty(),
+        "generated/ 在 excluded_dirs_extra,Gen 不应入库"
+    );
+    assert!(
+        !store
+            .search(SearchQuery::new("Keep").with_limit(10))
+            .unwrap()
+            .is_empty(),
+        "Keep.java 不在排除目录,应入库"
+    );
+}
+
+#[test]
+fn scan_with_config_honors_custom_endpoint_replacement() {
+    // custom_endpoint_annotations 是替换语义:配置只含 MyRpc 时,
+    // builtin 的 @RmbMap 不再被识别,而 @MyRpc 会。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("Svc.java"),
+        r#"
+        @RmbMap("builtinEndpoint")
+        @MyRpc("customEndpoint")
+        class Svc {}
+        "#,
+    )
+    .unwrap();
+
+    let mut cfg = IndexerConfig::default();
+    cfg.semantics.custom_endpoint_annotations = vec!["MyRpc".into()];
+
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer
+        .scan_with_config(dir.path(), &mut store, &cfg, |_| {})
+        .unwrap();
+
+    let entities = store
+        .search(SearchQuery::new("Endpoint").with_limit(20))
+        .unwrap();
+    let names: Vec<&str> = entities.iter().map(|m| m.entity.name.as_str()).collect();
+    assert!(
+        names.contains(&"customEndpoint"),
+        "配置的 @MyRpc 应被识别为 endpoint"
+    );
+    assert!(
+        !names.contains(&"builtinEndpoint"),
+        "builtin @RmbMap 被替换语义移除,不应再被识别"
     );
 }

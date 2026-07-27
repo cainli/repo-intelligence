@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use repo_intelligence_config::IndexerConfig;
 use repo_intelligence_analysis::{ImpactAnalyzer, ScanPhase, ScanProgress, WorkspaceIndexer};
 use repo_intelligence_graph::{GraphStore, SqliteGraphStore};
 use repo_intelligence_model::{ChangeRequest, SearchQuery};
@@ -108,8 +109,15 @@ fn run() -> Result<()> {
         }
         Command::Scan { workspace, format } => {
             let mut store = SqliteGraphStore::open(&cli.database)?;
-            let summary =
-                WorkspaceIndexer.scan_with_progress(&workspace, &mut store, log_scan_progress)?;
+            // 配置跟 workspace 走:从 workspace 根目录发现 .repo-intelligence.toml,
+            // 无文件则 builtin default(scan 行为与历史一致)。
+            let config = IndexerConfig::load(&workspace)?;
+            let summary = WorkspaceIndexer.scan_with_config(
+                &workspace,
+                &mut store,
+                &config,
+                log_scan_progress,
+            )?;
             emit(
                 format,
                 serde_json::json!({

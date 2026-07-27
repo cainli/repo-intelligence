@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 
 use anyhow::Result;
+use repo_intelligence_config::IndexerConfig;
 use repo_intelligence_analysis::{ImpactAnalyzer, WorkspaceIndexer};
 use repo_intelligence_graph::{GraphStore, SqliteGraphStore};
 use repo_intelligence_model::{
@@ -592,18 +593,24 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
         }
         "scan_workspace" => {
             let workspace = arguments["workspace"].as_str().unwrap_or(".");
+            let workspace_path = Path::new(workspace);
+            // 配置跟 workspace 走:从 workspace 根目录发现 .repo-intelligence.toml,
+            // 无文件则 builtin default(scan 行为与历史一致)。
+            let config = IndexerConfig::load(workspace_path)?;
             let mut store = SqliteGraphStore::open(path)?;
-            let summary = WorkspaceIndexer.scan(Path::new(workspace), &mut store)?;
-            // Echo the resulting kind distribution and the exclusion list so a
-            // caller can spot a polluted index (e.g. a worktree copy doubling
-            // every kind) from the scan result alone, without re-querying.
+            let summary =
+                WorkspaceIndexer.scan_with_config(workspace_path, &mut store, &config, |_| {})?;
+            // Echo the resulting kind distribution and the effective exclusion
+            // list (builtin + configured extras) so a caller can spot a polluted
+            // index (e.g. a worktree copy doubling every kind) from the scan
+            // result alone, without re-querying.
             let entities_by_kind = store.counts_by_kind()?;
             json!({
                 "files_indexed": summary.files_indexed,
                 "entities_indexed": summary.entities_indexed,
                 "edges_indexed": summary.edges_indexed,
                 "entities_by_kind": entities_by_kind,
-                "excluded_dirs": repo_intelligence_source::EXCLUDED_DIRS,
+                "excluded_dirs": config.discovery.effective_excluded_dirs(),
             })
         }
         "get_index_status" => {

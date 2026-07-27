@@ -1,16 +1,13 @@
 [package]
-name = "repo-intelligence-source"
+name = "repo-intelligence-config"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-blake3.workspace = true
-ignore.workspace = true
-repo-intelligence-config = { path = "../config" }
-repo-intelligence-model = { path = "../model" }
 serde.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

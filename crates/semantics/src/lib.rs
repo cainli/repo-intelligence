@@ -2,6 +2,7 @@ use std::sync::LazyLock;
 
 use anyhow::Result;
 use regex::Regex;
+use repo_intelligence_config::SemanticsConfig;
 use repo_intelligence_model::{
     Edge, EdgeKind, Entity, EntityId, EntityKind, EvidenceClass, GraphPatch,
 };
@@ -45,121 +46,6 @@ static HTTP_CALL: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// Framework-specific endpoint annotations recognized in addition to Spring
-/// MVC. The first string literal in an annotation's argument list (if any) is
-/// taken as the endpoint identifier. Add entries here to teach the indexer
-/// about in-house RPC frameworks (RMB `@RmbMap`, Dubbo, ...) so the API view
-/// and `find_endpoint` work on non-Spring-MVC services.
-const CUSTOM_ENDPOINT_ANNOTATIONS: &[&str] = &["RmbMap", "DubboService", "RpcMapping"];
-
-/// 前端属性访问中常见的非字段噪声(JS/TS 内建方法、工具函数、全大写常量)。
-/// VUE_BINDING 把任何 `a.b` 当 FrontendField,命中此集合的 b 不产出以降噪声。
-/// 这些名字与业务字段同名的概率极低,不影响贯通召回。
-const FRONTEND_NOISE: &[&str] = &[
-    "length",
-    "size",
-    "toString",
-    "valueOf",
-    "prototype",
-    "constructor",
-    "call",
-    "apply",
-    "bind",
-    "push",
-    "pop",
-    "shift",
-    "unshift",
-    "split",
-    "join",
-    "slice",
-    "splice",
-    "concat",
-    "reverse",
-    "sort",
-    "map",
-    "filter",
-    "forEach",
-    "find",
-    "findIndex",
-    "some",
-    "every",
-    "reduce",
-    "reduceRight",
-    "includes",
-    "indexOf",
-    "lastIndexOf",
-    "flat",
-    "flatMap",
-    "fill",
-    "copyWithin",
-    "floor",
-    "ceil",
-    "round",
-    "random",
-    "abs",
-    "max",
-    "min",
-    "pow",
-    "sqrt",
-    "log",
-    "exp",
-    "sign",
-    "keys",
-    "values",
-    "entries",
-    "assign",
-    "freeze",
-    "from",
-    "isArray",
-    "create",
-    "getPrototypeOf",
-    "trim",
-    "trimStart",
-    "trimEnd",
-    "replace",
-    "replaceAll",
-    "match",
-    "matchAll",
-    "search",
-    "toLowerCase",
-    "toUpperCase",
-    "charAt",
-    "charCodeAt",
-    "padStart",
-    "padEnd",
-    "startsWith",
-    "endsWith",
-    "then",
-    "catch",
-    "finally",
-    "resolve",
-    "reject",
-    "all",
-    "race",
-    "allSettled",
-    "log",
-    "error",
-    "warn",
-    "info",
-    "debug",
-    "time",
-    "timeEnd",
-    "createElement",
-    "appendChild",
-    "querySelector",
-    "querySelectorAll",
-    "getElementById",
-    "addEventListener",
-    "removeEventListener",
-    "preventDefault",
-    "stopPropagation",
-];
-
-static CUSTOM_ENDPOINT: LazyLock<Regex> = LazyLock::new(|| {
-    let alternation = CUSTOM_ENDPOINT_ANNOTATIONS.join("|");
-    Regex::new(&format!(r#"@({alternation})\b\s*(?:\(([^)]*)\))?"#)).unwrap()
-});
-
 static STRING_LITERAL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""([^"]*)""#).unwrap());
 
 // ---- MyBatis Plus 持久层(MP 3.5.7 主力 ORM:注解实体 + BaseMapper + Wrapper) ----
@@ -186,6 +72,15 @@ static MP_WRAPPER_COLUMN: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 pub fn extract(file: &SourceFile) -> Result<GraphPatch> {
+    extract_with_config(file, &SemanticsConfig::default())
+}
+
+/// 按 `SemanticsConfig` 提取语义:自研 RPC 注解与前端噪声词从配置读取,
+/// 其余框架提取(Spring/MyBatis Plus/XML/依赖图)逻辑不变。
+pub fn extract_with_config(
+    file: &SourceFile,
+    config: &SemanticsConfig,
+) -> Result<GraphPatch> {
     let path = file.relative_path.to_string_lossy().to_string();
     let file_entity = Entity::new(
         file.id.clone(),
@@ -208,10 +103,10 @@ pub fn extract(file: &SourceFile) -> Result<GraphPatch> {
     let mut entities = vec![file_entity];
     let mut edges = Vec::new();
     match file.kind {
-        FileKind::Java => extract_java(file, &path, &mut entities, &mut edges)?,
+        FileKind::Java => extract_java(file, &path, &mut entities, &mut edges, config)?,
         FileKind::Xml => extract_xml(file, &path, &mut entities, &mut edges),
         FileKind::Vue | FileKind::JavaScript | FileKind::TypeScript => {
-            extract_frontend(file, &path, &mut entities, &mut edges)
+            extract_frontend(file, &path, &mut entities, &mut edges, config)
         }
         FileKind::Gradle => extract_gradle(file, &path, &mut entities, &mut edges),
         FileKind::Toml => extract_version_catalog(file, &path, &mut entities, &mut edges),
@@ -255,6 +150,7 @@ fn extract_java(
     path: &str,
     entities: &mut Vec<Entity>,
     edges: &mut Vec<Edge>,
+    config: &SemanticsConfig,
 ) -> Result<()> {
     let parsed = JavaParser.parse(file)?;
     let syntax_confidence = if parsed.has_syntax_errors { 0.8 } else { 1.0 };
@@ -354,7 +250,7 @@ fn extract_java(
         );
         add_contained(file, path, entity, line, entities, edges);
     }
-    extract_custom_endpoints(file, path, entities, edges);
+    extract_custom_endpoints(file, path, entities, edges, config);
     extract_mybatis_plus(file, path, entities, edges);
     Ok(())
 }
@@ -471,8 +367,8 @@ fn extract_xml(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges:
 }
 
 /// 判断前端属性访问 `a.b` 的 b 是否「像业务字段」而非工具方法/常量。
-fn is_likely_field(name: &str) -> bool {
-    if FRONTEND_NOISE.contains(&name) {
+fn is_likely_field(name: &str, noise: &HashSet<String>) -> bool {
+    if noise.contains(name) {
         return false;
     }
     // 全大写(无小写字母,≥2 字符):视为常量/缩写(URL/MAX_VALUE),排除
@@ -487,7 +383,9 @@ fn extract_frontend(
     path: &str,
     entities: &mut Vec<Entity>,
     edges: &mut Vec<Edge>,
+    config: &SemanticsConfig,
 ) {
+    let noise: HashSet<String> = config.effective_frontend_noise().into_iter().collect();
     if file.kind == FileKind::Vue {
         let name = file
             .relative_path
@@ -512,7 +410,7 @@ fn extract_frontend(
     }
     for capture in VUE_BINDING.captures_iter(&file.content) {
         let name = capture.get(1).unwrap();
-        if !is_likely_field(name.as_str()) {
+        if !is_likely_field(name.as_str(), &noise) {
             continue;
         }
         let line = line_of(&file.content, name.start());
@@ -568,8 +466,21 @@ fn extract_custom_endpoints(
     path: &str,
     entities: &mut Vec<Entity>,
     edges: &mut Vec<Edge>,
+    config: &SemanticsConfig,
 ) {
-    for capture in CUSTOM_ENDPOINT.captures_iter(&file.content) {
+    let annotations: &[String] = &config.custom_endpoint_annotations;
+    if annotations.is_empty() {
+        return;
+    }
+    // 按配置的自研注解现场构建正则(替代原写死 static)。escape 以容忍
+    // 配置值含正则元字符。
+    let alternation = annotations
+        .iter()
+        .map(|annotation| regex::escape(annotation))
+        .collect::<Vec<_>>()
+        .join("|");
+    let custom_re = Regex::new(&format!(r#"@({alternation})\b\s*(?:\(([^)]*)\))?"#)).unwrap();
+    for capture in custom_re.captures_iter(&file.content) {
         let token = capture.get(0).unwrap();
         let annotation = capture.get(1).unwrap();
         let args = capture.get(2).map(|m| m.as_str()).unwrap_or("");
