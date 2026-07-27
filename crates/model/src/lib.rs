@@ -1,0 +1,376 @@
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EntityId(pub String);
+
+impl EntityId {
+    pub fn stable(
+        source_id: &str,
+        relative_path: &str,
+        kind: EntityKind,
+        qualified_name: &str,
+        discriminator: &str,
+    ) -> Self {
+        let identity = format!(
+            "{source_id}\0{relative_path}\0{}\0{qualified_name}\0{discriminator}",
+            kind.as_str()
+        );
+        Self(blake3::hash(identity.as_bytes()).to_hex().to_string())
+    }
+}
+
+impl fmt::Display for EntityId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntityKind {
+    Workspace,
+    Repository,
+    Submodule,
+    File,
+    Package,
+    Class,
+    Interface,
+    Method,
+    Field,
+    VuePage,
+    VueComponent,
+    FrontendField,
+    HttpClientCall,
+    HttpEndpoint,
+    ApiField,
+    SpringBean,
+    Mapper,
+    MapperMethod,
+    XmlStatement,
+    ResultMap,
+    SqlField,
+    Datasource,
+    Database,
+    Table,
+    Column,
+    TestCase,
+    ConfigFile,
+}
+
+impl EntityKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Workspace => "workspace",
+            Self::Repository => "repository",
+            Self::Submodule => "submodule",
+            Self::File => "file",
+            Self::Package => "package",
+            Self::Class => "class",
+            Self::Interface => "interface",
+            Self::Method => "method",
+            Self::Field => "field",
+            Self::VuePage => "vue_page",
+            Self::VueComponent => "vue_component",
+            Self::FrontendField => "frontend_field",
+            Self::HttpClientCall => "http_client_call",
+            Self::HttpEndpoint => "http_endpoint",
+            Self::ApiField => "api_field",
+            Self::SpringBean => "spring_bean",
+            Self::Mapper => "mapper",
+            Self::MapperMethod => "mapper_method",
+            Self::XmlStatement => "xml_statement",
+            Self::ResultMap => "result_map",
+            Self::SqlField => "sql_field",
+            Self::Datasource => "datasource",
+            Self::Database => "database",
+            Self::Table => "table",
+            Self::Column => "column",
+            Self::TestCase => "test_case",
+            Self::ConfigFile => "config_file",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceClass {
+    Fact,
+    Resolved,
+    Inferred,
+    RuntimeUnknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Evidence {
+    pub file: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub classification: EvidenceClass,
+    pub confidence: f32,
+    pub reason: String,
+}
+
+impl Evidence {
+    pub fn new(
+        file: impl Into<String>,
+        start_line: u32,
+        end_line: u32,
+        classification: EvidenceClass,
+        confidence: f32,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            file: file.into(),
+            start_line,
+            end_line,
+            classification,
+            confidence: confidence.clamp(0.0, 1.0),
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Entity {
+    pub id: EntityId,
+    pub kind: EntityKind,
+    pub name: String,
+    pub qualified_name: String,
+    pub metadata: serde_json::Value,
+    pub evidence: Vec<Evidence>,
+}
+
+impl Entity {
+    pub fn new(
+        id: EntityId,
+        kind: EntityKind,
+        name: impl Into<String>,
+        qualified_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            kind,
+            name: name.into(),
+            qualified_name: qualified_name.into(),
+            metadata: serde_json::Value::Null,
+            evidence: Vec::new(),
+        }
+    }
+
+    pub fn with_metadata(mut self, metadata: serde_json::Value) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    pub fn with_evidence(
+        mut self,
+        file: impl Into<String>,
+        start_line: u32,
+        end_line: u32,
+        classification: EvidenceClass,
+        confidence: f32,
+        reason: impl Into<String>,
+    ) -> Self {
+        self.evidence.push(Evidence::new(
+            file,
+            start_line,
+            end_line,
+            classification,
+            confidence,
+            reason,
+        ));
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeKind {
+    Contains,
+    Declares,
+    Calls,
+    Exposes,
+    SendsHttpRequest,
+    MatchesEndpoint,
+    HasResponseField,
+    SerializedFrom,
+    MappedFrom,
+    BindsToStatement,
+    ExecutesSql,
+    ReadsTable,
+    WritesTable,
+    ReadsColumn,
+    WritesColumn,
+    DependsOn,
+    SubmoduleOf,
+}
+
+impl EdgeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Contains => "contains",
+            Self::Declares => "declares",
+            Self::Calls => "calls",
+            Self::Exposes => "exposes",
+            Self::SendsHttpRequest => "sends_http_request",
+            Self::MatchesEndpoint => "matches_endpoint",
+            Self::HasResponseField => "has_response_field",
+            Self::SerializedFrom => "serialized_from",
+            Self::MappedFrom => "mapped_from",
+            Self::BindsToStatement => "binds_to_statement",
+            Self::ExecutesSql => "executes_sql",
+            Self::ReadsTable => "reads_table",
+            Self::WritesTable => "writes_table",
+            Self::ReadsColumn => "reads_column",
+            Self::WritesColumn => "writes_column",
+            Self::DependsOn => "depends_on",
+            Self::SubmoduleOf => "submodule_of",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Edge {
+    pub source: EntityId,
+    pub target: EntityId,
+    pub kind: EdgeKind,
+    pub evidence: Vec<Evidence>,
+}
+
+impl Edge {
+    pub fn new(source: EntityId, target: EntityId, kind: EdgeKind) -> Self {
+        Self {
+            source,
+            target,
+            kind,
+            evidence: Vec::new(),
+        }
+    }
+
+    pub fn with_evidence(
+        mut self,
+        file: impl Into<String>,
+        start_line: u32,
+        end_line: u32,
+        classification: EvidenceClass,
+        confidence: f32,
+        reason: impl Into<String>,
+    ) -> Self {
+        self.evidence.push(Evidence::new(
+            file,
+            start_line,
+            end_line,
+            classification,
+            confidence,
+            reason,
+        ));
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GraphPatch {
+    pub add_entities: Vec<Entity>,
+    pub add_edges: Vec<Edge>,
+    pub remove_entities: Vec<EntityId>,
+}
+
+impl GraphPatch {
+    pub fn add(add_entities: Vec<Entity>, add_edges: Vec<Edge>) -> Self {
+        Self {
+            add_entities,
+            add_edges,
+            remove_entities: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchQuery {
+    pub text: String,
+    pub limit: usize,
+}
+
+impl SearchQuery {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            limit: 50,
+        }
+    }
+
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraverseQuery {
+    pub start: EntityId,
+    pub outbound: bool,
+    pub max_depth: usize,
+}
+
+impl TraverseQuery {
+    pub fn outbound(start: EntityId) -> Self {
+        Self {
+            start,
+            outbound: true,
+            max_depth: 1,
+        }
+    }
+
+    pub fn with_depth(mut self, max_depth: usize) -> Self {
+        self.max_depth = max_depth;
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeOperation {
+    Add,
+    Remove,
+    Rename,
+    ChangeType,
+    ChangeNullable,
+    ChangeFormat,
+    ChangeSemantics,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeRequest {
+    pub target_kind: String,
+    pub operation: ChangeOperation,
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
+impl ChangeRequest {
+    pub fn rename_field(from: impl Into<String>, to: impl Into<String>) -> Self {
+        Self {
+            target_kind: "field".into(),
+            operation: ChangeOperation::Rename,
+            from: Some(from.into()),
+            to: Some(to.into()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ImpactFinding {
+    pub entity: Entity,
+    pub plane: String,
+    pub severity: String,
+    pub path: Vec<EntityId>,
+    pub evidence: Vec<Evidence>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ImpactReport {
+    pub findings: Vec<ImpactFinding>,
+    pub open_questions: Vec<String>,
+}

@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/model",
+  "crates/source",
+  "crates/parsing",
+  "crates/semantics",
+  "crates/graph",
+  "crates/analysis",
+  "crates/protocol",
+  "crates/mcp",
+  "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1"
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+ignore = "0.4"
+quick-xml = "0.38"
+regex = "1"
+rusqlite = { version = "0.37", features = ["bundled", "modern_sqlite"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+tree-sitter = "0.25"
+tree-sitter-java = "0.23"
+walkdir = "2"
+

@@ -1,0 +1,15 @@
+[package]
+name = "repo-intelligence-parsing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+quick-xml.workspace = true
+regex.workspace = true
+repo-intelligence-model = { path = "../model" }
+repo-intelligence-source = { path = "../source" }
+tree-sitter.workspace = true
+tree-sitter-java.workspace = true
+

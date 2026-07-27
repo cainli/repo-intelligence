@@ -1,0 +1,7 @@
+{
+  "name": "@repo-intelligence/PLATFORM",
+  "version": "0.1.0",
+  "os": ["OS"],
+  "cpu": ["ARCH"],
+  "files": ["bin/repo-intelligence"]
+}

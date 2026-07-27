@@ -1,0 +1,18 @@
+[package]
+name = "repo-intelligence-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+regex.workspace = true
+repo-intelligence-graph = { path = "../graph" }
+repo-intelligence-model = { path = "../model" }
+repo-intelligence-parsing = { path = "../parsing" }
+repo-intelligence-semantics = { path = "../semantics" }
+repo-intelligence-source = { path = "../source" }
+
+[dev-dependencies]
+tempfile.workspace = true
+

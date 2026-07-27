@@ -1,0 +1,16 @@
+{
+  "name": "@repo-intelligence/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "repo-intelligence": "./bin/cli.js"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
+

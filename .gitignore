@@ -1,0 +1,7 @@
+/target/
+/.repo-intelligence/
+/packages/npm/node_modules/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+

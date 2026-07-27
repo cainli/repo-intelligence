@@ -1,0 +1,15 @@
+[package]
+name = "repo-intelligence-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+repo-intelligence-model = { path = "../model" }
+rusqlite.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+

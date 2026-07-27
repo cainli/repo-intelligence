@@ -1,0 +1,23 @@
+[package]
+name = "repo-intelligence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "repo-intelligence"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+repo-intelligence-analysis = { path = "../analysis" }
+repo-intelligence-graph = { path = "../graph" }
+repo-intelligence-mcp = { path = "../mcp" }
+repo-intelligence-model = { path = "../model" }
+repo-intelligence-protocol = { path = "../protocol" }
+serde_json.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
