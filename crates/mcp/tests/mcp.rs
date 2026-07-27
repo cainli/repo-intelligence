@@ -115,6 +115,35 @@ fn index_status_is_bounded_for_large_graphs() {
 }
 
 #[test]
+fn index_status_reports_an_uninitialized_index() {
+    // An empty index must not masquerade as a healthy server: a zero-entity
+    // result otherwise looks like "it works", until every other tool quietly
+    // returns empty results. get_index_status flags it with `indexed: false`
+    // and a hint pointing at scan_workspace.
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    // Materialize the schema but index nothing.
+    drop(SqliteGraphStore::open(&database).unwrap());
+
+    let input = br#"{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"get_index_status","arguments":{}}}
+"#;
+    let mut output = Vec::new();
+    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database)).unwrap();
+
+    let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
+    let structured = &response["result"]["structuredContent"];
+    assert_eq!(structured["entity_count"], 0);
+    assert_eq!(structured["indexed"], false);
+    assert!(
+        structured["hint"]
+            .as_str()
+            .unwrap()
+            .contains("scan_workspace"),
+        "empty index should hint at scan_workspace, got: {structured}"
+    );
+}
+
+#[test]
 fn system_view_is_bounded_and_groups_by_kind() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("graph.sqlite");
@@ -224,7 +253,13 @@ fn system_view_filters_to_the_requested_plane() {
             "Order.customerName",
         ),
         Entity::new(
-            EntityId::stable("repo", "Api.java", EntityKind::HttpEndpoint, "GET /orders", ""),
+            EntityId::stable(
+                "repo",
+                "Api.java",
+                EntityKind::HttpEndpoint,
+                "GET /orders",
+                "",
+            ),
             EntityKind::HttpEndpoint,
             "GET /orders",
             "GET /orders",

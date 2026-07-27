@@ -5,7 +5,7 @@ use anyhow::Result;
 use repo_intelligence_analysis::{ImpactAnalyzer, WorkspaceIndexer};
 use repo_intelligence_graph::{GraphStore, SqliteGraphStore};
 use repo_intelligence_model::{ChangeRequest, SearchQuery};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Default row cap for the text-search tools when the caller omits `limit`.
 const DEFAULT_SEARCH_LIMIT: usize = 100;
@@ -235,10 +235,12 @@ fn tool_specs() -> Vec<ToolSpec> {
                 "additionalProperties": false,
                 "properties": {
                     "database": {"type": "string"},
+                    "indexed": {"type": "boolean"},
                     "entity_count": {"type": "integer", "minimum": 0},
-                    "edge_count": {"type": "integer", "minimum": 0}
+                    "edge_count": {"type": "integer", "minimum": 0},
+                    "hint": {"type": "string"}
                 },
-                "required": ["database", "entity_count", "edge_count"]
+                "required": ["database", "indexed", "entity_count", "edge_count"]
             }),
         },
     ]
@@ -298,17 +300,7 @@ pub fn serve<R: Read, W: Write>(reader: R, mut writer: W, database: Option<&Path
                 json!({"jsonrpc": "2.0", "id": id, "result": {"tools": tools}})
             }
             "ping" => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
-            "tools/call" => match call_tool(&request, database) {
-                Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-                Err(error) => json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "isError": true,
-                        "content": [{"type": "text", "text": format!("{error:#}")}]
-                    }
-                }),
-            },
+            "tools/call" => dispatch_tool_call(&request, database, &id),
             _ => json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -320,6 +312,57 @@ pub fn serve<R: Read, W: Write>(reader: R, mut writer: W, database: Option<&Path
         writer.flush()?;
     }
     Ok(())
+}
+
+/// Runs a single `tools/call`, isolating panics so one failing tool never aborts
+/// the session or starves its siblings.
+///
+/// `serve` is a single-threaded loop reading requests line by line; an
+/// unwinding panic inside `call_tool` would otherwise unwind straight out of
+/// `serve`, killing the process. Every call still queued behind the panic
+/// (i.e. every parallel sibling the client fired in the same batch) then gets
+/// no response at all and the client reports each as a generic "internal
+/// error" — while the one call already answered returns fine. Catching the
+/// unwind turns a panic into a normal MCP `isError` response, so the loop
+/// continues. The default panic hook still writes the panic + location to
+/// stderr for diagnosis.
+fn dispatch_tool_call(request: &Value, database: Option<&Path>, id: &Value) -> Value {
+    let tool_name = request["params"]["name"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_string();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        call_tool(request, database)
+    }));
+    match outcome {
+        Ok(Ok(result)) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        Ok(Err(error)) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "isError": true,
+                "content": [{"type": "text", "text": format!("{error:#}")}]
+            }
+        }),
+        Err(panic) => {
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&'static str>().copied())
+                .unwrap_or("panic with no message");
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "isError": true,
+                    "content": [{
+                        "type": "text",
+                        "text": format!("tool `{tool_name}` panicked: {message}")
+                    }]
+                }
+            })
+        }
+    }
 }
 
 fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
@@ -336,10 +379,7 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
                 .unwrap_or(DEFAULT_SEARCH_LIMIT);
             let store = SqliteGraphStore::open(path)?;
             let matches = store.search(SearchQuery::new(query).with_limit(limit))?;
-            let entities: Vec<_> = matches
-                .into_iter()
-                .map(|matched| matched.entity)
-                .collect();
+            let entities: Vec<_> = matches.into_iter().map(|matched| matched.entity).collect();
             let count = entities.len();
             // Wrap the array in an object: MCP forbids a bare array as
             // structuredContent ("expected record, received array").
@@ -366,11 +406,22 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
         "get_index_status" => {
             let store = SqliteGraphStore::open(path)?;
             let (entity_count, edge_count) = store.counts()?;
-            json!({
+            // Surface an uninitialized index explicitly: a zero-entity result
+            // otherwise looks indistinguishable from a healthy server, so a
+            // "never scanned" database reads as "working" until every other
+            // tool quietly returns empty results.
+            let indexed = entity_count > 0;
+            let mut status = json!({
                 "database": path.display().to_string(),
+                "indexed": indexed,
                 "entity_count": entity_count,
                 "edge_count": edge_count,
-            })
+            });
+            if !indexed {
+                status["hint"] =
+                    json!("index is empty; run `scan_workspace` to populate it before querying");
+            }
+            status
         }
         "show_system_view" => {
             let store = SqliteGraphStore::open(path)?;
