@@ -7,6 +7,43 @@
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-07-27
+
+### Added
+
+- **调用链追踪工具 `trace_callers` / `trace_callees`**：补齐"实体搜索≠调用链
+  追踪"的缺口（真实项目对比中，调用链还原曾靠 grep 兜底）。按精确实体名解析
+  起点，沿 `calls` 边（默认）BFS 上游/下游到 `depth`（默认 2），返回
+  `{items, edges, count, start_count}`——`S27501→S27204` 这类链路一步可得。
+  `edge_kinds` 可覆盖为 `depends_on`/`reads_table`/`writes_table` 等做其他依赖
+  追踪（DB↔SQL 等），不再需要 grep 猜。
+- `TraverseQuery` 新增 `edge_kinds` 过滤字段与 `with_kinds()` builder，BFS 可
+  限定边类型；空值保持 `analyze_change` 原"走所有边"的行为（向后兼容）。
+- **matches_endpoint 分级匹配**：前端调用与后端端点的连接从精确全等放宽为
+  分级——精确 `Resolved`(0.95)、路径后缀段对齐(吸收 baseURL/版本前缀)
+  `Inferred`(0.6)；同步放宽 `@RequestMapping`(`value=`/多路径)与前端 HTTP 调用
+  (封装 client)正则。解决"826 调用 × 537 端点仅匹配 2 条"的跨栈断链。
+- **Spring Bean 依赖注入**：`ParseOutput` 返回 tree-sitter AST(原本 parse 后
+  丢弃)；`@Autowired`/`@Resource` 字段→`SpringBean`+`DependsOn`，`@Bean` 方法
+  →`Exposes`；`@Scheduled`/`@Transactional` 作为 class metadata 标记。
+- **ImpactFinding.confidence**：finding 携带可达性置信度(路径边证据的最小值)，
+  供客户端区分精确命中与推断命中。
+- **MCP 空库可观测性**：`get_index_status` 显示规范化绝对路径；空库时
+  `analyze_change`/`search` 加 open_question，避免"零影响"被误读为"安全"。
+
+### Changed
+
+- trace 起点按精确名匹配（非子串），与 `analyze_change` 对齐，避免
+  `trace_callers("S27204")` 把 `S27204Req`/`S27204Resp` 的调用方混入。
+- trace 结果按 `qualified_name` / `(source, target, kind)` 排序，保证输出与
+  测试确定性（BFS 内部用 HashMap/HashSet，顺序本不定）。
+- `trace_callers`/`trace_callees` 起点缺失时返回 `hint`，区别于"工具坏了"。
+- 新增回归测试：`traverse_filters_by_edge_kind`、
+  `trace_callers_walks_the_inbound_call_chain`、
+  `trace_callees_walks_the_outbound_call_chain`、
+  `trace_follows_a_non_default_edge_kind`、`trace_respects_depth`、
+  `trace_unknown_name_attaches_a_hint`、`trace_tools_declare_typed_schemas`。
+
 ## [0.1.7] - 2026-07-27
 
 ### Fixed

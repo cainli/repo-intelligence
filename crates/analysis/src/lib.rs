@@ -192,11 +192,30 @@ fn resolve_cross_stack(entities: Vec<Entity>) -> GraphPatch {
                 .metadata
                 .get("method")
                 .and_then(|value| value.as_str());
+            // custom RPC endpoints(@RmbMap 等)无 method,不与前端 HTTP 调用匹配。
+            if call_method != endpoint_method {
+                continue;
+            }
             let endpoint_path = endpoint
                 .metadata
                 .get("path")
                 .and_then(|value| value.as_str());
-            if call_method == endpoint_method && call_path == endpoint_path {
+            // 分级匹配:精确全等 = Resolved 高置信;否则后缀段对齐 = Inferred 低置信
+            // (吸收 baseURL/版本前缀)。同一 (call, endpoint) 对最多产生一条边。
+            let match_kind = match (call_path, endpoint_path) {
+                (Some(cp), Some(ep)) if cp == ep => Some((
+                    EvidenceClass::Resolved,
+                    0.95,
+                    "normalized HTTP method and path match",
+                )),
+                (Some(cp), Some(ep)) if segment_suffix_align(cp, ep) => Some((
+                    EvidenceClass::Inferred,
+                    0.6,
+                    "path suffix aligns (baseURL/version prefix tolerated)",
+                )),
+                _ => None,
+            };
+            if let Some((classification, confidence, reason)) = match_kind {
                 let evidence = call.evidence.first();
                 let mut edge = Edge::new(
                     call.id.clone(),
@@ -208,9 +227,9 @@ fn resolve_cross_stack(entities: Vec<Entity>) -> GraphPatch {
                         &evidence.file,
                         evidence.start_line,
                         evidence.end_line,
-                        EvidenceClass::Resolved,
-                        0.95,
-                        "normalized HTTP method and path match",
+                        classification,
+                        confidence,
+                        reason,
                     );
                 }
                 edges.push(edge);
@@ -228,6 +247,32 @@ fn semantic_rank(kind: EntityKind) -> u8 {
         EntityKind::SqlField => 3,
         _ => 4,
     }
+}
+
+/// 判断 endpoint 路径是否为 call 路径的"连续后缀段"——用于在前端调用带了
+/// baseURL/版本前缀(如 `/api/v1/orders/{}`)而后端只声明 `/orders/{}` 时仍能连上。
+/// 两侧路径都已被 `semantics::normalize_path` 归一化(参数→`{}`、统一前导 `/`)。
+///
+/// 规则:按 `/` 切段(去空),endpoint 段序列必须等于 call 段序列的末尾连续段,
+/// 且段数差 ≥ 1(差为 0 即精确全等,由上游精确分支处理)。
+///
+/// 可调边界(召回 vs 精度的旋钮,按真实仓库的误连情况再拧):
+/// - 段数差当前无上限。若 `/a` 误连到 `/x/y/z/w/a` 这类长尾,加上限(如差 ≤ 3)。
+/// - 参数段 `{}` 当前只与 `{}` 相等,不通配任意段。若要 `/orders/{}` 对上
+///   `/orders/123`,需让 `{}` 通配——但这会显著抬高误报,慎用。
+/// - 当前不要求 HTTP method 之外的前缀词匹配;若噪声多,可加调用者白名单。
+fn segment_suffix_align(call_path: &str, endpoint_path: &str) -> bool {
+    let call_segments: Vec<&str> = call_path.split('/').filter(|segment| !segment.is_empty()).collect();
+    let endpoint_segments: Vec<&str> = endpoint_path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if endpoint_segments.is_empty() || endpoint_segments.len() >= call_segments.len() {
+        // endpoint 为空,或段数 ≥ call(含相等)→ 不算后缀对齐(相等归精确分支)。
+        return false;
+    }
+    let offset = call_segments.len() - endpoint_segments.len();
+    call_segments[offset..] == endpoint_segments[..]
 }
 
 pub struct ImpactAnalyzer<'a> {
@@ -289,6 +334,11 @@ impl<'a> ImpactAnalyzer<'a> {
             let plane = plane_for(entity.kind).to_owned();
             let mut path = vec![entity.id.clone()];
             let mut evidence = entity.evidence.clone();
+            // finding 的可达性置信度 = path 周围边上证据的最小 confidence。
+            // 触及 Inferred 边(分级匹配的低置信 matches_endpoint)会拉低它,
+            // 让客户端能区分精确命中与推断命中。起点实体自身的存在证据不参与
+            // (那是"它存在"的证据,不是"这样可达"的证据)。
+            let mut confidence = 1.0_f32;
             for traversal in [
                 self.store
                     .traverse(TraverseQuery::outbound(entity.id.clone()).with_depth(depth))?,
@@ -296,9 +346,15 @@ impl<'a> ImpactAnalyzer<'a> {
                     start: entity.id.clone(),
                     outbound: false,
                     max_depth: depth,
+                    edge_kinds: Vec::new(),
                 })?,
             ] {
                 for edge in traversal.edges {
+                    for ev in &edge.evidence {
+                        if ev.confidence < confidence {
+                            confidence = ev.confidence;
+                        }
+                    }
                     evidence.extend(edge.evidence);
                 }
                 for related in traversal.entities {
@@ -313,6 +369,7 @@ impl<'a> ImpactAnalyzer<'a> {
                 entity,
                 plane,
                 severity: "review_required".into(),
+                confidence,
             });
         }
         if total >= MAX_SEARCH_LIMIT {

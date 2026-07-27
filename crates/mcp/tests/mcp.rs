@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Cursor;
 
 use repo_intelligence_graph::{GraphStore, SqliteGraphStore};
-use repo_intelligence_model::{Entity, EntityId, EntityKind, GraphPatch};
+use repo_intelligence_model::{Edge, EdgeKind, Entity, EntityId, EntityKind, GraphPatch};
 
 #[test]
 fn mcp_lists_supported_tools_over_json_rpc() {
@@ -141,6 +141,52 @@ fn index_status_reports_an_uninitialized_index() {
             .unwrap()
             .contains("scan_workspace"),
         "empty index should hint at scan_workspace, got: {structured}"
+    );
+}
+
+#[test]
+fn index_status_reports_absolute_database_path() {
+    // 默认 database 是相对路径(.repo-intelligence/workspace.sqlite),依赖 cwd。
+    // get_index_status 应规范化为绝对路径,让调用方一眼看出连的是哪个库。
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    drop(SqliteGraphStore::open(&database).unwrap());
+
+    let input = br#"{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"get_index_status","arguments":{}}}
+"#;
+    let mut output = Vec::new();
+    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database)).unwrap();
+    let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
+    let reported = response["result"]["structuredContent"]["database"]
+        .as_str()
+        .unwrap();
+    assert!(
+        reported.starts_with('/'),
+        "database path should be absolute, got: {reported}"
+    );
+    assert!(reported.ends_with("graph.sqlite"));
+}
+
+#[test]
+fn analyze_change_warns_when_index_is_empty() {
+    // 空库时影响分析无意义——应在 open_questions 显式提示,避免"零影响"被误读为"安全"。
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    drop(SqliteGraphStore::open(&database).unwrap());
+
+    let input = br#"{"jsonrpc":"2.0","id":43,"method":"tools/call","params":{"name":"analyze_change","arguments":{"target_kind":"field","operation":"rename","from":"x","to":"y"}}}
+"#;
+    let mut output = Vec::new();
+    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database)).unwrap();
+    let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
+    let questions = response["result"]["structuredContent"]["open_questions"]
+        .as_array()
+        .expect("open_questions array");
+    assert!(
+        questions
+            .iter()
+            .any(|question| question.as_str().unwrap_or("").contains("index is empty")),
+        "empty index should be flagged in open_questions, got: {questions:?}"
     );
 }
 
@@ -461,4 +507,211 @@ fn empty_search_attaches_a_hint_instead_of_silent_zero() {
             .is_some_and(|hint| hint.contains("substring")),
         "empty result should hint at substring matching, got: {structured}"
     );
+}
+
+/// Seed a call chain S27501 --calls--> S27204 --calls--> S27000 plus an
+/// S27204 --depends_on--> S28000 edge, mirroring the RMB project scenario from
+/// the 0.1.6 comparison: the call chain must now be recoverable without grep.
+fn index_call_chain(database: &std::path::Path) {
+    let mut store = SqliteGraphStore::open(database).unwrap();
+    let make = |name: &str| {
+        Entity::new(
+            EntityId::stable("repo", name, EntityKind::Method, name, ""),
+            EntityKind::Method,
+            name,
+            format!("mes.{name}"),
+        )
+    };
+    let s27501 = make("S27501");
+    let s27204 = make("S27204");
+    let s27000 = make("S27000");
+    let s28000 = make("S28000");
+    let edges = vec![
+        Edge::new(s27501.id.clone(), s27204.id.clone(), EdgeKind::Calls),
+        Edge::new(s27204.id.clone(), s27000.id.clone(), EdgeKind::Calls),
+        Edge::new(s27204.id.clone(), s28000.id.clone(), EdgeKind::DependsOn),
+    ];
+    store
+        .apply_patch(GraphPatch::add(
+            vec![s27501, s27204, s27000, s28000],
+            edges,
+        ))
+        .unwrap();
+}
+
+/// Drive a single `tools/call` and return its `structuredContent`.
+fn call_tool(
+    database: &std::path::Path,
+    name: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 99,
+        "method": "tools/call",
+        "params": {"name": name, "arguments": arguments}
+    });
+    let mut output = Vec::new();
+    let line = format!("{request}\n");
+    repo_intelligence_mcp::serve(Cursor::new(line.as_bytes()), &mut output, Some(database)).unwrap();
+    let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
+    response["result"]["structuredContent"].clone()
+}
+
+fn entity_names(structured: &serde_json::Value) -> Vec<String> {
+    structured["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entity| entity["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn trace_callers_walks_the_inbound_call_chain() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    index_call_chain(&database);
+
+    let structured = call_tool(&database, "trace_callers", serde_json::json!({"name": "S27204"}));
+
+    assert_eq!(structured["start_count"], 1);
+    let names = entity_names(&structured);
+    assert!(names.contains(&"S27204".to_owned()));
+    assert!(
+        names.contains(&"S27501".to_owned()),
+        "upstream caller must be reachable: {structured}"
+    );
+    assert!(
+        !names.contains(&"S27000".to_owned()),
+        "downstream callee must not appear in callers: {structured}"
+    );
+    // Exactly one inbound call edge, both endpoints among the visited entities.
+    let item_ids: Vec<&str> = structured["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entity| entity["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(structured["edges"].as_array().unwrap().len(), 1);
+    let edge = &structured["edges"][0];
+    assert_eq!(edge["kind"], "calls");
+    assert!(item_ids.contains(&edge["source"].as_str().unwrap()));
+    assert!(item_ids.contains(&edge["target"].as_str().unwrap()));
+}
+
+#[test]
+fn trace_callees_walks_the_outbound_call_chain() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    index_call_chain(&database);
+
+    let structured = call_tool(&database, "trace_callees", serde_json::json!({"name": "S27204"}));
+
+    assert_eq!(structured["start_count"], 1);
+    let names = entity_names(&structured);
+    assert!(names.contains(&"S27204".to_owned()));
+    assert!(
+        names.contains(&"S27000".to_owned()),
+        "downstream callee must be reachable: {structured}"
+    );
+    assert!(
+        !names.contains(&"S28000".to_owned()),
+        "depends_on neighbor must not appear with the default calls filter: {structured}"
+    );
+    assert_eq!(structured["edges"].as_array().unwrap().len(), 1);
+    assert_eq!(structured["edges"][0]["kind"], "calls");
+}
+
+#[test]
+fn trace_follows_a_non_default_edge_kind() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    index_call_chain(&database);
+
+    // Asking for depends_on reaches S28000, which the default calls filter hides.
+    let structured = call_tool(
+        &database,
+        "trace_callees",
+        serde_json::json!({"name": "S27204", "edge_kinds": ["depends_on"]}),
+    );
+    let names = entity_names(&structured);
+    assert!(
+        names.contains(&"S28000".to_owned()),
+        "depends_on neighbor must be reachable: {structured}"
+    );
+    assert!(!names.contains(&"S27000".to_owned()));
+    assert_eq!(structured["edges"].as_array().unwrap()[0]["kind"], "depends_on");
+}
+
+#[test]
+fn trace_respects_depth() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    index_call_chain(&database);
+
+    // depth 1 from S27501 reaches S27204 but not the second hop S27000.
+    let structured = call_tool(
+        &database,
+        "trace_callees",
+        serde_json::json!({"name": "S27501", "depth": 1}),
+    );
+    let names = entity_names(&structured);
+    assert!(names.contains(&"S27501".to_owned()));
+    assert!(names.contains(&"S27204".to_owned()));
+    assert!(
+        !names.contains(&"S27000".to_owned()),
+        "depth 1 must not reach the second hop: {structured}"
+    );
+}
+
+#[test]
+fn trace_unknown_name_attaches_a_hint() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    index_call_chain(&database);
+
+    let structured = call_tool(&database, "trace_callers", serde_json::json!({"name": "NoSuchService"}));
+    assert_eq!(structured["start_count"], 0);
+    assert_eq!(structured["count"], 0);
+    assert!(
+        structured["hint"].as_str().is_some(),
+        "unknown start name should attach a hint, got: {structured}"
+    );
+}
+
+#[test]
+fn trace_tools_declare_typed_schemas() {
+    let input = br#"{"jsonrpc":"2.0","id":60,"method":"tools/list","params":{}}
+"#;
+    let mut output = Vec::new();
+    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, None).unwrap();
+    let response: serde_json::Value =
+        serde_json::from_slice(output.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
+    let tools = response["result"]["tools"].as_array().unwrap();
+
+    for tool_name in ["trace_callers", "trace_callees"] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == tool_name)
+            .unwrap_or_else(|| panic!("missing {tool_name} in tools/list"));
+        let input_props = &tool["inputSchema"]["properties"];
+        assert_eq!(input_props["name"]["type"], "string", "{tool_name} must take a name");
+        assert_eq!(input_props["depth"]["default"], 2);
+        assert_eq!(input_props["edge_kinds"]["default"], serde_json::json!(["calls"]));
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        assert_eq!(tool["outputSchema"]["type"], "object");
+        let required: Vec<&str> = tool["outputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        for field in ["items", "edges", "count", "start_count"] {
+            assert!(
+                required.contains(&field),
+                "{tool_name} output must require {field}"
+            );
+        }
+    }
 }
