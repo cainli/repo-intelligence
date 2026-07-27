@@ -8,7 +8,14 @@ fn discovery_honors_ignore_files_and_builtin_directory_exclusions() {
     fs::create_dir_all(root.path().join("node_modules/pkg")).unwrap();
     fs::create_dir_all(root.path().join("generated")).unwrap();
     fs::create_dir_all(root.path().join("ignored-by-git")).unwrap();
+    fs::create_dir_all(root.path().join(".claude/worktrees/jacoco-global-coverage")).unwrap();
     fs::write(root.path().join("Keep.java"), "class Keep {}").unwrap();
+    fs::write(
+        root.path()
+            .join(".claude/worktrees/jacoco-global-coverage/Clone.java"),
+        "class Clone {}",
+    )
+    .unwrap();
     fs::write(
         root.path().join("node_modules/pkg/Dependency.java"),
         "class Dependency {}",

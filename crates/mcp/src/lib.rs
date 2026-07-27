@@ -35,12 +35,29 @@ pub fn serve<R: Read, W: Write>(reader: R, mut writer: W, database: Option<&Path
         if line.trim().is_empty() {
             continue;
         }
-        let request: Value = serde_json::from_str(&line)?;
+        let request: Value = match serde_json::from_str(&line) {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("[repo-intelligence:mcp] invalid JSON-RPC message: {error}");
+                let response = json!({
+                    "jsonrpc": "2.0",
+                    "id": Value::Null,
+                    "error": {"code": -32700, "message": "Parse error"}
+                });
+                serde_json::to_writer(&mut writer, &response)?;
+                writer.write_all(b"\n")?;
+                writer.flush()?;
+                continue;
+            }
+        };
         let id = request.get("id").cloned().unwrap_or(Value::Null);
         let method = request
             .get("method")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        if request.get("id").is_none() {
+            continue;
+        }
         let response = match method {
             "initialize" => json!({
                 "jsonrpc": "2.0",
@@ -64,6 +81,7 @@ pub fn serve<R: Read, W: Write>(reader: R, mut writer: W, database: Option<&Path
                     .collect();
                 json!({"jsonrpc": "2.0", "id": id, "result": {"tools": tools}})
             }
+            "ping" => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
             "tools/call" => match call_tool(&request, database) {
                 Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
                 Err(error) => json!({
@@ -75,7 +93,6 @@ pub fn serve<R: Read, W: Write>(reader: R, mut writer: W, database: Option<&Path
                     }
                 }),
             },
-            "notifications/initialized" => continue,
             _ => json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -124,9 +141,26 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
                 "edges_indexed": summary.edges_indexed
             })
         }
-        "get_index_status" | "show_system_view" => {
+        "get_index_status" => {
             let store = SqliteGraphStore::open(path)?;
-            serde_json::to_value(store.all_entities()?)?
+            let (entity_count, edge_count) = store.counts()?;
+            json!({
+                "database": path.display().to_string(),
+                "entity_count": entity_count,
+                "edge_count": edge_count,
+            })
+        }
+        "show_system_view" => {
+            let store = SqliteGraphStore::open(path)?;
+            let view = arguments["view"].as_str().unwrap_or("repositories");
+            let (entity_count, edge_count) = store.counts()?;
+            let entities_by_kind = store.counts_by_kind()?;
+            json!({
+                "view": view,
+                "entity_count": entity_count,
+                "edge_count": edge_count,
+                "entities_by_kind": entities_by_kind,
+            })
         }
         _ => return Err(anyhow::anyhow!("tool not implemented: {name}")),
     };
