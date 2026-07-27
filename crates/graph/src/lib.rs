@@ -21,6 +21,9 @@ pub trait GraphStore {
     fn apply_patch(&mut self, patch: GraphPatch) -> Result<()>;
     fn replace_snapshot(&mut self, patch: GraphPatch) -> Result<()>;
     fn search(&self, query: SearchQuery) -> Result<Vec<EntityMatch>>;
+    /// 精确名匹配(大小写敏感,走 entity_name 索引)。analyze 要 name == source_name,
+    /// 不是子串——用这个替代 search 的 LIKE %text% 省内存。
+    fn search_exact_name(&self, name: &str, limit: usize) -> Result<Vec<Entity>>;
     fn traverse(&self, query: TraverseQuery) -> Result<Traversal>;
     fn get_entity(&self, id: &EntityId) -> Result<Option<Entity>>;
     fn all_entities(&self) -> Result<Vec<Entity>>;
@@ -94,6 +97,7 @@ impl SqliteGraphStore {
             );
             CREATE INDEX IF NOT EXISTS edge_source ON edge(source_id, kind);
             CREATE INDEX IF NOT EXISTS edge_target ON edge(target_id, kind);
+            CREATE INDEX IF NOT EXISTS entity_name ON entity(name);
             CREATE VIRTUAL TABLE IF NOT EXISTS entity_fts USING fts5(
                 entity_id UNINDEXED,
                 name,
@@ -235,15 +239,24 @@ impl GraphStore for SqliteGraphStore {
              WHERE lower(e.name) LIKE lower(?1)
                 OR lower(e.qualified_name) LIKE lower(?1)
              ORDER BY CASE WHEN lower(e.name) = lower(?2) THEN 0 ELSE 1 END, e.name
-             LIMIT ?3",
+             LIMIT ?3 OFFSET ?4",
         )?;
         let pattern = format!("%{}%", query.text);
-        let rows = statement
-            .query_map(params![pattern, query.text, query.limit as i64], |row| {
-                Self::row_entity(row)
-            })?;
+        let rows = statement.query_map(
+            params![pattern, query.text, query.limit as i64, query.offset as i64],
+            Self::row_entity,
+        )?;
         rows.map(|result| result.map(|entity| EntityMatch { entity, score: 1.0 }))
             .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    fn search_exact_name(&self, name: &str, limit: usize) -> Result<Vec<Entity>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT json FROM entity WHERE name = ?1 LIMIT ?2")?;
+        let rows = statement.query_map(params![name, limit as i64], Self::row_entity)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 

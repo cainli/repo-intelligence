@@ -707,3 +707,246 @@ fn scan_with_config_honors_custom_endpoint_replacement() {
         "builtin @RmbMap 被替换语义移除,不应再被识别"
     );
 }
+
+#[test]
+fn spring_autowired_constructor_injection_produces_depends_on() {
+    // @Autowired 构造器:OrderService(OrderRepo) → DependsOn OrderRepo bean。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("OrderService.java"),
+        r#"
+        class OrderService {
+          private final OrderRepo repo;
+          @Autowired
+          public OrderService(OrderRepo repo) { this.repo = repo; }
+        }
+        "#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    let bean = store
+        .search(SearchQuery::new("OrderRepo").with_limit(10))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::SpringBean)
+        .expect("@Autowired 构造器应产出 OrderRepo SpringBean")
+        .entity;
+    let owners = store
+        .traverse(TraverseQuery {
+            start: bean.id,
+            outbound: false,
+            max_depth: 1,
+            edge_kinds: vec![EdgeKind::DependsOn],
+        })
+        .unwrap();
+    assert!(
+        owners.entities.iter().any(|e| e.name == "OrderService"),
+        "OrderService 应经构造器注入 DependsOn OrderRepo"
+    );
+}
+
+#[test]
+fn spring_single_constructor_injects_without_annotation() {
+    // 无 @Autowired 的唯一构造器:Spring 默认自动注入。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("OrderService.java"),
+        r#"
+        class OrderService {
+          public OrderService(OrderRepo repo) {}
+        }
+        "#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    assert!(
+        store
+            .search(SearchQuery::new("OrderRepo").with_limit(10))
+            .unwrap()
+            .iter()
+            .any(|m| m.entity.kind == EntityKind::SpringBean),
+        "单构造器(无 @Autowired)应自动注入"
+    );
+}
+
+#[test]
+fn spring_multi_constructor_not_injected_without_autowired() {
+    // 多构造器且无 @Autowired:不注入,避免过捕。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("OrderService.java"),
+        r#"
+        class OrderService {
+          public OrderService(OrderRepo repo) {}
+          public OrderService(OrderRepo repo, int x) {}
+        }
+        "#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    assert!(
+        !store
+            .search(SearchQuery::new("OrderRepo").with_limit(10))
+            .unwrap()
+            .iter()
+            .any(|m| m.entity.kind == EntityKind::SpringBean),
+        "多构造器无 @Autowired 不应注入"
+    );
+}
+
+#[test]
+fn cross_file_basemapper_binds_to_entity_table() {
+    // Order.java:@TableName 类;OrderMapper.java:BaseMapper<Order>(不同文件)。
+    // resolve 应跨文件连 OrderMapper --DependsOn--> t_order。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("Order.java"),
+        r#"
+        @TableName("t_order")
+        public class Order {
+          @TableField("customer_name")
+          private String customerName;
+        }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("OrderMapper.java"),
+        "interface OrderMapper extends BaseMapper<Order> {}",
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    let mapper = store
+        .search(SearchQuery::new("OrderMapper").with_limit(10))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::Mapper)
+        .expect("OrderMapper")
+        .entity;
+    let outbound = store
+        .traverse(
+            TraverseQuery::outbound(mapper.id)
+                .with_depth(1)
+                .with_kinds(vec![EdgeKind::DependsOn]),
+        )
+        .unwrap();
+    assert!(
+        outbound
+            .entities
+            .iter()
+            .any(|e| e.name == "t_order" && e.kind == EntityKind::Table),
+        "跨文件 OrderMapper 应 DependsOn t_order"
+    );
+}
+
+#[test]
+fn mybatis_plus_lambda_wrapper_extracts_column() {
+    // wrapper.eq(Order::getCustomerName, …):Lambda 方法引用 → customer_name Column。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("Order.java"),
+        r#"
+        @TableName("t_order")
+        public class Order {
+          private String customerName;
+          public String getCustomerName() { return customerName; }
+        }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("OrderRepo.java"),
+        r#"
+        class OrderRepo {
+          public Object find() {
+            return wrapper.eq(Order::getCustomerName, "x").list();
+          }
+        }
+        "#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    assert!(
+        store
+            .search(SearchQuery::new("customer_name").with_limit(20))
+            .unwrap()
+            .iter()
+            .any(|m| m.entity.kind == EntityKind::Column),
+        "Lambda Order::getCustomerName 应产出 customer_name Column"
+    );
+}
+
+#[test]
+fn incremental_scan_reuses_unchanged_extracts() {
+    // 未变文件复用缓存:第二次 scan files_extracted=0,实体数不变。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("A.java"), "class A { private String name; }").unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    let first = WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    assert_eq!(first.files_extracted, first.files_indexed, "首次全量 extract");
+    let second = WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    assert_eq!(second.files_extracted, 0, "未变文件复用缓存,extract=0");
+    assert_eq!(second.entities_indexed, first.entities_indexed, "实体数不变");
+}
+
+#[test]
+fn incremental_scan_reextracts_changed_file() {
+    // 变化文件重 extract:content_hash 变 → 缓存失效 → files_extracted=1 + 新字段入库。
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("A.java");
+    fs::write(&a, "class A { private String name; }").unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    fs::write(&a, "class A { private String name; private String added; }").unwrap();
+    let second = WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    assert_eq!(second.files_extracted, 1, "变化的文件重 extract");
+    assert!(
+        store
+            .search(SearchQuery::new("added").with_limit(10))
+            .unwrap()
+            .iter()
+            .any(|m| m.entity.kind == EntityKind::Field),
+        "新字段入库"
+    );
+}
+
+#[test]
+fn method_declarations_and_same_file_calls_extracted() {
+    // methodA→methodB→methodC:产出 Method 实体 + 同文件 Calls 边。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("Svc.java"),
+        r#"
+        class Svc {
+          public void methodA() { methodB(); }
+          public void methodB() { methodC(); }
+          public void methodC() {}
+        }
+        "#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    let a = store
+        .search(SearchQuery::new("methodA").with_limit(10))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::Method)
+        .expect("Method methodA")
+        .entity;
+    let chain = store
+        .traverse(
+            TraverseQuery::outbound(a.id)
+                .with_depth(2)
+                .with_kinds(vec![EdgeKind::Calls]),
+        )
+        .unwrap();
+    let names: Vec<&str> = chain.entities.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"methodB"), "methodA 调用 methodB");
+    assert!(names.contains(&"methodC"), "调用链达 methodC");
+}

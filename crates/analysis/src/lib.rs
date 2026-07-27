@@ -6,14 +6,23 @@ use anyhow::{Result, anyhow};
 pub use repo_intelligence_config::{AnalysisConfig, IndexerConfig};
 use repo_intelligence_graph::GraphStore;
 use repo_intelligence_model::{
-    ChangeOperation, ChangeRequest, Edge, EdgeKind, Entity, EntityKind, EvidenceClass, GraphPatch,
-    ImpactFinding, ImpactReport, SearchQuery, TraverseQuery,
+    ChangeOperation, ChangeRequest, Edge, EdgeKind, Entity, EntityId, EntityKind, EvidenceClass,
+    GraphPatch, ImpactFinding, ImpactReport, TraverseQuery,
 };
 use repo_intelligence_source::discover_with_config;
+
+thread_local! {
+    /// extract 缓存:path → (content_hash, GraphPatch)。未变文件复用,跳过 parse/regex。
+    /// resolve 与 replace_snapshot 仍全量,故跨文件边一致;缓存代价是内存(存全部 patch)。
+    static EXTRACT_CACHE: std::cell::RefCell<HashMap<String, (String, GraphPatch)>> =
+        std::cell::RefCell::new(HashMap::new());
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct ScanSummary {
     pub files_indexed: usize,
+    /// 实际 extract 的文件数(变化/新增);未变文件复用缓存不计。增量可观测指标。
+    pub files_extracted: usize,
     pub entities_indexed: usize,
     pub edges_indexed: usize,
 }
@@ -110,7 +119,34 @@ impl WorkspaceIndexer {
                 current_path: Some(file.relative_path.to_string_lossy().to_string()),
                 elapsed_ms: started.elapsed().as_millis(),
             });
-            let patch = repo_intelligence_semantics::extract_with_config(file, &config.semantics)?;
+            let patch = {
+                // 增量:content_hash 未变的文件复用上次 extract 的 patch,跳过 parse/regex。
+                let path_key = file.relative_path.to_string_lossy().to_string();
+                let cached = EXTRACT_CACHE.with(|cache| {
+                    cache
+                        .borrow()
+                        .get(&path_key)
+                        .filter(|(hash, _)| *hash == file.content_hash)
+                        .map(|(_, patch)| patch.clone())
+                });
+                match cached {
+                    Some(patch) => patch,
+                    None => {
+                        summary.files_extracted += 1;
+                        let patch = repo_intelligence_semantics::extract_with_config(
+                            file,
+                            &config.semantics,
+                        )?;
+                        EXTRACT_CACHE.with(|cache| {
+                            cache.borrow_mut().insert(
+                                path_key,
+                                (file.content_hash.clone(), patch.clone()),
+                            );
+                        });
+                        patch
+                    }
+                }
+            };
             summary.entities_indexed += patch.add_entities.len();
             summary.edges_indexed += patch.add_edges.len();
             combined.add_entities.extend(patch.add_entities);
@@ -130,7 +166,7 @@ impl WorkspaceIndexer {
             current_path: None,
             elapsed_ms: started.elapsed().as_millis(),
         });
-        let resolution = resolve_cross_stack(combined.add_entities.clone());
+        let resolution = resolve_cross_stack(&combined.add_entities, &combined.add_edges);
         summary.edges_indexed += resolution.add_edges.len();
         combined.add_edges.extend(resolution.add_edges);
         report(ScanProgress {
@@ -152,12 +188,13 @@ impl WorkspaceIndexer {
     }
 }
 
-fn resolve_cross_stack(entities: Vec<Entity>) -> GraphPatch {
+fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch {
     let mut edges = Vec::new();
     let mut fields: HashMap<String, Vec<&Entity>> = HashMap::new();
     let mut endpoints = Vec::new();
     let mut calls = Vec::new();
-    for entity in &entities {
+    let mut mappers: Vec<&Entity> = Vec::new();
+    for entity in entities {
         match entity.kind {
             EntityKind::Field
             | EntityKind::FrontendField
@@ -168,6 +205,7 @@ fn resolve_cross_stack(entities: Vec<Entity>) -> GraphPatch {
             }
             EntityKind::HttpEndpoint => endpoints.push(entity),
             EntityKind::HttpClientCall => calls.push(entity),
+            EntityKind::Mapper => mappers.push(entity),
             _ => {}
         }
     }
@@ -192,6 +230,41 @@ fn resolve_cross_stack(entities: Vec<Entity>) -> GraphPatch {
             edges.push(edge);
         }
     }
+    // 跨文件 Mapper→Table:Mapper.metadata.entity_type 命中同名 Class → 其 DependsOn 的 Table
+    // (同文件绑定由 extract_mybatis_plus 产;这里补跨文件,store upsert 按 (s,t,kind) 去重)。
+    let entity_by_id: HashMap<&EntityId, &Entity> =
+        entities.iter().map(|entity| (&entity.id, entity)).collect();
+    let mut class_to_table: HashMap<&str, &EntityId> = HashMap::new();
+    for edge in input_edges {
+        if edge.kind == EdgeKind::DependsOn
+            && let (Some(src), Some(tgt)) =
+                (entity_by_id.get(&edge.source), entity_by_id.get(&edge.target))
+            && src.kind == EntityKind::Class
+            && tgt.kind == EntityKind::Table
+        {
+            class_to_table.insert(src.name.as_str(), &tgt.id);
+        }
+    }
+    for mapper in &mappers {
+        let Some(entity_type) = mapper.metadata.get("entity_type").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if let Some(table_id) = class_to_table.get(entity_type) {
+            let mut edge = Edge::new(mapper.id.clone(), (*table_id).clone(), EdgeKind::DependsOn);
+            if let Some(ev) = mapper.evidence.first() {
+                edge = edge.with_evidence(
+                    &ev.file,
+                    ev.start_line,
+                    ev.end_line,
+                    EvidenceClass::Resolved,
+                    0.9,
+                    "BaseMapper<EntityType> binds mapper to entity table (cross-file)",
+                );
+            }
+            edges.push(edge);
+        }
+    }
+
     for call in calls {
         let call_method = call.metadata.get("method").and_then(|value| value.as_str());
         let call_path = call.metadata.get("path").and_then(|value| value.as_str());
@@ -324,16 +397,11 @@ impl<'a> ImpactAnalyzer<'a> {
         // would silently cap `total` at the window size and break `has_more`.
         // The cap bounds a runaway query; reaching it means `total` is a lower
         // bound (surfaced as an open question below).
-        let matches = self
+        // 精确名匹配(走 entity_name 索引,非子串 LIKE)——只有 name == source_name
+        // 的实体才是真影响目标;子串命中(如 customer_name_id)是巧合。
+        let mut candidates: Vec<Entity> = self
             .store
-            .search(SearchQuery::new(source_name).with_limit(self.analysis.max_search_limit))?;
-        // Only exact-name matches are real impact targets; substring hits are
-        // coincidence (e.g. a table named `customer_name_id`).
-        let mut candidates: Vec<Entity> = matches
-            .into_iter()
-            .filter(|matched| matched.entity.name == source_name)
-            .map(|matched| matched.entity)
-            .collect();
+            .search_exact_name(source_name, self.analysis.max_search_limit)?;
         let total = candidates.len();
         // Rank by impact surface: user-visible planes (frontend/api/data)
         // first, so a truncated page still shows the changes a human cares most

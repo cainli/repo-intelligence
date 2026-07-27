@@ -122,6 +122,7 @@ fn run() -> Result<()> {
                 format,
                 serde_json::json!({
                     "files_indexed": summary.files_indexed,
+                    "files_extracted": summary.files_extracted,
                     "entities_indexed": summary.entities_indexed,
                     "edges_indexed": summary.edges_indexed
                 }),

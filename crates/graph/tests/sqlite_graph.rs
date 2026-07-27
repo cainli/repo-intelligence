@@ -1,4 +1,4 @@
-use repo_intelligence_graph::{GraphStore, SqliteGraphStore};
+use repo_intelligence_graph::{EntityMatch, GraphStore, SqliteGraphStore};
 use repo_intelligence_model::{
     Edge, EdgeKind, Entity, EntityId, EntityKind, EvidenceClass, GraphPatch, SearchQuery,
     TraverseQuery,
@@ -132,5 +132,69 @@ fn traverse_filters_by_edge_kind() {
             .edges
             .iter()
             .all(|edge| edge.kind == EdgeKind::Calls)
+    );
+}
+
+#[test]
+fn search_exact_name_returns_only_exact_case_sensitive_matches() {
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    let exact = entity(EntityKind::Field, "customerName");
+    // 子串包含但 name != "customerName" —— 精确匹配不应命中
+    let decoy_substring = entity(EntityKind::Table, "customerNameHistory");
+    let decoy_different = entity(EntityKind::Field, "customer_name_id");
+    store
+        .apply_patch(GraphPatch::add(
+            vec![exact.clone(), decoy_substring, decoy_different],
+            vec![],
+        ))
+        .unwrap();
+
+    let matches = store.search_exact_name("customerName", 100).unwrap();
+    // 只精确名命中,排除子串与不同名
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].id, exact.id);
+
+    // 大小写敏感:BINARY 比较,customername 不命中
+    assert!(store.search_exact_name("customername", 100).unwrap().is_empty());
+}
+
+#[test]
+fn search_offset_skips_the_first_n_matches() {
+    // offset 分页:5 个共享前缀的实体,limit=2 应切出互不重叠的三页,
+    // offset 越过末尾返回空 —— 验证 SQL LIMIT/OFFSET 而非内存截断。
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    let entities: Vec<_> = (0..5)
+        .map(|index| entity(EntityKind::Field, &format!("shared_{index}")))
+        .collect();
+    store
+        .apply_patch(GraphPatch::add(entities, vec![]))
+        .unwrap();
+
+    let names = |matches: Vec<EntityMatch>| -> Vec<String> {
+        matches
+            .into_iter()
+            .map(|matched| matched.entity.name)
+            .collect()
+    };
+
+    let page0 = store
+        .search(SearchQuery::new("shared_").with_limit(2).with_offset(0))
+        .unwrap();
+    let page1 = store
+        .search(SearchQuery::new("shared_").with_limit(2).with_offset(2))
+        .unwrap();
+    let page2 = store
+        .search(SearchQuery::new("shared_").with_limit(2).with_offset(4))
+        .unwrap();
+    let beyond = store
+        .search(SearchQuery::new("shared_").with_limit(2).with_offset(6))
+        .unwrap();
+
+    assert_eq!(names(page0), ["shared_0", "shared_1"]);
+    assert_eq!(names(page1), ["shared_2", "shared_3"]);
+    assert_eq!(names(page2), ["shared_4"]);
+    assert!(
+        beyond.is_empty(),
+        "offset past the end must return nothing"
     );
 }

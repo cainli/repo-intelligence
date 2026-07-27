@@ -132,7 +132,18 @@ fn tool_specs() -> Vec<ToolSpec> {
                 "type": "integer",
                 "minimum": 1,
                 "default": 100,
-                "description": "Maximum number of entities to return."
+                "description": "Maximum number of entities to return in this page."
+            },
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "default": 0,
+                "description": "Number of matches to skip before the first returned row. Page through wide matches (e.g. an enterprise ID naming dozens of entities) with limit/offset instead of one huge batch."
+            },
+            "verbose": {
+                "type": "boolean",
+                "default": false,
+                "description": "When true, return full entities (metadata + evidence[] with reason strings). Default false returns a compact {id, kind, name, qualified_name, evidence_count} view so a wide match stays small; pass verbose=true only for the few items you want to inspect."
             }
         },
         "required": ["query"]
@@ -141,11 +152,14 @@ fn tool_specs() -> Vec<ToolSpec> {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "items": {"type": "array", "items": entity_schema()},
-            "count": {"type": "integer", "minimum": 0},
+            "items": {"type": "array", "description": "Compact entity views by default; full entities when verbose=true."},
+            "count": {"type": "integer", "minimum": 0, "description": "Number of items in this page (not the total match count)."},
+            "limit": {"type": "integer", "minimum": 0},
+            "offset": {"type": "integer", "minimum": 0},
+            "has_more": {"type": "boolean", "description": "true if another page likely exists at offset+limit."},
             "hint": {"type": "string"}
         },
-        "required": ["items", "count"]
+        "required": ["items", "count", "limit", "offset", "has_more"]
     });
     // The trace tools share one contract: an exact `name` to start from (with
     // optional `depth` and `edge_kinds`) in, and a `{items, edges, count,
@@ -218,6 +232,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                 "additionalProperties": false,
                 "properties": {
                     "files_indexed": {"type": "integer", "minimum": 0},
+                    "files_extracted": {"type": "integer", "minimum": 0},
                     "entities_indexed": {"type": "integer", "minimum": 0},
                     "edges_indexed": {"type": "integer", "minimum": 0},
                     "entities_by_kind": {
@@ -496,17 +511,11 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
     let path = database.ok_or_else(|| anyhow::anyhow!("MCP server has no database configured"))?;
     let data = match name {
         "search_entities" => {
-            let query = arguments["query"].as_str().unwrap_or_default();
-            let limit = parse_limit(arguments);
             let store = SqliteGraphStore::open(path)?;
-            let (entities, count) = search_with_filter(&store, query, limit, None)?;
-            let mut result = json!({
-                "items": serde_json::to_value(&entities)?,
-                "count": count,
-            });
+            let mut result = run_search(&store, arguments, None)?;
             // On zero hits, distinguish "not found" from "empty index": the latter
             // points at a wrong database connection. Counts are only read on miss.
-            if count == 0 {
+            if result["count"].as_u64() == Some(0) {
                 let (total, _) = store.counts()?;
                 if total == 0 {
                     result["hint"] = json!(
@@ -518,21 +527,14 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
             result
         }
         "find_endpoint" => {
-            let query = arguments["query"].as_str().unwrap_or_default();
-            let limit = parse_limit(arguments);
             let store = SqliteGraphStore::open(path)?;
             let endpoint_kinds = [
                 EntityKind::HttpEndpoint,
                 EntityKind::HttpClientCall,
                 EntityKind::ApiField,
             ];
-            let (entities, count) =
-                search_with_filter(&store, query, limit, Some(&endpoint_kinds))?;
-            let mut result = json!({
-                "items": serde_json::to_value(&entities)?,
-                "count": count,
-            });
-            if count == 0 {
+            let mut result = run_search(&store, arguments, Some(&endpoint_kinds))?;
+            if result["count"].as_u64() == Some(0) {
                 result["hint"] = json!(
                     "No endpoints matched. Endpoints are recognized from Spring MVC mappings \
                      (@RequestMapping/@GetMapping/...) or configured RPC annotations (@RmbMap, \
@@ -543,15 +545,9 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
             result
         }
         "analyze_requirement" => {
-            let query = arguments["query"].as_str().unwrap_or_default();
-            let limit = parse_limit(arguments);
             let store = SqliteGraphStore::open(path)?;
-            let (entities, count) = search_with_filter(&store, query, limit, None)?;
-            let mut result = json!({
-                "items": serde_json::to_value(&entities)?,
-                "count": count,
-            });
-            if count == 0 {
+            let mut result = run_search(&store, arguments, None)?;
+            if result["count"].as_u64() == Some(0) {
                 result["hint"] = json!(
                     "No indexed entity name contains this text. This tool matches entity \
                      names/qualified names (classes, fields, tables, endpoints) by substring, \
@@ -607,6 +603,7 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
             let entities_by_kind = store.counts_by_kind()?;
             json!({
                 "files_indexed": summary.files_indexed,
+                "files_extracted": summary.files_extracted,
                 "entities_indexed": summary.entities_indexed,
                 "edges_indexed": summary.edges_indexed,
                 "entities_by_kind": entities_by_kind,
@@ -703,23 +700,95 @@ fn parse_limit(arguments: &Value) -> usize {
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
 }
 
+fn parse_offset(arguments: &Value) -> usize {
+    arguments["offset"].as_u64().unwrap_or(0) as usize
+}
+
 /// Runs a name/qualified-name search and optionally narrows to a set of kinds.
 /// `find_endpoint` uses the filter so it only ever returns endpoint entities —
 /// never the unrelated classes/fields a plain `search_entities` would surface.
+///
+/// Peeks `limit + 1` rows so `has_more` is decided without a COUNT(*) round-trip:
+/// if the (filtered) window holds more than `limit`, another page likely exists.
+/// For `search_entities` (no filter) this is exact; for `find_endpoint` the window
+/// is over pre-filter candidates, so `has_more` may under-report — but it never
+/// drops data, it only stops paging a step early.
 fn search_with_filter(
     store: &SqliteGraphStore,
     query: &str,
     limit: usize,
+    offset: usize,
     filter: Option<&[EntityKind]>,
-) -> Result<(Vec<repo_intelligence_model::Entity>, usize)> {
-    let matches = store.search(SearchQuery::new(query).with_limit(limit))?;
-    let entities: Vec<_> = matches
+) -> Result<(Vec<repo_intelligence_model::Entity>, usize, bool)> {
+    let peek = limit.saturating_add(1);
+    let matches = store.search(
+        SearchQuery::new(query)
+            .with_limit(peek)
+            .with_offset(offset),
+    )?;
+    let mut entities: Vec<_> = matches
         .into_iter()
         .map(|matched| matched.entity)
         .filter(|entity| filter.is_none_or(|kinds| kinds.contains(&entity.kind)))
         .collect();
+    let has_more = entities.len() > limit;
+    if has_more {
+        entities.truncate(limit);
+    }
     let count = entities.len();
-    Ok((entities, count))
+    Ok((entities, count, has_more))
+}
+
+/// Shared body of the three substring-search tools (search_entities,
+/// find_endpoint, analyze_requirement): parse query/limit/offset/verbose, run the
+/// filtered search, and serialize items through the compact-or-verbose view. The
+/// caller still owns the empty-result `hint` — each tool explains a miss differently
+/// (empty index vs. non-Spring endpoint vs. non-substring query).
+fn run_search(
+    store: &SqliteGraphStore,
+    arguments: &Value,
+    filter: Option<&[EntityKind]>,
+) -> Result<Value> {
+    let query = arguments["query"].as_str().unwrap_or_default();
+    let limit = parse_limit(arguments);
+    let offset = parse_offset(arguments);
+    let verbose = arguments["verbose"].as_bool().unwrap_or(false);
+    let (entities, count, has_more) = search_with_filter(store, query, limit, offset, filter)?;
+    let items: Vec<Value> = entities
+        .iter()
+        .map(|entity| entity_to_json(entity, verbose))
+        .collect();
+    Ok(json!({
+        "items": items,
+        "count": count,
+        "limit": limit,
+        "offset": offset,
+        "has_more": has_more,
+    }))
+}
+
+/// Serialize an entity for search results.
+///
+/// `verbose=false` (the default) emits a compact view: a wide substring match —
+/// e.g. an enterprise ID that names dozens of fields/tables/methods — must not
+/// dump every evidence `reason` (long natural-language strings) and the metadata
+/// blob into one response. `verbose=true` returns the full entity for the few
+/// items the caller actually wants to inspect.
+fn entity_to_json(entity: &repo_intelligence_model::Entity, verbose: bool) -> Value {
+    if verbose {
+        serde_json::to_value(entity).unwrap_or(Value::Null)
+    } else {
+        // Compact view:id/kind/name/qualified_name + evidence_count(不展开 evidence[]
+        // 的 reason 长串与 metadata blob)。一个宽匹配(如企业 ID 命中数十个实体)不致
+        // 把响应撑到上万 token;verbose=true 时才返回完整实体。
+        json!({
+            "id": entity.id,
+            "kind": entity.kind.as_str(),
+            "name": entity.name,
+            "qualified_name": entity.qualified_name,
+            "evidence_count": entity.evidence.len(),
+        })
+    }
 }
 
 fn parse_depth(arguments: &Value, default: usize) -> usize {

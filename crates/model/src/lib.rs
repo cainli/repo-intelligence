@@ -291,6 +291,12 @@ impl GraphPatch {
 pub struct SearchQuery {
     pub text: String,
     pub limit: usize,
+    /// Number of matches to skip before the first returned row. Combined with
+    /// `limit` this gives keyset-free pagination; the MCP search tools expose it
+    /// as `offset` so a wide substring match (e.g. an enterprise ID that names
+    /// dozens of entities) can be paged instead of returned in one huge batch.
+    #[serde(default)]
+    pub offset: usize,
 }
 
 impl SearchQuery {
@@ -298,11 +304,17 @@ impl SearchQuery {
         Self {
             text: text.into(),
             limit: 50,
+            offset: 0,
         }
     }
 
     pub fn with_limit(mut self, limit: usize) -> Self {
         self.limit = limit;
+        self
+    }
+
+    pub fn with_offset(mut self, offset: usize) -> Self {
+        self.offset = offset;
         self
     }
 }

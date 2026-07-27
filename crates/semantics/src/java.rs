@@ -54,6 +54,14 @@ static MP_MAPPER: LazyLock<Regex> = LazyLock::new(|| {
 static MP_WRAPPER_COLUMN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"\.(eq|ne|gt|ge|lt|le|like|notLike|in|notIn|between|orderBy(?:Asc|Desc)?|groupBy|having|select)\s*\(\s*"([A-Za-z_]\w*)""#).unwrap()
 });
+// QueryWrapper Lambda 方法引用:.eq(Entity::getXxx, …)。组2=Entity 类型,组3=getter。
+// 是 MP_WRAPPER_COLUMN(字符串列名)的 Lambda 补充;getter→字段名→驼峰列名。
+static MP_WRAPPER_LAMBDA: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"\.(eq|ne|gt|ge|lt|le|like|notLike|in|notIn|between|orderBy(?:Asc|Desc)?|groupBy|having|select)\s*\(\s*([A-Za-z_]\w*)::([A-Za-z_]\w*)"#,
+    )
+    .unwrap()
+});
 
 pub struct JavaExtractor;
 
@@ -86,6 +94,8 @@ fn extract_java(
     // 先跑 AST 遍历:产出 Bean DI 边 + 收集 Spring 信号(事务/定时),后者作为
     // metadata 挂到对应 class 实体,故必须在 class 实体创建前完成。
     let mut signals: HashMap<String, SpringSignals> = HashMap::new();
+    let mut methods: HashMap<String, EntityId> = HashMap::new();
+    let mut invocations: Vec<(String, String, u32)> = Vec::new();
     if let Some(tree) = parsed.tree.as_ref() {
         visit_spring(
             tree.root_node(),
@@ -96,6 +106,34 @@ fn extract_java(
             edges,
             &mut signals,
         );
+        visit_methods(
+            tree.root_node(),
+            file.content.as_bytes(),
+            file,
+            path,
+            entities,
+            edges,
+            &mut methods,
+            &mut invocations,
+            None,
+        );
+    }
+    // 同文件 method 调用 → Calls 边(低保真:按方法名匹配,跨类同名混淆、跨文件留后续)。
+    for (caller, callee, line) in &invocations {
+        if let (Some(caller_id), Some(callee_id)) = (methods.get(caller), methods.get(callee))
+            && caller_id != callee_id
+        {
+            edges.push(
+                Edge::new(caller_id.clone(), callee_id.clone(), EdgeKind::Calls).with_evidence(
+                    path,
+                    *line,
+                    *line,
+                    EvidenceClass::Inferred,
+                    0.7,
+                    "same-file method call",
+                ),
+            );
+        }
     }
     for capture in JAVA_CLASS.captures_iter(&file.content) {
         let name = capture.get(2).unwrap();
@@ -229,18 +267,44 @@ fn extract_custom_endpoints(
 }
 
 /// camelCase → snake_case(MyBatis Plus 默认 mapUnderscoreToCamelCase 的逆推断)。
-/// 位置 0 的大写不插下划线。仅用于 @TableName 类内无显式 @TableField 字段的列名
-/// 推断,配 EvidenceClass::Inferred(显式注解走 Fact 1.0)。连续大写(URLPath)会转成
-/// u_r_l_path,与 MP 默认略异——这类字段实践中多有显式注解,影响有限。
+/// 仅用于 @TableName 类内无显式 @TableField 字段的列名推断,配 EvidenceClass::Inferred
+/// (显式注解走 Fact 1.0)。下划线插在两类边界:
+///   - 小写→大写(camelCase):userId → user_id
+///   - 大写缩写词结束(后接小写):URLPath → url_path、XMLParser → xml_parser
+///     (缩写词内部连续大写不逐字拆分,与 MP 默认一致)
 fn camel_to_snake(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
     let mut out = String::with_capacity(name.len() + 4);
-    for (i, ch) in name.chars().enumerate() {
-        if ch.is_ascii_uppercase() && i != 0 {
-            out.push('_');
+    for (i, &ch) in chars.iter().enumerate() {
+        if ch.is_ascii_uppercase() && i > 0 {
+            let prev = chars[i - 1];
+            // 小写→大写:camelCase 边界(userId 的 I)
+            // 大写→大写 且 下一个是小写:缩写词到此结束,当前是新词首(URLPath 的 P)
+            if prev.is_ascii_lowercase()
+                || (prev.is_ascii_uppercase()
+                    && i + 1 < chars.len()
+                    && chars[i + 1].is_ascii_lowercase())
+            {
+                out.push('_');
+            }
         }
         out.push(ch.to_ascii_lowercase());
     }
     out
+}
+
+/// getter 方法名 → 字段名:getCustomerName→customerName,isActive→active。
+/// 去掉 get/is 前缀后首字母小写;无前缀则原样首字母小写。
+fn method_to_field(method: &str) -> String {
+    let after = method
+        .strip_prefix("get")
+        .or_else(|| method.strip_prefix("is"))
+        .unwrap_or(method);
+    let mut chars = after.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_ascii_lowercase(), chars.as_str()),
+        None => String::new(),
+    }
 }
 
 /// MyBatis Plus 持久层提取。MP 主力是注解实体 + BaseMapper + QueryWrapper 链式 API,
@@ -414,6 +478,7 @@ fn extract_mybatis_plus(
             mname.as_str(),
             mname.as_str(),
         )
+        .with_metadata(json!({"entity_type": entity_type}))
         .with_evidence(
             path,
             line,
@@ -472,6 +537,45 @@ fn extract_mybatis_plus(
         );
         entities.push(column);
     }
+
+    // (4) Lambda 方法引用:wrapper.eq(Entity::getXxx, …) → 列(Inferred)
+    //     getXxx→字段名→驼峰列名。跨文件 Entity 的显式 @TableField 未查(精度换覆盖);
+    //     同 (文件,列名) 的 Column 因 EntityId 确定性合并。
+    for lambda_cap in MP_WRAPPER_LAMBDA.captures_iter(content) {
+        let method = lambda_cap.get(3).unwrap();
+        let field_name = method_to_field(method.as_str());
+        if field_name.is_empty() {
+            continue;
+        }
+        let col_name = camel_to_snake(&field_name);
+        let line = line_of(content, method.start());
+        let column = Entity::new(
+            EntityId::stable("workspace", path, EntityKind::Column, &col_name, ""),
+            EntityKind::Column,
+            &col_name,
+            format!("{path}#{col_name}"),
+        )
+        .with_metadata(json!({"source": "lambda_wrapper"}))
+        .with_evidence(
+            path,
+            line,
+            line,
+            EvidenceClass::Inferred,
+            0.6,
+            "QueryWrapper Lambda method reference",
+        );
+        edges.push(
+            Edge::new(file.id.clone(), column.id.clone(), EdgeKind::ReadsColumn).with_evidence(
+                path,
+                line,
+                line,
+                EvidenceClass::Inferred,
+                0.6,
+                "QueryWrapper Lambda column reference",
+            ),
+        );
+        entities.push(column);
+    }
 }
 
 // ---- Spring Bean 依赖注入(基于 tree-sitter AST) ----
@@ -487,6 +591,8 @@ fn extract_mybatis_plus(
 struct SpringSignals {
     transactional: bool,
     scheduled: bool,
+    /// 该类型直接子构造器数量(决定单构造器是否自动注入)。interface 恒为 0。
+    constructor_count: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -502,13 +608,52 @@ fn visit_spring(
     match node.kind() {
         "class_declaration" | "interface_declaration" | "record_declaration"
         | "enum_declaration" => {
-            if has_annotation(source, node, &["Transactional"])
-                && let Some(name_node) = node.child_by_field_name("name")
-            {
-                signals
-                    .entry(node_text(source, name_node))
-                    .or_default()
-                    .transactional = true;
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = node_text(source, name_node);
+                let sig = signals.entry(name).or_default();
+                if has_annotation(source, node, &["Transactional"]) {
+                    sig.transactional = true;
+                }
+                // 数构造器(class_body/enum_body 等容器下的成员,非 class 直接子);
+                // interface 无构造器→0。决定单构造器是否自动注入。
+                let mut ctors = 0;
+                for i in 0..node.named_child_count() {
+                    if let Some(body) = node.named_child(i) {
+                        for j in 0..body.named_child_count() {
+                            if let Some(member) = body.named_child(j)
+                                && member.kind() == "constructor_declaration"
+                            {
+                                ctors += 1;
+                            }
+                        }
+                    }
+                }
+                sig.constructor_count = ctors;
+            }
+        }
+        "constructor_declaration" => {
+            // 构造器注入:@Autowired 标注,或所在 class 恰好 1 个构造器(Spring 默认)。
+            if let Some((owner_name, owner_kind)) = enclosing_type(source, node) {
+                let single = signals
+                    .get(&owner_name)
+                    .is_some_and(|sig| sig.constructor_count == 1);
+                if has_annotation(source, node, &["Autowired"]) || single {
+                    for param_type in constructor_param_types(source, node) {
+                        if !param_type.is_empty() {
+                            link_bean(
+                                file,
+                                path,
+                                &param_type,
+                                &owner_name,
+                                owner_kind,
+                                EdgeKind::DependsOn,
+                                node,
+                                entities,
+                                edges,
+                            );
+                        }
+                    }
+                }
             }
         }
         "method_declaration" => {
@@ -560,6 +705,82 @@ fn visit_spring(
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
             visit_spring(child, source, file, path, entities, edges, signals);
+        }
+    }
+}
+
+/// 方法级提取:method_declaration → Method 实体;method_invocation → 调用信号。
+/// caller/callee 按方法名同文件匹配(低保真:跨类同名混淆、跨文件调用留后续)。
+#[allow(clippy::too_many_arguments)]
+fn visit_methods(
+    node: Node<'_>,
+    source: &[u8],
+    file: &SourceFile,
+    path: &str,
+    entities: &mut Vec<Entity>,
+    edges: &mut Vec<Edge>,
+    methods: &mut HashMap<String, EntityId>,
+    invocations: &mut Vec<(String, String, u32)>,
+    current_method: Option<&str>,
+) {
+    if node.kind() == "method_declaration"
+        && let Some(name_node) = node.child_by_field_name("name")
+    {
+        let name = node_text(source, name_node);
+        let line = line_of(&file.content, name_node.start_byte());
+        let entity = Entity::new(
+            EntityId::stable("workspace", path, EntityKind::Method, &name, ""),
+            EntityKind::Method,
+            &name,
+            format!("{path}#{name}"),
+        )
+        .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "Java method declaration");
+        let id = entity.id.clone();
+        add_contained(file, path, entity, line, entities, edges);
+        methods.insert(name.clone(), id);
+        for i in 0..node.named_child_count() {
+            if let Some(child) = node.named_child(i) {
+                visit_methods(
+                    child,
+                    source,
+                    file,
+                    path,
+                    entities,
+                    edges,
+                    methods,
+                    invocations,
+                    Some(&name),
+                );
+            }
+        }
+        return;
+    }
+    if node.kind() == "method_invocation"
+        && let (Some(caller), Some(name_node)) =
+            (current_method, node.child_by_field_name("name"))
+    {
+        let callee = node_text(source, name_node);
+        if !callee.is_empty() {
+            invocations.push((
+                caller.to_string(),
+                callee,
+                line_of(&file.content, node.start_byte()),
+            ));
+        }
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            visit_methods(
+                child,
+                source,
+                file,
+                path,
+                entities,
+                edges,
+                methods,
+                invocations,
+                current_method,
+            );
         }
     }
 }
@@ -638,6 +859,26 @@ fn injected_field_type(source: &[u8], node: Node<'_>) -> Option<String> {
         .map(|t| node_text(source, t))
 }
 
+/// 构造器的参数类型列表(formal_parameters → formal_parameter.type)。
+fn constructor_param_types(source: &[u8], node: Node<'_>) -> Vec<String> {
+    let mut types = Vec::new();
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i)
+            && child.kind() == "formal_parameters"
+        {
+            for j in 0..child.named_child_count() {
+                if let Some(param) = child.named_child(j)
+                    && param.kind() == "formal_parameter"
+                    && let Some(type_node) = param.child_by_field_name("type")
+                {
+                    types.push(node_text(source, type_node));
+                }
+            }
+        }
+    }
+    types
+}
+
 #[allow(clippy::too_many_arguments)]
 fn link_bean(
     file: &SourceFile,
@@ -679,4 +920,27 @@ fn link_bean(
         ),
     );
     entities.push(bean);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn camel_to_snake_handles_camel_case_and_acronyms() {
+        // 普通 camelCase
+        assert_eq!(camel_to_snake("userId"), "user_id");
+        assert_eq!(camel_to_snake("customerName"), "customer_name");
+        // 连续大写(缩写词)——历史 bug:URLPath 曾被错转成 u_r_l_path
+        assert_eq!(camel_to_snake("URLPath"), "url_path");
+        assert_eq!(camel_to_snake("XMLParser"), "xml_parser");
+        assert_eq!(camel_to_snake("HTTPSConnection"), "https_connection");
+        // 全大写缩写词(无后续小写):整体小写,无下划线
+        assert_eq!(camel_to_snake("URL"), "url");
+        assert_eq!(camel_to_snake("id"), "id");
+        // 单字符大写首
+        assert_eq!(camel_to_snake("Id"), "id");
+        // 小写后接全大写结尾
+        assert_eq!(camel_to_snake("userURL"), "user_url");
+    }
 }
