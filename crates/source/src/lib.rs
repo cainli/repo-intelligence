@@ -16,6 +16,8 @@ pub enum FileKind {
     Properties,
     Gradle,
     Sql,
+    Toml,
+    Json,
     Unknown,
 }
 
@@ -37,6 +39,8 @@ impl FileKind {
             Some("yml") | Some("yaml") => Self::Yaml,
             Some("properties") => Self::Properties,
             Some("sql") => Self::Sql,
+            Some("toml") => Self::Toml,
+            Some("json") => Self::Json,
             _ => Self::Unknown,
         }
     }

@@ -455,3 +455,185 @@ fn impact_of_frontend_field_reaches_endpoint_via_file_bridge() {
         finding.confidence
     );
 }
+
+#[test]
+fn mybatis_plus_links_field_to_column_for_rename_impact() {
+    // MyBatis Plus 主力是注解实体 + BaseMapper + QueryWrapper,XML mapper 很少。
+    // 持久层贯通必须覆盖:@TableName/@TableField/@TableId 注解、驼峰推断、
+    // exist=false 跳过、BaseMapper、QueryWrapper 列引用,且 rename 字段影响要触达 Column。
+    use repo_intelligence_model::EntityId;
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("Order.java"),
+        r#"
+        @TableName("t_order")
+        public class Order {
+          @TableId("id")
+          private Long id;
+          @TableField("customer_name")
+          private String customerName;
+          private Integer orderStatus;
+          @TableField(exist = false)
+          private String transientField;
+        }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("OrderMapper.java"),
+        "interface OrderMapper extends BaseMapper<Order> {}",
+    )
+    .unwrap();
+
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+
+    // 显式 @TableField → customer_name Column(Fact)
+    let customer_cols = store
+        .search(SearchQuery::new("customer_name").with_limit(20))
+        .unwrap();
+    assert!(
+        customer_cols
+            .iter()
+            .any(|m| m.entity.kind == EntityKind::Column),
+        "@TableField 应产出 customer_name Column"
+    );
+    // 无注解字段 orderStatus 驼峰推断 → order_status Column(Inferred)
+    assert!(
+        store
+            .search(SearchQuery::new("order_status").with_limit(20))
+            .unwrap()
+            .iter()
+            .any(|m| m.entity.kind == EntityKind::Column),
+        "无注解字段 orderStatus 应驼峰推断为 order_status Column"
+    );
+    // exist=false 字段不产出 Column
+    assert!(
+        !store
+            .search(SearchQuery::new("transient_field").with_limit(20))
+            .unwrap()
+            .iter()
+            .any(|m| m.entity.kind == EntityKind::Column),
+        "@TableField(exist=false) 字段不应产出 Column"
+    );
+    // @TableName → Table;BaseMapper → Mapper
+    assert!(
+        store
+            .search(SearchQuery::new("t_order").with_limit(10))
+            .unwrap()
+            .iter()
+            .any(|m| m.entity.kind == EntityKind::Table)
+    );
+    assert!(
+        store
+            .search(SearchQuery::new("OrderMapper").with_limit(10))
+            .unwrap()
+            .iter()
+            .any(|m| m.entity.kind == EntityKind::Mapper)
+    );
+
+    // rename customerName 的影响必须触达 Order.java 的 customer_name Column(贯通链)
+    let column_id = EntityId::stable(
+        "workspace",
+        "Order.java",
+        EntityKind::Column,
+        "customer_name",
+        "",
+    );
+    let report = ImpactAnalyzer::new(&store)
+        .analyze(&ChangeRequest::rename_field(
+            "customerName",
+            "customerFullName",
+        ))
+        .unwrap();
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.path.contains(&column_id)),
+        "rename customerName 应在某 finding 的 path 里触达 customer_name Column"
+    );
+}
+
+#[test]
+fn dependency_graph_links_module_to_declared_dependencies() {
+    // package.json → npm 模块 Package + 依赖;build.gradle.kts → gradle 模块 + 依赖。
+    // 模块级依赖影响:以依赖为源反向遍历应触达声明它的模块。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("package.json"),
+        r#"{
+          "name": "mos-websr",
+          "dependencies": { "vue": "^3.5.4", "axios": "^1.12.0" },
+          "devDependencies": { "vite": "^5.3.5" }
+        }"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("build.gradle.kts"),
+        r#"
+        dependencies {
+          implementation("com.foo:ccl-loan:1.0")
+          implementation(libs.baz.qux)
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+
+    let module = store
+        .search(SearchQuery::new("mos-websr").with_limit(10))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::Package && m.entity.name == "mos-websr")
+        .expect("npm module Package")
+        .entity;
+    let vue = store
+        .search(SearchQuery::new("vue").with_limit(10))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::Package && m.entity.name == "vue")
+        .expect("vue dependency Package")
+        .entity;
+    // 模块 --DependsOn--> vue:从 vue 反向遍历应到模块
+    let vue_dependents = store
+        .traverse(TraverseQuery {
+            start: vue.id.clone(),
+            outbound: false,
+            max_depth: 1,
+            edge_kinds: vec![EdgeKind::DependsOn],
+        })
+        .unwrap();
+    assert!(
+        vue_dependents.entities.iter().any(|e| e.id == module.id),
+        "mos-websr 应 DependsOn vue"
+    );
+    // gradle 依赖:坐标版本剥离 + libs.xxx 别名引用
+    assert!(
+        store
+            .search(SearchQuery::new("com.foo:ccl-loan").with_limit(10))
+            .unwrap()
+            .iter()
+            .any(|m| m.entity.kind == EntityKind::Package)
+    );
+    assert!(
+        store
+            .search(SearchQuery::new("libs.baz.qux").with_limit(10))
+            .unwrap()
+            .iter()
+            .any(|m| m.entity.kind == EntityKind::Package)
+    );
+    // 模块级依赖影响:以 vue 为源的影响分析应 inbound 触达 mos-websr 模块
+    let report = ImpactAnalyzer::new(&store)
+        .analyze(&ChangeRequest::rename_field("vue", "vue-next"))
+        .unwrap();
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.path.contains(&module.id)),
+        "以 vue 为源的影响分析应 inbound 触达依赖它的 mos-websr 模块"
+    );
+}

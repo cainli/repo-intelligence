@@ -532,10 +532,7 @@ fn index_call_chain(database: &std::path::Path) {
         Edge::new(s27204.id.clone(), s28000.id.clone(), EdgeKind::DependsOn),
     ];
     store
-        .apply_patch(GraphPatch::add(
-            vec![s27501, s27204, s27000, s28000],
-            edges,
-        ))
+        .apply_patch(GraphPatch::add(vec![s27501, s27204, s27000, s28000], edges))
         .unwrap();
 }
 
@@ -553,7 +550,8 @@ fn call_tool(
     });
     let mut output = Vec::new();
     let line = format!("{request}\n");
-    repo_intelligence_mcp::serve(Cursor::new(line.as_bytes()), &mut output, Some(database)).unwrap();
+    repo_intelligence_mcp::serve(Cursor::new(line.as_bytes()), &mut output, Some(database))
+        .unwrap();
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     response["result"]["structuredContent"].clone()
 }
@@ -573,7 +571,11 @@ fn trace_callers_walks_the_inbound_call_chain() {
     let database = directory.path().join("graph.sqlite");
     index_call_chain(&database);
 
-    let structured = call_tool(&database, "trace_callers", serde_json::json!({"name": "S27204"}));
+    let structured = call_tool(
+        &database,
+        "trace_callers",
+        serde_json::json!({"name": "S27204"}),
+    );
 
     assert_eq!(structured["start_count"], 1);
     let names = entity_names(&structured);
@@ -606,7 +608,11 @@ fn trace_callees_walks_the_outbound_call_chain() {
     let database = directory.path().join("graph.sqlite");
     index_call_chain(&database);
 
-    let structured = call_tool(&database, "trace_callees", serde_json::json!({"name": "S27204"}));
+    let structured = call_tool(
+        &database,
+        "trace_callees",
+        serde_json::json!({"name": "S27204"}),
+    );
 
     assert_eq!(structured["start_count"], 1);
     let names = entity_names(&structured);
@@ -641,7 +647,10 @@ fn trace_follows_a_non_default_edge_kind() {
         "depends_on neighbor must be reachable: {structured}"
     );
     assert!(!names.contains(&"S27000".to_owned()));
-    assert_eq!(structured["edges"].as_array().unwrap()[0]["kind"], "depends_on");
+    assert_eq!(
+        structured["edges"].as_array().unwrap()[0]["kind"],
+        "depends_on"
+    );
 }
 
 #[test]
@@ -671,7 +680,11 @@ fn trace_unknown_name_attaches_a_hint() {
     let database = directory.path().join("graph.sqlite");
     index_call_chain(&database);
 
-    let structured = call_tool(&database, "trace_callers", serde_json::json!({"name": "NoSuchService"}));
+    let structured = call_tool(
+        &database,
+        "trace_callers",
+        serde_json::json!({"name": "NoSuchService"}),
+    );
     assert_eq!(structured["start_count"], 0);
     assert_eq!(structured["count"], 0);
     assert!(
@@ -696,9 +709,15 @@ fn trace_tools_declare_typed_schemas() {
             .find(|tool| tool["name"] == tool_name)
             .unwrap_or_else(|| panic!("missing {tool_name} in tools/list"));
         let input_props = &tool["inputSchema"]["properties"];
-        assert_eq!(input_props["name"]["type"], "string", "{tool_name} must take a name");
+        assert_eq!(
+            input_props["name"]["type"], "string",
+            "{tool_name} must take a name"
+        );
         assert_eq!(input_props["depth"]["default"], 2);
-        assert_eq!(input_props["edge_kinds"]["default"], serde_json::json!(["calls"]));
+        assert_eq!(
+            input_props["edge_kinds"]["default"],
+            serde_json::json!(["calls"])
+        );
         assert_eq!(tool["inputSchema"]["additionalProperties"], false);
         assert_eq!(tool["outputSchema"]["type"], "object");
         let required: Vec<&str> = tool["outputSchema"]["required"]

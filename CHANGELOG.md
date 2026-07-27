@@ -7,6 +7,57 @@
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-07-27
+
+### Added
+
+- **MyBatis Plus 持久层提取**：补齐主力 ORM（MyBatis Plus 3.5.7）的字段级贯通。
+  此前持久层贯通只解析传统 MyBatis XML mapper，而 MP 主力是注解实体 + BaseMapper +
+  QueryWrapper 链式 API，XML 无语句，导致字段级变更影响分析在主力持久层断裂。
+  `extract_java` 末尾新增 `extract_mybatis_plus`（regex 优先，不引入新 parser）：
+  - `@TableName("t")` → `Table` 实体 + `Class --depends_on→ Table`。
+  - `@TableField("c")`/`@TableId("c")` 注解字段 → `Column` 实体 + 显式
+    `Field --mapped_from→ Column`（Fact 1.0）；`@TableName` 类内无注解字段按驼峰转下划线
+    推断列名（Inferred 0.7）；`@TableField(exist = false)` 跳过。
+  - `interface XxxMapper extends BaseMapper<T>` → `Mapper` 实体；同文件内 T 是
+    `@TableName` 类 → `Mapper --depends_on→ Table`。
+  - `QueryWrapper` 链式列字面量（`.eq("col", …)` 等） → `Column` 实体 +
+    `File --reads_column→ Column`（Inferred 0.6，召回优先）。
+  - 同 (文件,列名) 的实体列与 wrapper 列引用合并为单一 Column 节点（EntityId 确定性）。
+- **模块依赖图**：`FileKind` 新增 `Toml`/`Json`（此前 `.toml`/`.json` 落 Unknown 被丢弃）；
+  `extract_package_json`/`extract_gradle`/`extract_version_catalog` 解析
+  package.json / build.gradle(.kts) / libs.versions.toml，产出模块 `Package` +
+  `DependsOn` 边，支撑「改 SDK X 影响 mes 哪些模块」的模块级依赖影响分析。
+- **前端字段降噪**：`VUE_BINDING` 新增 `is_likely_field` 守卫，过滤 JS/TS 内建方法
+  （length/map/forEach…）与全大写常量误报，降低 `FrontendField` 同名匹配噪声。
+
+### Changed
+
+- `resolve_cross_stack` 字段贯通桶纳入 `EntityKind::Column`，`semantic_rank(Column)=4`
+  （物理列居最深数据层，SqlField=3 之后）；跨文件/跨技术同名 Column 自动互链。
+- 字段重命名影响分析现可经显式 `Field→Column` mapped_from 边覆盖到 `Column` 实体，
+  主力持久层断链修复；`ImpactAnalyzer`/`plane_for`/`plane_rank` 无需改动
+  （Column 已在 data 平面 rank=2，分析器 kind-agnostic）。
+- clippy 漂移修复：Spring AST 区块（v0.1.8）的嵌套 `if let` 按新版 clippy 的
+  `collapsible_if` 合并为 let-chains（edition 2024）。
+- 新增测试：`mybatis_plus_links_field_to_column_for_rename_impact`、
+  `dependency_graph_links_module_to_declared_dependencies`（analysis 端到端）；
+  `mybatis_plus_explicit_is_fact_inferred_is_low_confidence`、
+  `camel_to_snake_via_inferred_column_names`、
+  `query_wrapper_column_reference_produces_inferred_reads_column`、
+  `frontend_noise_properties_are_not_extracted_as_fields`（semantics crate 首批集成测试）。
+
+### Known Limitations
+
+- `LambdaQueryWrapper` 的方法引用形式（`.eq(Entity::getName)`）不提取（需方法→字段映射）；
+  仅覆盖 `QueryWrapper` 字符串首参形式。
+- Mapper→Table 仅同文件解析；跨文件（实体与 mapper 分文件）留待后续在
+  `resolve_cross_stack` 加一轮泛型→实体类名→Table 同名匹配。
+- 驼峰转下划线对连续大写（`URLPath` → `u_r_l_path`）与 MP 默认略异；这类字段实践中
+  多有显式 `@TableField`，影响有限。
+- 模块依赖图实体是 path-scoped，同名依赖跨文件不自动合并；Gradle 版本目录别名的
+  连字符转点规则（`my-lib` → `libs.my.lib`）未实现，catalog 别名与 build 脚本引用暂不连通。
+
 ## [0.1.8] - 2026-07-27
 
 ### Added
