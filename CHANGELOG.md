@@ -7,6 +7,29 @@
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-07-27
+
+### Fixed
+
+- **MCP 工具未声明参数 schema 导致参数黑洞**：`tools/list` 此前给每个工具同一个
+  空 `inputSchema`（`{type:object, additionalProperties:true}`，零属性），客户端
+  因此不透传参数 → `analyze_change` 报 `missing field target_kind`、`show_system_view`
+  的 `view` 失效。现在为每个工具声明真实的 `inputSchema`（含 `query`/`target_kind`/
+  `operation`/`view`/`workspace` 等）与对象型 `outputSchema`。
+- **MCP 搜索类工具返回裸数组被协议拒绝**：`search_entities`/`find_endpoint`/
+  `analyze_requirement` 原本把 `Vec<Entity>` 直接作为 `structuredContent`，而 MCP 要求
+  其为 JSON 对象，触发 `expected record, received array`。现在包成 `{items, count}`。
+
+### Changed
+
+- `show_system_view` 的 `view` 参数真正生效：`api`/`data` 视图只返回对应平面的实体
+  分布；`repositories` 及未知视图仍返回全量概览（向后兼容）。
+- 搜索类工具新增可选 `limit` 参数（默认 100，与原硬编码一致）。
+- `analyze_change` 的 `from` 在 `inputSchema` 中标记为必填（运行时本就必填）。
+- 新增回归测试：`search_returns_structured_content_as_an_object`、
+  `tools_list_declares_typed_input_and_output_schemas`、
+  `system_view_filters_to_the_requested_plane`。
+
 ## [0.1.4] - 2026-07-27
 
 ### Fixed
