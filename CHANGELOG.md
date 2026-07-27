@@ -30,6 +30,10 @@
   供客户端区分精确命中与推断命中。
 - **MCP 空库可观测性**：`get_index_status` 显示规范化绝对路径；空库时
   `analyze_change`/`search` 加 open_question，避免"零影响"被误读为"安全"。
+- **前端字段影响 file-桥接**：`ImpactAnalyzer` 对前端字段 finding 额外从所在 file
+  outbound 到同 file 的 `http_client_call`→`MatchesEndpoint`→后端 endpoint，让"改前端
+  字段"的 blast radius 触及后端端点（此前字段是叶节点，单向 traverse 到 file 即停）。
+  桥接走的 Inferred 边会拉低 finding.confidence，与分级匹配呼应。
 
 ### Changed
 

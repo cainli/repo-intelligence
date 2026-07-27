@@ -398,3 +398,60 @@ fn impact_finding_carries_confidence_field() {
         "pure-field path should be fully confident"
     );
 }
+
+#[test]
+fn impact_of_frontend_field_reaches_endpoint_via_file_bridge() {
+    // 前端字段是叶节点,单向 traverse 到所在 file 即停。file-桥接应让它触及
+    // 同 file 的 http_client_call → MatchesEndpoint → 后端 endpoint,且因 MatchesEndpoint
+    // 多为 Inferred,把 finding.confidence 拉到 < 1.0(分级匹配首次在字段分析生效)。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("OrderController.java"),
+        r#"
+        @RestController
+        @RequestMapping(value = "/orders")
+        class OrderController {
+          @GetMapping("/{id}")
+          OrderDto getOrder() { return null; }
+        }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("OrderPage.vue"),
+        r#"<template>{{ order.customerName }}</template>
+        <script setup>
+        const order = await request.get("/api/orders/1")
+        </script>"#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    let endpoint = store
+        .search(SearchQuery::new("orders").with_limit(20))
+        .unwrap()
+        .into_iter()
+        .find(|matched| matched.entity.kind == EntityKind::HttpEndpoint)
+        .expect("backend endpoint")
+        .entity;
+    let report = ImpactAnalyzer::new(&store)
+        .analyze(&ChangeRequest::rename_field(
+            "customerName",
+            "customerFullName",
+        ))
+        .unwrap();
+    let finding = report
+        .findings
+        .iter()
+        .find(|found| found.entity.kind == EntityKind::FrontendField)
+        .expect("frontend field finding");
+    assert!(
+        finding.path.contains(&endpoint.id),
+        "frontend field impact should reach the backend endpoint via the file bridge"
+    );
+    assert!(
+        finding.confidence < 1.0,
+        "confidence should drop via the Inferred matches_endpoint edge, got {}",
+        finding.confidence
+    );
+}
