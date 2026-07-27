@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use repo_intelligence_analysis::{ImpactAnalyzer, WorkspaceIndexer};
+use repo_intelligence_analysis::{ImpactAnalyzer, ScanPhase, ScanProgress, WorkspaceIndexer};
 use repo_intelligence_graph::{GraphStore, SqliteGraphStore};
 use repo_intelligence_model::{ChangeRequest, SearchQuery};
 use repo_intelligence_protocol::Envelope;
@@ -108,7 +108,8 @@ fn run() -> Result<()> {
         }
         Command::Scan { workspace, format } => {
             let mut store = SqliteGraphStore::open(&cli.database)?;
-            let summary = WorkspaceIndexer.scan(&workspace, &mut store)?;
+            let summary =
+                WorkspaceIndexer.scan_with_progress(&workspace, &mut store, log_scan_progress)?;
             emit(
                 format,
                 serde_json::json!({
@@ -167,6 +168,25 @@ fn run() -> Result<()> {
             )
         }
     }
+}
+
+fn log_scan_progress(progress: ScanProgress) {
+    if progress.phase == ScanPhase::Parsing
+        && progress.current_path.is_some()
+        && progress.processed != 0
+        && !progress.processed.is_multiple_of(100)
+    {
+        return;
+    }
+    let current = progress
+        .current_path
+        .as_deref()
+        .map(|path| format!(" file={path}"))
+        .unwrap_or_default();
+    eprintln!(
+        "[repo-intelligence] phase={} progress={}/{} elapsed_ms={}{}",
+        progress.phase, progress.processed, progress.total, progress.elapsed_ms, current
+    );
 }
 
 fn emit<T: serde::Serialize>(format: OutputFormat, data: T) -> Result<()> {

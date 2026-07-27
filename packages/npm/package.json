@@ -1,6 +1,6 @@
 {
   "name": "@cainli/repo-intelligence",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": false,
   "type": "module",
   "description": "Local cross-stack repository intelligence and change impact analyzer",
@@ -25,6 +25,6 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@cainli/repo-intelligence-darwin-arm64": "0.1.0"
+    "@cainli/repo-intelligence-darwin-arm64": "0.1.1"
   }
 }

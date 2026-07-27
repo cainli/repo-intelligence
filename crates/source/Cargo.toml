@@ -11,3 +11,5 @@ ignore.workspace = true
 repo-intelligence-model = { path = "../model" }
 serde.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true

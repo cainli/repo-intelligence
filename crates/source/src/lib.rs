@@ -56,6 +56,7 @@ pub fn discover(root: &Path) -> Result<Vec<SourceFile>> {
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .git_ignore(true)
+        .require_git(false)
         .filter_entry(|entry| {
             !matches!(
                 entry.file_name().to_str(),

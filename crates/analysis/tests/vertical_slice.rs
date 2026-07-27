@@ -1,6 +1,6 @@
 use std::fs;
 
-use repo_intelligence_analysis::{ImpactAnalyzer, WorkspaceIndexer};
+use repo_intelligence_analysis::{ImpactAnalyzer, ScanPhase, WorkspaceIndexer};
 use repo_intelligence_graph::{GraphStore, SqliteGraphStore};
 use repo_intelligence_model::{ChangeRequest, EdgeKind, EntityKind, SearchQuery, TraverseQuery};
 
@@ -72,6 +72,38 @@ fn indexes_cross_stack_field_chain_and_reports_rename_impact() {
             .iter()
             .all(|finding| !finding.evidence.is_empty())
     );
+}
+
+#[test]
+fn scan_reports_stage_and_file_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("Dto.java"),
+        "class Dto { private String name; }",
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    let mut progress = Vec::new();
+
+    WorkspaceIndexer
+        .scan_with_progress(dir.path(), &mut store, |event| progress.push(event))
+        .unwrap();
+
+    assert_eq!(progress.first().unwrap().phase, ScanPhase::Discovering);
+    assert!(progress.iter().any(|event| {
+        event.phase == ScanPhase::Parsing && event.processed == 1 && event.total == 1
+    }));
+    assert!(
+        progress
+            .iter()
+            .any(|event| event.phase == ScanPhase::Resolving)
+    );
+    assert!(
+        progress
+            .iter()
+            .any(|event| event.phase == ScanPhase::Persisting)
+    );
+    assert_eq!(progress.last().unwrap().phase, ScanPhase::Completed);
 }
 
 #[test]

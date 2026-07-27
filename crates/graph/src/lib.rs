@@ -19,6 +19,7 @@ pub struct Traversal {
 
 pub trait GraphStore {
     fn apply_patch(&mut self, patch: GraphPatch) -> Result<()>;
+    fn replace_snapshot(&mut self, patch: GraphPatch) -> Result<()>;
     fn search(&self, query: SearchQuery) -> Result<Vec<EntityMatch>>;
     fn traverse(&self, query: TraverseQuery) -> Result<Traversal>;
     fn get_entity(&self, id: &EntityId) -> Result<Option<Entity>>;
@@ -107,53 +108,94 @@ impl SqliteGraphStore {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
-}
 
-impl GraphStore for SqliteGraphStore {
-    fn apply_patch(&mut self, patch: GraphPatch) -> Result<()> {
-        let transaction = self.connection.transaction()?;
-        for id in patch.remove_entities {
-            transaction.execute(
-                "DELETE FROM edge WHERE source_id = ?1 OR target_id = ?1",
-                [&id.0],
+    fn write_patch(
+        transaction: &rusqlite::Transaction<'_>,
+        patch: GraphPatch,
+        replacing_snapshot: bool,
+    ) -> Result<()> {
+        if replacing_snapshot {
+            transaction.execute_batch(
+                "
+                DELETE FROM edge;
+                DELETE FROM entity_fts;
+                DELETE FROM entity;
+                ",
             )?;
-            transaction.execute("DELETE FROM entity_fts WHERE entity_id = ?1", [&id.0])?;
-            transaction.execute("DELETE FROM entity WHERE id = ?1", [&id.0])?;
+        } else {
+            for id in patch.remove_entities {
+                transaction.execute(
+                    "DELETE FROM edge WHERE source_id = ?1 OR target_id = ?1",
+                    [&id.0],
+                )?;
+                transaction.execute("DELETE FROM entity_fts WHERE entity_id = ?1", [&id.0])?;
+                transaction.execute("DELETE FROM entity WHERE id = ?1", [&id.0])?;
+            }
         }
-        for entity in patch.add_entities {
-            let json = serde_json::to_string(&entity)?;
-            transaction.execute(
+
+        {
+            let mut upsert_entity = transaction.prepare_cached(
                 "INSERT INTO entity(id, kind, name, qualified_name, json)
                  VALUES(?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(id) DO UPDATE SET
                    kind=excluded.kind, name=excluded.name,
                    qualified_name=excluded.qualified_name, json=excluded.json",
-                params![
+            )?;
+            let mut delete_fts = if replacing_snapshot {
+                None
+            } else {
+                Some(transaction.prepare_cached("DELETE FROM entity_fts WHERE entity_id = ?1")?)
+            };
+            let mut insert_fts = transaction.prepare_cached(
+                "INSERT INTO entity_fts(entity_id, name, qualified_name) VALUES(?1, ?2, ?3)",
+            )?;
+            for entity in patch.add_entities {
+                let json = serde_json::to_string(&entity)?;
+                upsert_entity.execute(params![
                     entity.id.0,
                     entity.kind.as_str(),
                     entity.name,
                     entity.qualified_name,
                     json
-                ],
-            )?;
-            transaction.execute(
-                "DELETE FROM entity_fts WHERE entity_id = ?1",
-                [&entity.id.0],
-            )?;
-            transaction.execute(
-                "INSERT INTO entity_fts(entity_id, name, qualified_name) VALUES(?1, ?2, ?3)",
-                params![entity.id.0, entity.name, entity.qualified_name],
-            )?;
+                ])?;
+                if let Some(statement) = delete_fts.as_mut() {
+                    statement.execute([&entity.id.0])?;
+                }
+                insert_fts.execute(params![entity.id.0, entity.name, entity.qualified_name])?;
+            }
         }
-        for edge in patch.add_edges {
-            let json = serde_json::to_string(&edge)?;
-            transaction.execute(
+
+        {
+            let mut upsert_edge = transaction.prepare_cached(
                 "INSERT INTO edge(source_id, target_id, kind, json)
                  VALUES(?1, ?2, ?3, ?4)
                  ON CONFLICT(source_id, target_id, kind) DO UPDATE SET json=excluded.json",
-                params![edge.source.0, edge.target.0, edge.kind.as_str(), json],
             )?;
+            for edge in patch.add_edges {
+                let json = serde_json::to_string(&edge)?;
+                upsert_edge.execute(params![
+                    edge.source.0,
+                    edge.target.0,
+                    edge.kind.as_str(),
+                    json
+                ])?;
+            }
         }
+        Ok(())
+    }
+}
+
+impl GraphStore for SqliteGraphStore {
+    fn apply_patch(&mut self, patch: GraphPatch) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        Self::write_patch(&transaction, patch, false)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn replace_snapshot(&mut self, patch: GraphPatch) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        Self::write_patch(&transaction, patch, true)?;
         transaction.commit()?;
         Ok(())
     }

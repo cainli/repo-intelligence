@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 use repo_intelligence_graph::GraphStore;
@@ -16,36 +17,121 @@ pub struct ScanSummary {
     pub edges_indexed: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanPhase {
+    Discovering,
+    Parsing,
+    Resolving,
+    Persisting,
+    Completed,
+}
+
+impl std::fmt::Display for ScanPhase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Discovering => "discovering",
+            Self::Parsing => "parsing",
+            Self::Resolving => "resolving",
+            Self::Persisting => "persisting",
+            Self::Completed => "completed",
+        };
+        formatter.write_str(value)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanProgress {
+    pub phase: ScanPhase,
+    pub processed: usize,
+    pub total: usize,
+    pub current_path: Option<String>,
+    pub elapsed_ms: u128,
+}
+
 #[derive(Default)]
 pub struct WorkspaceIndexer;
 
 impl WorkspaceIndexer {
     pub fn scan(&self, root: &Path, store: &mut dyn GraphStore) -> Result<ScanSummary> {
+        self.scan_with_progress(root, store, |_| {})
+    }
+
+    pub fn scan_with_progress<F>(
+        &self,
+        root: &Path,
+        store: &mut dyn GraphStore,
+        mut report: F,
+    ) -> Result<ScanSummary>
+    where
+        F: FnMut(ScanProgress),
+    {
+        let started = Instant::now();
+        report(ScanProgress {
+            phase: ScanPhase::Discovering,
+            processed: 0,
+            total: 0,
+            current_path: None,
+            elapsed_ms: 0,
+        });
         let files = discover(root)?;
+        report(ScanProgress {
+            phase: ScanPhase::Discovering,
+            processed: files.len(),
+            total: files.len(),
+            current_path: None,
+            elapsed_ms: started.elapsed().as_millis(),
+        });
         let mut summary = ScanSummary {
             files_indexed: files.len(),
             ..Default::default()
         };
-        let remove_entities = store
-            .all_entities()?
-            .into_iter()
-            .map(|entity| entity.id)
-            .collect();
-        let mut combined = GraphPatch {
-            remove_entities,
-            ..Default::default()
-        };
-        for file in &files {
+        let mut combined = GraphPatch::default();
+        for (index, file) in files.iter().enumerate() {
+            report(ScanProgress {
+                phase: ScanPhase::Parsing,
+                processed: index,
+                total: files.len(),
+                current_path: Some(file.relative_path.to_string_lossy().to_string()),
+                elapsed_ms: started.elapsed().as_millis(),
+            });
             let patch = repo_intelligence_semantics::extract(file)?;
             summary.entities_indexed += patch.add_entities.len();
             summary.edges_indexed += patch.add_edges.len();
             combined.add_entities.extend(patch.add_entities);
             combined.add_edges.extend(patch.add_edges);
         }
+        report(ScanProgress {
+            phase: ScanPhase::Parsing,
+            processed: files.len(),
+            total: files.len(),
+            current_path: None,
+            elapsed_ms: started.elapsed().as_millis(),
+        });
+        report(ScanProgress {
+            phase: ScanPhase::Resolving,
+            processed: 0,
+            total: combined.add_entities.len(),
+            current_path: None,
+            elapsed_ms: started.elapsed().as_millis(),
+        });
         let resolution = resolve_cross_stack(combined.add_entities.clone());
         summary.edges_indexed += resolution.add_edges.len();
         combined.add_edges.extend(resolution.add_edges);
-        store.apply_patch(combined)?;
+        report(ScanProgress {
+            phase: ScanPhase::Persisting,
+            processed: 0,
+            total: combined.add_entities.len() + combined.add_edges.len(),
+            current_path: None,
+            elapsed_ms: started.elapsed().as_millis(),
+        });
+        store.replace_snapshot(combined)?;
+        report(ScanProgress {
+            phase: ScanPhase::Completed,
+            processed: summary.files_indexed,
+            total: summary.files_indexed,
+            current_path: None,
+            elapsed_ms: started.elapsed().as_millis(),
+        });
         Ok(summary)
     }
 }

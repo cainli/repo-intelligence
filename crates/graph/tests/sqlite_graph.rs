@@ -3,6 +3,7 @@ use repo_intelligence_model::{
     Edge, EdgeKind, Entity, EntityId, EntityKind, EvidenceClass, GraphPatch, SearchQuery,
     TraverseQuery,
 };
+use std::time::{Duration, Instant};
 
 fn entity(kind: EntityKind, name: &str) -> Entity {
     Entity::new(
@@ -11,6 +12,41 @@ fn entity(kind: EntityKind, name: &str) -> Entity {
         name,
         name,
     )
+}
+
+#[test]
+fn replaces_a_large_snapshot_without_per_entity_fts_deletes() {
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    let old_entities = (0..5_000)
+        .map(|index| entity(EntityKind::Field, &format!("old_field_{index}")))
+        .collect();
+    store
+        .replace_snapshot(GraphPatch::add(old_entities, vec![]))
+        .unwrap();
+
+    let replacement = entity(EntityKind::Field, "replacement");
+    let started = Instant::now();
+    store
+        .replace_snapshot(GraphPatch::add(vec![replacement.clone()], vec![]))
+        .unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(
+        store
+            .search(SearchQuery::new("old_field_"))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .search(SearchQuery::new("replacement"))
+            .unwrap()
+            .first()
+            .unwrap()
+            .entity
+            .id,
+        replacement.id
+    );
 }
 
 #[test]
