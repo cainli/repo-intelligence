@@ -26,9 +26,11 @@ test("rejects unsupported platforms clearly", () => {
 
 test("publishes an executable CLI entrypoint", () => {
   const cli = fileURLToPath(new URL("../bin/cli.js", import.meta.url));
-  assert.notEqual(statSync(cli).mode & 0o111, 0);
   const manifest = JSON.parse(
     readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"),
   );
   assert.equal(manifest.bin["repo-intelligence"], "bin/cli.js");
+  if (process.platform !== "win32") {
+    assert.notEqual(statSync(cli).mode & 0o111, 0);
+  }
 });
