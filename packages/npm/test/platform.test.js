@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { statSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import { platformPackage } from "../lib/platform.js";
 
@@ -20,4 +22,9 @@ test("maps supported platforms to public packages owned by the publisher", () =>
 
 test("rejects unsupported platforms clearly", () => {
   assert.throws(() => platformPackage("aix", "ppc64"), /Unsupported platform/);
+});
+
+test("publishes an executable CLI entrypoint", () => {
+  const cli = fileURLToPath(new URL("../bin/cli.js", import.meta.url));
+  assert.notEqual(statSync(cli).mode & 0o111, 0);
 });
