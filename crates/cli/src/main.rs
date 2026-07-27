@@ -139,12 +139,13 @@ fn run() -> Result<()> {
         }
         Command::Status { format } => {
             let store = SqliteGraphStore::open(&cli.database)?;
-            let entities = store.all_entities()?;
+            let (entities, edges) = store.counts()?;
             emit(
                 format,
                 serde_json::json!({
                     "database": cli.database,
-                    "entities": entities.len()
+                    "entities": entities,
+                    "edges": edges
                 }),
             )
         }

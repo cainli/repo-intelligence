@@ -3,7 +3,7 @@
 本地运行的跨技术栈代码知识图谱与字段变更影响分析引擎。核心使用 Rust、bundled
 SQLite、FTS5 和 Tree-sitter，通过 npm CLI 或原生二进制运行，不依赖图数据库。
 
-当前 Rust 引擎 `0.1.1` 是首个可运行垂直切片，已经支持：
+当前 Rust 引擎 `0.1.4`，已经支持：
 
 - 遵循 Git ignore 规则扫描 Java、Vue/TypeScript、MyBatis XML 等文件。
 - 使用 Tree-sitter 验证 Java 语法，并提取 Java 字段与 Spring Mapping。
@@ -15,7 +15,7 @@ SQLite、FTS5 和 Tree-sitter，通过 npm CLI 或原生二进制运行，不依
 ## 扫描范围与自动忽略
 
 扫描器会读取项目的 `.gitignore` 和 `.ignore`，并固定排除
-`.git/`、`node_modules/`、`target/`、`build/`、`dist/`、`.gradle/`。
+`.git/`、`node_modules/`、`target/`、`build/`、`dist/`、`.gradle`、`.claude/`。
 不支持的文件扩展名和超过 2 MiB 的单个文件也会跳过。项目可以在 `.ignore`
 中增加生成代码、日志、缓存或其他不需要分析的目录。
 
@@ -55,13 +55,15 @@ target/release/repo-intelligence impact \
   --format json
 ```
 
-MCP 配置使用：
+MCP 配置使用（`--database` 必须指向可写路径，避免使用只读的系统目录）：
 
 ```bash
-repo-intelligence --database /absolute/path/workspace.sqlite mcp
+repo-intelligence --database ~/.repo-intelligence/workspace.sqlite mcp
 ```
 
-stdout 仅输出 JSON-RPC，诊断信息输出到 stderr。
+stdout 仅输出 JSON-RPC，诊断信息输出到 stderr。`get_index_status` 与
+`show_system_view` 返回聚合计数与分布，而非全量实体，因此在大索引下也不会
+撑爆协议通道。
 
 ## npm 开发入口
 
@@ -86,3 +88,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 npm test --prefix packages/npm
 ```
+
+## 变更记录
+
+见 [CHANGELOG.md](CHANGELOG.md)。

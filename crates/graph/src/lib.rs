@@ -45,6 +45,34 @@ impl SqliteGraphStore {
         Ok(store)
     }
 
+    pub fn counts(&self) -> Result<(u64, u64)> {
+        let entities = self
+            .connection
+            .query_row("SELECT count(*) FROM entity", [], |row| row.get(0))?;
+        let edges = self
+            .connection
+            .query_row("SELECT count(*) FROM edge", [], |row| row.get(0))?;
+        Ok((entities, edges))
+    }
+
+    /// Counts entities grouped by `EntityKind`, aggregated in SQLite rather than
+    /// loaded into memory. Used to render a bounded "system view" for very large
+    /// graphs where `all_entities()` would overflow the MCP stdout channel.
+    pub fn counts_by_kind(&self) -> Result<HashMap<String, u64>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT kind, count(*) FROM entity GROUP BY kind")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+        })?;
+        let mut counts = HashMap::new();
+        for row in rows {
+            let (kind, count) = row?;
+            counts.insert(kind, count);
+        }
+        Ok(counts)
+    }
+
     fn initialize(&self) -> Result<()> {
         self.connection.execute_batch(
             "

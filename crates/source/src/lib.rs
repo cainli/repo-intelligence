@@ -60,7 +60,7 @@ pub fn discover(root: &Path) -> Result<Vec<SourceFile>> {
         .filter_entry(|entry| {
             !matches!(
                 entry.file_name().to_str(),
-                Some("node_modules" | "target" | "build" | "dist" | ".gradle" | ".git")
+                Some("node_modules" | "target" | "build" | "dist" | ".gradle" | ".git" | ".claude")
             )
         })
         .build();
