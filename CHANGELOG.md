@@ -7,6 +7,22 @@
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-07-27
+
+### Added
+
+- **空索引自诊断**：`get_index_status` 新增 `indexed`（布尔）字段，并在索引为空
+  （`entity_count == 0`）时附带 `hint`，提示先运行 `scan_workspace`。此前一个从未
+  扫描的空库会返回与"健康服务"无异的零计数结果，让人误以为工具可用，直到其它工具
+  静默返回空结果。
+
+### Fixed
+
+- **单个工具 panic 不再连累同批调用**：`tools/call` 现在用 `catch_unwind` 隔离每次
+  调用，工具内部的 panic 会降级为一条 `isError` 响应（panic 信息同时打到 stderr 便于
+  诊断），而不会 unwind 出 `serve`、杀掉整个会话——后者正是"多个并行调用里已应答的
+  正常、排在后面的全部报 internal error"这一类故障的结构性成因。
+
 ## [0.1.5] - 2026-07-27
 
 ### Fixed
