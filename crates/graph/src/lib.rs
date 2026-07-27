@@ -264,6 +264,12 @@ impl GraphStore for SqliteGraphStore {
                 continue;
             }
             for edge in self.adjacent_edges(&current, query.outbound)? {
+                // When the caller pins `edge_kinds`, stay on those edges only —
+                // otherwise a callers/callees walk would ride `Contains`/`DependsOn`
+                // edges, burning depth budget and dragging in unrelated nodes.
+                if !query.edge_kinds.is_empty() && !query.edge_kinds.contains(&edge.kind) {
+                    continue;
+                }
                 let next = if query.outbound {
                     edge.target.clone()
                 } else {

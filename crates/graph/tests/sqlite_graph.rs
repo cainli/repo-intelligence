@@ -81,3 +81,54 @@ fn applies_patch_searches_and_traverses() {
     assert_eq!(traversal.entities.len(), 2);
     assert_eq!(traversal.edges.len(), 1);
 }
+
+#[test]
+fn traverse_filters_by_edge_kind() {
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    let alpha = entity(EntityKind::Method, "Alpha");
+    let beta = entity(EntityKind::Method, "Beta");
+    let gamma = entity(EntityKind::Method, "Gamma");
+    // Reached only via a Contains edge — must drop out when filtering to Calls.
+    let nested = entity(EntityKind::Class, "Nested");
+    let edges = vec![
+        Edge::new(alpha.id.clone(), beta.id.clone(), EdgeKind::Calls),
+        Edge::new(beta.id.clone(), gamma.id.clone(), EdgeKind::Calls),
+        Edge::new(alpha.id.clone(), nested.id.clone(), EdgeKind::Contains),
+    ];
+    store
+        .apply_patch(GraphPatch::add(
+            vec![alpha.clone(), beta, gamma, nested],
+            edges,
+        ))
+        .unwrap();
+
+    // No filter: every edge kind is walked, so Nested is reached via Contains.
+    let all = store
+        .traverse(TraverseQuery::outbound(alpha.id.clone()).with_depth(2))
+        .unwrap();
+    assert_eq!(all.entities.len(), 4);
+    assert_eq!(all.edges.len(), 3);
+
+    // Filtered to Calls: Nested (reached only via Contains) drops out, and the
+    // depth budget is spent on the call chain alone. `entities` comes back in
+    // HashMap-iteration order, so sort before asserting membership.
+    let calls_only = store
+        .traverse(
+            TraverseQuery::outbound(alpha.id.clone())
+                .with_depth(2)
+                .with_kinds(vec![EdgeKind::Calls]),
+        )
+        .unwrap();
+    let mut names: Vec<_> = calls_only
+        .entities
+        .iter()
+        .map(|entity| entity.name.as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, vec!["Alpha", "Beta", "Gamma"]);
+    assert_eq!(calls_only.edges.len(), 2);
+    assert!(calls_only
+        .edges
+        .iter()
+        .all(|edge| edge.kind == EdgeKind::Calls));
+}

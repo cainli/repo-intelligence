@@ -1,14 +1,21 @@
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 
 use anyhow::Result;
 use repo_intelligence_analysis::{ImpactAnalyzer, WorkspaceIndexer};
 use repo_intelligence_graph::{GraphStore, SqliteGraphStore};
-use repo_intelligence_model::{ChangeRequest, EntityKind, SearchQuery};
+use repo_intelligence_model::{
+    ChangeRequest, Edge, EdgeKind, Entity, EntityId, EntityKind, SearchQuery, TraverseQuery,
+};
 use serde_json::{Value, json};
 
 /// Default row cap for the text-search tools when the caller omits `limit`.
 const DEFAULT_SEARCH_LIMIT: usize = 100;
+/// Default hop depth for `trace_callers`/`trace_callees` when the caller omits
+/// `depth`. Two hops answers "who calls this, and who calls them" without
+/// flooding the result; raise it for deeper chains.
+const DEFAULT_TRACE_DEPTH: usize = 2;
 
 /// A tool advertised over `tools/list`, together with its typed contracts.
 ///
@@ -77,10 +84,33 @@ fn finding_schema() -> Value {
             "entity": entity_schema(),
             "plane": {"type": "string"},
             "severity": {"type": "string"},
+            "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
             "path": {"type": "array", "items": {"type": "string"}},
             "evidence": {"type": "array", "items": evidence_schema()}
         },
-        "required": ["entity", "plane", "severity", "path", "evidence"]
+        "required": ["entity", "plane", "severity", "confidence", "path", "evidence"]
+    })
+}
+
+fn edge_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "source": {"type": "string"},
+            "target": {"type": "string"},
+            "kind": {
+                "type": "string",
+                "enum": [
+                    "contains", "declares", "calls", "exposes", "sends_http_request",
+                    "matches_endpoint", "has_response_field", "serialized_from", "mapped_from",
+                    "binds_to_statement", "executes_sql", "reads_table", "writes_table",
+                    "reads_column", "writes_column", "depends_on", "submodule_of"
+                ]
+            },
+            "evidence": {"type": "array", "items": evidence_schema()}
+        },
+        "required": ["source", "target", "kind", "evidence"]
     })
 }
 
@@ -115,6 +145,56 @@ fn tool_specs() -> Vec<ToolSpec> {
             "hint": {"type": "string"}
         },
         "required": ["items", "count"]
+    });
+    // The trace tools share one contract: an exact `name` to start from (with
+    // optional `depth` and `edge_kinds`) in, and a `{items, edges, count,
+    // start_count}` object out. Unlike the substring search tools, the start
+    // point is resolved by exact name — `trace_callers("S27204")` traces that
+    // entity, not the union of every `*27204*` substring hit. `hint` is set
+    // only when no exact match exists, so an empty result reads as "no such
+    // entity" rather than "tool broken".
+    let trace_input = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Exact entity name to trace from (e.g. a class or method name). The start point is resolved by exact name match, not substring; use search_entities first if unsure of the exact name."
+            },
+            "depth": {
+                "type": "integer",
+                "minimum": 0,
+                "default": 2,
+                "description": "How many edge hops to follow. 0 returns only the start entity itself."
+            },
+            "edge_kinds": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "contains", "declares", "calls", "exposes", "sends_http_request",
+                        "matches_endpoint", "has_response_field", "serialized_from", "mapped_from",
+                        "binds_to_statement", "executes_sql", "reads_table", "writes_table",
+                        "reads_column", "writes_column", "depends_on", "submodule_of"
+                    ]
+                },
+                "default": ["calls"],
+                "description": "Edge kinds to follow. Defaults to [\"calls\"] for a call chain; pass e.g. [\"depends_on\"] or [\"reads_table\",\"writes_table\"] to trace other dependency types."
+            }
+        },
+        "required": ["name"]
+    });
+    let trace_output = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "items": {"type": "array", "items": entity_schema()},
+            "edges": {"type": "array", "items": edge_schema()},
+            "count": {"type": "integer", "minimum": 0},
+            "start_count": {"type": "integer", "minimum": 0},
+            "hint": {"type": "string"}
+        },
+        "required": ["items", "edges", "count", "start_count"]
     });
 
     vec![
@@ -225,6 +305,18 @@ fn tool_specs() -> Vec<ToolSpec> {
             description: "Find candidate code entities for a requirement keyword by matching indexed entity names/qualified names. Substring match only — not semantic or free-text search.",
             input_schema: search_input,
             output_schema: search_output,
+        },
+        ToolSpec {
+            name: "trace_callers",
+            description: "Trace who calls an entity (inbound edges). Defaults to the `calls` edge for a call chain; set edge_kinds to follow other dependencies (depends_on, reads_table, ...). Resolves the start point by exact entity name, then BFS inward up to `depth`.",
+            input_schema: trace_input.clone(),
+            output_schema: trace_output.clone(),
+        },
+        ToolSpec {
+            name: "trace_callees",
+            description: "Trace what an entity calls (outbound edges). Defaults to the `calls` edge for a call chain; set edge_kinds to follow other dependencies (depends_on, reads_table, ...). Resolves the start point by exact entity name, then BFS outward up to `depth`.",
+            input_schema: trace_input,
+            output_schema: trace_output,
         },
         ToolSpec {
             name: "show_system_view",
@@ -407,10 +499,22 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
             let limit = parse_limit(arguments);
             let store = SqliteGraphStore::open(path)?;
             let (entities, count) = search_with_filter(&store, query, limit, None)?;
-            json!({
+            let mut result = json!({
                 "items": serde_json::to_value(&entities)?,
                 "count": count,
-            })
+            });
+            // On zero hits, distinguish "not found" from "empty index": the latter
+            // points at a wrong database connection. Counts are only read on miss.
+            if count == 0 {
+                let (total, _) = store.counts()?;
+                if total == 0 {
+                    result["hint"] = json!(
+                        "no matches and the index is empty (entity_count == 0); \
+                         run `scan_workspace` or verify the database path with `get_index_status`."
+                    );
+                }
+            }
+            result
         }
         "find_endpoint" => {
             let query = arguments["query"].as_str().unwrap_or_default();
@@ -458,7 +562,33 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
         "analyze_change" => {
             let change: ChangeRequest = serde_json::from_value(arguments.clone())?;
             let store = SqliteGraphStore::open(path)?;
-            serde_json::to_value(ImpactAnalyzer::new(&store).analyze(&change)?)?
+            let mut report = ImpactAnalyzer::new(&store).analyze(&change)?;
+            // An empty index makes impact analysis meaningless — surface it so a
+            // "zero findings" result isn't misread as "this change is safe".
+            let (entity_count, _) = store.counts()?;
+            if entity_count == 0 {
+                report.open_questions.push(
+                    "index is empty (entity_count == 0); this impact analysis is meaningless \
+                     until `scan_workspace` populates the database — verify the connected \
+                     database path with `get_index_status`."
+                        .into(),
+                );
+            }
+            serde_json::to_value(report)?
+        }
+        "trace_callers" => {
+            let name = arguments["name"].as_str().unwrap_or_default();
+            let depth = parse_depth(arguments, DEFAULT_TRACE_DEPTH);
+            let kinds = parse_edge_kinds(arguments)?;
+            let store = SqliteGraphStore::open(path)?;
+            trace_graph(&store, name, depth, kinds, false)?
+        }
+        "trace_callees" => {
+            let name = arguments["name"].as_str().unwrap_or_default();
+            let depth = parse_depth(arguments, DEFAULT_TRACE_DEPTH);
+            let kinds = parse_edge_kinds(arguments)?;
+            let store = SqliteGraphStore::open(path)?;
+            trace_graph(&store, name, depth, kinds, true)?
         }
         "scan_workspace" => {
             let workspace = arguments["workspace"].as_str().unwrap_or(".");
@@ -484,8 +614,15 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
             // "never scanned" database reads as "working" until every other
             // tool quietly returns empty results.
             let indexed = entity_count > 0;
+            // Show a canonicalized absolute path so the caller can tell at a glance
+            // whether the connected database is the one they expect. The default
+            // (`.repo-intelligence/workspace.sqlite`) is relative to cwd, so a wrong
+            // working dir silently lands on an empty database.
+            let database = std::fs::canonicalize(path)
+                .map(|resolved| resolved.display().to_string())
+                .unwrap_or_else(|_| path.display().to_string());
             let mut status = json!({
-                "database": path.display().to_string(),
+                "database": database,
                 "indexed": indexed,
                 "entity_count": entity_count,
                 "edge_count": edge_count,
@@ -576,4 +713,115 @@ fn search_with_filter(
         .collect();
     let count = entities.len();
     Ok((entities, count))
+}
+
+fn parse_depth(arguments: &Value, default: usize) -> usize {
+    arguments["depth"]
+        .as_u64()
+        .map(|value| value as usize)
+        .unwrap_or(default)
+}
+
+/// Resolve `edge_kinds` from arguments. Defaults to the `Calls` edge so the
+/// trace tools answer "call chain" out of the box instead of dragging in
+/// containment or table-read edges; an explicit array overrides it.
+fn parse_edge_kinds(arguments: &Value) -> Result<Vec<EdgeKind>> {
+    match &arguments["edge_kinds"] {
+        Value::Null => Ok(vec![EdgeKind::Calls]),
+        value => Ok(serde_json::from_value(value.clone())?),
+    }
+}
+
+fn kinds_label(kinds: &[EdgeKind]) -> String {
+    if kinds.is_empty() {
+        "any kind".to_string()
+    } else {
+        kinds
+            .iter()
+            .copied()
+            .map(EdgeKind::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// Shared engine for `trace_callers`/`trace_callees`: resolve every entity
+/// whose name equals `name` exactly as a start point, then BFS along
+/// `outbound` edges of the requested kinds and return the visited entities and
+/// edges.
+///
+/// Exact-name (not substring) matching keeps `trace_callers("S27204")` from
+/// pulling in `S27204Req`/`S27204Resp` callers — it mirrors how
+/// `analyze_change` resolves its target and matches the "trace *this* entity"
+/// intent. Multiple same-named entities each seed the walk; results merge and
+/// dedupe so a polymorphic/overloaded name still resolves in one call.
+fn trace_graph(
+    store: &SqliteGraphStore,
+    name: &str,
+    depth: usize,
+    edge_kinds: Vec<EdgeKind>,
+    outbound: bool,
+) -> Result<Value> {
+    let matches = store.search(SearchQuery::new(name).with_limit(DEFAULT_SEARCH_LIMIT))?;
+    let starts: Vec<Entity> = matches
+        .into_iter()
+        .map(|matched| matched.entity)
+        .filter(|entity| entity.name == name)
+        .collect();
+    if starts.is_empty() {
+        return Ok(json!({
+            "items": [],
+            "edges": [],
+            "count": 0,
+            "start_count": 0,
+            "hint": format!(
+                "No entity is exactly named `{name}`. The start point is resolved by exact \
+                 name (not substring), then the {direction} edges of kind {kinds} are walked. \
+                 Run search_entities to find the precise identifier.",
+                direction = if outbound { "outbound (callees)" } else { "inbound (callers)" },
+                kinds = kinds_label(&edge_kinds),
+            ),
+        }));
+    }
+    let mut entities: HashMap<EntityId, Entity> = HashMap::new();
+    let mut edges: Vec<Edge> = Vec::new();
+    let mut seen_edge: HashSet<(EntityId, EntityId, EdgeKind)> = HashSet::new();
+    for start in &starts {
+        let traversal = store.traverse(TraverseQuery {
+            start: start.id.clone(),
+            outbound,
+            max_depth: depth,
+            edge_kinds: edge_kinds.clone(),
+        })?;
+        for entity in traversal.entities {
+            entities.insert(entity.id.clone(), entity);
+        }
+        for edge in traversal.edges {
+            let key = (edge.source.clone(), edge.target.clone(), edge.kind);
+            if seen_edge.insert(key) {
+                edges.push(edge);
+            }
+        }
+    }
+    // Deterministic ordering: HashMap/HashSet iteration order is random, which
+    // would make the JSON (and any test asserting on it) non-reproducible.
+    let mut items = entities.into_values().collect::<Vec<_>>();
+    items.sort_by(|a, b| {
+        a.qualified_name
+            .cmp(&b.qualified_name)
+            .then_with(|| a.id.0.cmp(&b.id.0))
+    });
+    edges.sort_by(|a, b| {
+        (a.source.0.as_str(), a.target.0.as_str(), a.kind.as_str()).cmp(&(
+            b.source.0.as_str(),
+            b.target.0.as_str(),
+            b.kind.as_str(),
+        ))
+    });
+    Ok(json!({
+        "items": serde_json::to_value(&items)?,
+        "edges": serde_json::to_value(&edges)?,
+        "count": items.len(),
+        "start_count": starts.len(),
+    }))
 }

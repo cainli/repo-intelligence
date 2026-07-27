@@ -312,6 +312,12 @@ pub struct TraverseQuery {
     pub start: EntityId,
     pub outbound: bool,
     pub max_depth: usize,
+    /// Restricts the BFS to these edge kinds. Empty = walk every edge kind
+    /// (the historical behavior `analyze_change` relies on). Non-empty = only
+    /// traverse along the listed kinds, so a callers/callees query can stay on
+    /// the `Calls` edge instead of being polluted by `Contains`/`DependsOn`.
+    #[serde(default)]
+    pub edge_kinds: Vec<EdgeKind>,
 }
 
 impl TraverseQuery {
@@ -320,11 +326,18 @@ impl TraverseQuery {
             start,
             outbound: true,
             max_depth: 1,
+            edge_kinds: Vec::new(),
         }
     }
 
     pub fn with_depth(mut self, max_depth: usize) -> Self {
         self.max_depth = max_depth;
+        self
+    }
+
+    /// Restrict the traversal to the given edge kinds (empty walks all kinds).
+    pub fn with_kinds(mut self, edge_kinds: Vec<EdgeKind>) -> Self {
+        self.edge_kinds = edge_kinds;
         self
     }
 }
@@ -378,6 +391,11 @@ pub struct ImpactFinding {
     pub entity: Entity,
     pub plane: String,
     pub severity: String,
+    /// 该 finding 可达性的最低证据置信度。1.0 = 仅经 Fact/Resolved 边可达;
+    /// <1.0 = path 上触及 Inferred 边(如分级匹配产生的低置信 matches_endpoint)。
+    /// 客户端据此区分"精确命中"与"推断命中"。分页当前不按此排序(那需要
+    /// 遍历全部候选),后续可做两阶段排序让高置信优先占用分页额度。
+    pub confidence: f32,
     pub path: Vec<EntityId>,
     pub evidence: Vec<Evidence>,
 }
