@@ -177,6 +177,7 @@ fn extract_java(
 
 fn extract_xml(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges: &mut Vec<Edge>) {
     for capture in XML_STATEMENT.captures_iter(&file.content) {
+        let operation = capture[1].to_lowercase();
         let statement_id = capture.get(2).unwrap();
         let sql = capture.get(3).unwrap();
         let line = line_of(&file.content, statement_id.start());
@@ -192,7 +193,7 @@ fn extract_xml(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges:
             statement_id.as_str(),
             format!("{path}#{}", statement_id.as_str()),
         )
-        .with_metadata(json!({"operation": capture[1].to_lowercase()}))
+        .with_metadata(json!({"operation": operation}))
         .with_evidence(
             path,
             line,
@@ -244,7 +245,7 @@ fn extract_xml(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges:
             );
             entities.push(field);
         }
-        for table_match in SQL_FROM.captures_iter(sql.as_str()) {
+        for (table_index, table_match) in SQL_FROM.captures_iter(sql.as_str()).enumerate() {
             let name = table_match.get(1).unwrap();
             let table = Entity::new(
                 EntityId::stable("workspace", path, EntityKind::Table, name.as_str(), ""),
@@ -260,19 +261,24 @@ fn extract_xml(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges:
                 1.0,
                 "SQL table reference",
             );
+            let writes_target = operation != "select" && table_index == 0;
+            let edge_kind = if writes_target {
+                EdgeKind::WritesTable
+            } else {
+                EdgeKind::ReadsTable
+            };
             edges.push(
-                Edge::new(
-                    statement_id_value.clone(),
-                    table.id.clone(),
-                    EdgeKind::ReadsTable,
-                )
-                .with_evidence(
+                Edge::new(statement_id_value.clone(), table.id.clone(), edge_kind).with_evidence(
                     path,
                     line,
                     line,
                     EvidenceClass::Fact,
                     1.0,
-                    "SQL table reference",
+                    if writes_target {
+                        "SQL mutation target"
+                    } else {
+                        "SQL read table reference"
+                    },
                 ),
             );
             entities.push(table);

@@ -9,11 +9,13 @@ SQLite、FTS5 和 Tree-sitter，通过 npm CLI 或原生二进制运行，不依
 - 使用 Tree-sitter 验证 Java 语法，并提取 Java 字段与 Spring Mapping。
 - 提取 Vue 属性引用、Axios/fetch 风格调用、MyBatis Statement、SQL alias 和表引用。
 - 将实体、关系、证据和置信度持久化到 SQLite，提供搜索和有限深度遍历。
-- 对字段重命名生成前端、代码和数据影响平面。
+- 对字段重命名生成基于证据关系的前端、代码和数据候选影响平面。
 - 通过 CLI JSON 协议和 stdio MCP 提供查询入口。
 
-目前的跨层字段关系是基于名称和框架约定的 `resolved` 关系，不等同于完整 Java
-类型检查。MySQL 在线元数据采集、Git 快照差分、完整 Gradle 语义和向量召回仍是后续阶段。
+目前的跨层字段关系是基于名称和框架约定的 `resolved` 候选关系，不等同于完整 Java
+类型检查，调用方需要结合证据确认。扫描采用内存构建、单事务替换快照，以保证失败时保留
+旧索引；文件级增量更新尚未实现。MySQL 在线元数据采集、Git/Submodule 快照差分、完整
+Gradle 语义和向量召回仍是后续阶段。
 
 ## 构建与运行
 
@@ -67,4 +69,3 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 npm test --prefix packages/npm
 ```
-

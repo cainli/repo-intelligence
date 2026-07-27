@@ -1,7 +1,7 @@
 {
   "name": "@repo-intelligence/cli",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "type": "module",
   "bin": {
     "repo-intelligence": "./bin/cli.js"
@@ -11,6 +11,12 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@repo-intelligence/darwin-arm64": "0.1.0",
+    "@repo-intelligence/darwin-x64": "0.1.0",
+    "@repo-intelligence/linux-arm64-gnu": "0.1.0",
+    "@repo-intelligence/linux-x64-gnu": "0.1.0",
+    "@repo-intelligence/win32-x64": "0.1.0"
   }
 }
-

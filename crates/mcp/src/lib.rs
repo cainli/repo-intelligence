@@ -14,7 +14,6 @@ const TOOLS: &[(&str, &str)] = &[
     ),
     ("search_entities", "Search indexed entities"),
     ("find_endpoint", "Find an HTTP endpoint"),
-    ("trace_path", "Traverse relationships from an entity"),
     (
         "analyze_change",
         "Analyze the impact of a structured change",
@@ -27,7 +26,6 @@ const TOOLS: &[(&str, &str)] = &[
         "show_system_view",
         "Show a repository, API, or data system view",
     ),
-    ("get_evidence", "Read evidence for an entity or relation"),
     ("get_index_status", "Read local index status"),
 ];
 

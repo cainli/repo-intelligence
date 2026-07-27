@@ -26,15 +26,26 @@ impl WorkspaceIndexer {
             files_indexed: files.len(),
             ..Default::default()
         };
+        let remove_entities = store
+            .all_entities()?
+            .into_iter()
+            .map(|entity| entity.id)
+            .collect();
+        let mut combined = GraphPatch {
+            remove_entities,
+            ..Default::default()
+        };
         for file in &files {
             let patch = repo_intelligence_semantics::extract(file)?;
             summary.entities_indexed += patch.add_entities.len();
             summary.edges_indexed += patch.add_edges.len();
-            store.apply_patch(patch)?;
+            combined.add_entities.extend(patch.add_entities);
+            combined.add_edges.extend(patch.add_edges);
         }
-        let resolution = resolve_cross_stack(store.all_entities()?);
+        let resolution = resolve_cross_stack(combined.add_entities.clone());
         summary.edges_indexed += resolution.add_edges.len();
-        store.apply_patch(resolution)?;
+        combined.add_edges.extend(resolution.add_edges);
+        store.apply_patch(combined)?;
         Ok(summary)
     }
 }
@@ -57,7 +68,8 @@ fn resolve_cross_stack(entities: Vec<Entity>) -> GraphPatch {
             _ => {}
         }
     }
-    for related in fields.values() {
+    for related in fields.values_mut() {
+        related.sort_by_key(|entity| semantic_rank(entity.kind));
         for pair in related.windows(2) {
             let evidence = pair[0]
                 .evidence
@@ -113,6 +125,16 @@ fn resolve_cross_stack(entities: Vec<Entity>) -> GraphPatch {
     GraphPatch::add(Vec::new(), edges)
 }
 
+fn semantic_rank(kind: EntityKind) -> u8 {
+    match kind {
+        EntityKind::FrontendField => 0,
+        EntityKind::ApiField => 1,
+        EntityKind::Field => 2,
+        EntityKind::SqlField => 3,
+        _ => 4,
+    }
+}
+
 pub struct ImpactAnalyzer<'a> {
     store: &'a dyn GraphStore,
 }
@@ -137,9 +159,32 @@ impl<'a> ImpactAnalyzer<'a> {
         {
             let entity = matched.entity;
             let plane = plane_for(entity.kind).to_owned();
+            let mut path = vec![entity.id.clone()];
+            let mut evidence = entity.evidence.clone();
+            for traversal in [
+                self.store.traverse(
+                    repo_intelligence_model::TraverseQuery::outbound(entity.id.clone())
+                        .with_depth(8),
+                )?,
+                self.store
+                    .traverse(repo_intelligence_model::TraverseQuery {
+                        start: entity.id.clone(),
+                        outbound: false,
+                        max_depth: 8,
+                    })?,
+            ] {
+                for edge in traversal.edges {
+                    evidence.extend(edge.evidence);
+                }
+                for related in traversal.entities {
+                    if !path.contains(&related.id) {
+                        path.push(related.id);
+                    }
+                }
+            }
             report.findings.push(ImpactFinding {
-                path: vec![entity.id.clone()],
-                evidence: entity.evidence.clone(),
+                path,
+                evidence,
                 entity,
                 plane,
                 severity: "review_required".into(),
