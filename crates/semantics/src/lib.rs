@@ -8,7 +8,7 @@ use repo_intelligence_model::{
 use repo_intelligence_parsing::{Extractor, JavaParser};
 use repo_intelligence_source::{FileKind, SourceFile};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
 static JAVA_CLASS: LazyLock<Regex> =
@@ -52,12 +52,138 @@ static HTTP_CALL: LazyLock<Regex> = LazyLock::new(|| {
 /// and `find_endpoint` work on non-Spring-MVC services.
 const CUSTOM_ENDPOINT_ANNOTATIONS: &[&str] = &["RmbMap", "DubboService", "RpcMapping"];
 
+/// 前端属性访问中常见的非字段噪声(JS/TS 内建方法、工具函数、全大写常量)。
+/// VUE_BINDING 把任何 `a.b` 当 FrontendField,命中此集合的 b 不产出以降噪声。
+/// 这些名字与业务字段同名的概率极低,不影响贯通召回。
+const FRONTEND_NOISE: &[&str] = &[
+    "length",
+    "size",
+    "toString",
+    "valueOf",
+    "prototype",
+    "constructor",
+    "call",
+    "apply",
+    "bind",
+    "push",
+    "pop",
+    "shift",
+    "unshift",
+    "split",
+    "join",
+    "slice",
+    "splice",
+    "concat",
+    "reverse",
+    "sort",
+    "map",
+    "filter",
+    "forEach",
+    "find",
+    "findIndex",
+    "some",
+    "every",
+    "reduce",
+    "reduceRight",
+    "includes",
+    "indexOf",
+    "lastIndexOf",
+    "flat",
+    "flatMap",
+    "fill",
+    "copyWithin",
+    "floor",
+    "ceil",
+    "round",
+    "random",
+    "abs",
+    "max",
+    "min",
+    "pow",
+    "sqrt",
+    "log",
+    "exp",
+    "sign",
+    "keys",
+    "values",
+    "entries",
+    "assign",
+    "freeze",
+    "from",
+    "isArray",
+    "create",
+    "getPrototypeOf",
+    "trim",
+    "trimStart",
+    "trimEnd",
+    "replace",
+    "replaceAll",
+    "match",
+    "matchAll",
+    "search",
+    "toLowerCase",
+    "toUpperCase",
+    "charAt",
+    "charCodeAt",
+    "padStart",
+    "padEnd",
+    "startsWith",
+    "endsWith",
+    "then",
+    "catch",
+    "finally",
+    "resolve",
+    "reject",
+    "all",
+    "race",
+    "allSettled",
+    "log",
+    "error",
+    "warn",
+    "info",
+    "debug",
+    "time",
+    "timeEnd",
+    "createElement",
+    "appendChild",
+    "querySelector",
+    "querySelectorAll",
+    "getElementById",
+    "addEventListener",
+    "removeEventListener",
+    "preventDefault",
+    "stopPropagation",
+];
+
 static CUSTOM_ENDPOINT: LazyLock<Regex> = LazyLock::new(|| {
     let alternation = CUSTOM_ENDPOINT_ANNOTATIONS.join("|");
     Regex::new(&format!(r#"@({alternation})\b\s*(?:\(([^)]*)\))?"#)).unwrap()
 });
 
 static STRING_LITERAL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""([^"]*)""#).unwrap());
+
+// ---- MyBatis Plus 持久层(MP 3.5.7 主力 ORM:注解实体 + BaseMapper + Wrapper) ----
+// 注解-声明关联用 offset 配对(见 extract_mybatis_plus),不走 AST,避免 grammar 改动。
+static MP_TABLE_NAME: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"@TableName\s*\(\s*(?:value\s*=\s*)?"([^"]+)""#).unwrap());
+static MP_TABLE_FIELD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"@TableField\s*\(\s*(?:value\s*=\s*)?"([^"]+)""#).unwrap());
+static MP_TABLE_ID_VAL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"@TableId\s*\(\s*(?:value\s*=\s*)?"([^"]+)""#).unwrap());
+// @TableField(exist = false):非表字段,推断时跳过以降误报。
+static MP_NON_EXISTENT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"@TableField\s*\([^)]*exist\s*=\s*false").unwrap());
+static MP_MAPPER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\binterface\s+([A-Za-z_]\w*)\s*(?:extends|,)\s*BaseMapper\s*<\s*([A-Za-z_]\w*)\s*>",
+    )
+    .unwrap()
+});
+// QueryWrapper 链式方法的字符串首参(列名)。仅覆盖字符串形式;Lambda 方法引用
+// (Entity::getName)需方法→字段映射,留后续。
+static MP_WRAPPER_COLUMN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\.(eq|ne|gt|ge|lt|le|like|notLike|in|notIn|between|orderBy(?:Asc|Desc)?|groupBy|having|select)\s*\(\s*"([A-Za-z_]\w*)""#).unwrap()
+});
 
 pub fn extract(file: &SourceFile) -> Result<GraphPatch> {
     let path = file.relative_path.to_string_lossy().to_string();
@@ -87,6 +213,9 @@ pub fn extract(file: &SourceFile) -> Result<GraphPatch> {
         FileKind::Vue | FileKind::JavaScript | FileKind::TypeScript => {
             extract_frontend(file, &path, &mut entities, &mut edges)
         }
+        FileKind::Gradle => extract_gradle(file, &path, &mut entities, &mut edges),
+        FileKind::Toml => extract_version_catalog(file, &path, &mut entities, &mut edges),
+        FileKind::Json => extract_package_json(file, &path, &mut entities, &mut edges),
         _ => {}
     }
     Ok(GraphPatch::add(entities, edges))
@@ -226,6 +355,7 @@ fn extract_java(
         add_contained(file, path, entity, line, entities, edges);
     }
     extract_custom_endpoints(file, path, entities, edges);
+    extract_mybatis_plus(file, path, entities, edges);
     Ok(())
 }
 
@@ -340,6 +470,18 @@ fn extract_xml(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges:
     }
 }
 
+/// 判断前端属性访问 `a.b` 的 b 是否「像业务字段」而非工具方法/常量。
+fn is_likely_field(name: &str) -> bool {
+    if FRONTEND_NOISE.contains(&name) {
+        return false;
+    }
+    // 全大写(无小写字母,≥2 字符):视为常量/缩写(URL/MAX_VALUE),排除
+    if name.len() >= 2 && !name.chars().any(|c| c.is_ascii_lowercase()) {
+        return false;
+    }
+    true
+}
+
 fn extract_frontend(
     file: &SourceFile,
     path: &str,
@@ -370,6 +512,9 @@ fn extract_frontend(
     }
     for capture in VUE_BINDING.captures_iter(&file.content) {
         let name = capture.get(1).unwrap();
+        if !is_likely_field(name.as_str()) {
+            continue;
+        }
         let line = line_of(&file.content, name.start());
         let field = Entity::new(
             EntityId::stable(
@@ -469,6 +614,480 @@ fn extract_custom_endpoints(
     }
 }
 
+/// camelCase → snake_case(MyBatis Plus 默认 mapUnderscoreToCamelCase 的逆推断)。
+/// 位置 0 的大写不插下划线。仅用于 @TableName 类内无显式 @TableField 字段的列名
+/// 推断,配 EvidenceClass::Inferred(显式注解走 Fact 1.0)。连续大写(URLPath)会转成
+/// u_r_l_path,与 MP 默认略异——这类字段实践中多有显式注解,影响有限。
+fn camel_to_snake(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for (i, ch) in name.chars().enumerate() {
+        if ch.is_ascii_uppercase() && i != 0 {
+            out.push('_');
+        }
+        out.push(ch.to_ascii_lowercase());
+    }
+    out
+}
+
+/// MyBatis Plus 持久层提取。MP 主力是注解实体 + BaseMapper + QueryWrapper 链式 API,
+/// XML mapper 很少,故持久层贯通不能只靠 extract_xml。
+///
+/// 注解-声明关联用 offset 配对(注解 offset → 之后最近的 class/field offset),而非
+/// tree-sitter AST——避免 grammar 改动,精度足够(MP 实体多为顶层类、字段注解紧贴声明)。
+/// 产出:
+///   @TableName → Table + Class--DependsOn→Table
+///   @TableField/@TableId → Column + Field--MappedFrom→Column(Fact 1.0);@TableName 类
+///     内无注解字段驼峰推断 → Column(Inferred 0.7);@TableField(exist=false) 跳过
+///   BaseMapper<T> → Mapper;同文件内 T 是 @TableName 类 → Mapper--DependsOn→Table
+///   QueryWrapper .eq("col",…) → Column + File--ReadsColumn→Column(Inferred 0.6)
+/// 同 (文件,列名) 的实体列与 wrapper 列引用因 EntityId 确定性相同而合并为单节点。
+#[allow(clippy::too_many_lines)]
+fn extract_mybatis_plus(
+    file: &SourceFile,
+    path: &str,
+    entities: &mut Vec<Entity>,
+    edges: &mut Vec<Edge>,
+) {
+    let content = &file.content;
+
+    // 收集 class / field 的 (名字 offset, 名字),复用 extract_java 同源 regex。
+    let classes: Vec<(usize, String)> = JAVA_CLASS
+        .captures_iter(content)
+        .map(|c| {
+            let name = c.get(2).unwrap();
+            (name.start(), name.as_str().to_string())
+        })
+        .collect();
+    let fields: Vec<(usize, String)> = JAVA_FIELD
+        .captures_iter(content)
+        .map(|c| {
+            let name = c.get(1).unwrap();
+            (name.start(), name.as_str().to_string())
+        })
+        .collect();
+
+    // (1) @TableName → 类 → Table + (后续)类内字段 → Column。
+    // table_by_class: class_name -> table_name(本文件内 @TableName 标注的实体类)
+    let mut table_by_class: HashMap<String, String> = HashMap::new();
+    for table_cap in MP_TABLE_NAME.captures_iter(content) {
+        let table_name = table_cap.get(1).unwrap();
+        let ann_end = table_cap.get(0).unwrap().end();
+        // 注解之后最近的 class 声明 = 注解所属类
+        let class_name = match classes
+            .iter()
+            .filter(|(start, _)| *start >= ann_end)
+            .min_by_key(|(start, _)| *start)
+        {
+            Some((_, name)) => name.clone(),
+            None => continue,
+        };
+        table_by_class.insert(class_name.clone(), table_name.as_str().to_string());
+        let line = line_of(content, table_name.start());
+        let table = Entity::new(
+            EntityId::stable(
+                "workspace",
+                path,
+                EntityKind::Table,
+                table_name.as_str(),
+                "",
+            ),
+            EntityKind::Table,
+            table_name.as_str(),
+            table_name.as_str(),
+        )
+        .with_evidence(
+            path,
+            line,
+            line,
+            EvidenceClass::Fact,
+            1.0,
+            "MyBatis Plus @TableName",
+        );
+        let class_id = EntityId::stable("workspace", path, EntityKind::Class, &class_name, "");
+        edges.push(
+            Edge::new(class_id, table.id.clone(), EdgeKind::DependsOn).with_evidence(
+                path,
+                line,
+                line,
+                EvidenceClass::Fact,
+                1.0,
+                "entity class maps to table via @TableName",
+            ),
+        );
+        entities.push(table);
+    }
+
+    // 显式 @TableField/@TableId → 字段偏移 -> (列名, 注解行)
+    let mut explicit_col: HashMap<usize, (String, u32)> = HashMap::new();
+    for ann in MP_TABLE_FIELD
+        .captures_iter(content)
+        .chain(MP_TABLE_ID_VAL.captures_iter(content))
+    {
+        let col = ann.get(1).unwrap();
+        let ann_start = ann.get(0).unwrap().start();
+        if let Some((foff, _)) = fields
+            .iter()
+            .filter(|(foff, _)| *foff > ann_start)
+            .min_by_key(|(foff, _)| *foff)
+        {
+            explicit_col
+                .entry(*foff)
+                .or_insert((col.as_str().to_string(), line_of(content, col.start())));
+        }
+    }
+
+    // exist=false → 被标注的字段偏移集合(跳过)
+    let non_existent: HashSet<usize> = MP_NON_EXISTENT
+        .captures_iter(content)
+        .filter_map(|ann| {
+            let ann_start = ann.get(0).unwrap().start();
+            fields
+                .iter()
+                .filter(|(foff, _)| *foff > ann_start)
+                .min_by_key(|(foff, _)| *foff)
+                .map(|(foff, _)| *foff)
+        })
+        .collect();
+
+    for (foff, fname) in &fields {
+        // 字段所属类 = offset ≤ 字段的最大 class
+        let class_name = match classes.iter().rev().find(|(cstart, _)| *cstart <= *foff) {
+            Some((_, name)) => name.as_str(),
+            None => continue,
+        };
+        // 仅 @TableName 类的字段才映射列(其它类的字段不是 MP 实体字段)
+        if !table_by_class.contains_key(class_name) {
+            continue;
+        }
+        if non_existent.contains(foff) {
+            continue;
+        }
+        let (col_name, classification, confidence, reason) = match explicit_col.get(foff) {
+            Some((col, _)) => (
+                col.clone(),
+                EvidenceClass::Fact,
+                1.0,
+                "@TableField/@TableId maps field to column",
+            ),
+            None => (
+                camel_to_snake(fname),
+                EvidenceClass::Inferred,
+                0.7,
+                "inferred column name (camelCase→snake_case, no explicit @TableField)",
+            ),
+        };
+        let line = explicit_col
+            .get(foff)
+            .map(|(_, line)| *line)
+            .unwrap_or_else(|| line_of(content, *foff));
+        let col = Entity::new(
+            EntityId::stable("workspace", path, EntityKind::Column, &col_name, ""),
+            EntityKind::Column,
+            &col_name,
+            format!("{path}#{col_name}"),
+        )
+        .with_metadata(json!({"mapped_field": fname, "source": "mybatis_plus"}))
+        .with_evidence(path, line, line, classification, confidence, reason);
+        let field_id = EntityId::stable("workspace", path, EntityKind::Field, fname, "");
+        edges.push(
+            Edge::new(field_id, col.id.clone(), EdgeKind::MappedFrom).with_evidence(
+                path,
+                line,
+                line,
+                classification,
+                confidence,
+                "field mapped to physical column",
+            ),
+        );
+        entities.push(col);
+    }
+
+    // (2) Mapper 接口:interface XxxMapper extends BaseMapper<Entity>
+    for mapper_cap in MP_MAPPER.captures_iter(content) {
+        let mname = mapper_cap.get(1).unwrap();
+        let entity_type = mapper_cap.get(2).unwrap().as_str().to_string();
+        let line = line_of(content, mname.start());
+        let mapper = Entity::new(
+            EntityId::stable("workspace", path, EntityKind::Mapper, mname.as_str(), ""),
+            EntityKind::Mapper,
+            mname.as_str(),
+            mname.as_str(),
+        )
+        .with_evidence(
+            path,
+            line,
+            line,
+            EvidenceClass::Fact,
+            1.0,
+            "MyBatis Plus mapper interface (BaseMapper<T>)",
+        );
+        let mapper_id = mapper.id.clone();
+        add_contained(file, path, mapper, line, entities, edges);
+        // 同文件内实体类型是 @TableName 类 → Mapper 绑定其表(跨文件解析留后续)
+        if let Some(table_name) = table_by_class.get(&entity_type) {
+            let table_id = EntityId::stable("workspace", path, EntityKind::Table, table_name, "");
+            edges.push(
+                Edge::new(mapper_id, table_id, EdgeKind::DependsOn).with_evidence(
+                    path,
+                    line,
+                    line,
+                    EvidenceClass::Fact,
+                    1.0,
+                    "BaseMapper<EntityType> binds mapper to entity table (same file)",
+                ),
+            );
+        }
+    }
+
+    // (3) Wrapper 链式列引用:.eq("col", …) 等
+    for wrapper_cap in MP_WRAPPER_COLUMN.captures_iter(content) {
+        let col = wrapper_cap.get(2).unwrap();
+        let col_name = col.as_str();
+        let line = line_of(content, col.start());
+        let column = Entity::new(
+            EntityId::stable("workspace", path, EntityKind::Column, col_name, ""),
+            EntityKind::Column,
+            col_name,
+            format!("{path}#{col_name}"),
+        )
+        .with_metadata(json!({"source": "query_wrapper"}))
+        .with_evidence(
+            path,
+            line,
+            line,
+            EvidenceClass::Inferred,
+            0.6,
+            "QueryWrapper first-arg column literal",
+        );
+        edges.push(
+            Edge::new(file.id.clone(), column.id.clone(), EdgeKind::ReadsColumn).with_evidence(
+                path,
+                line,
+                line,
+                EvidenceClass::Inferred,
+                0.6,
+                "QueryWrapper column reference",
+            ),
+        );
+        entities.push(column);
+    }
+}
+
+// ---- 模块依赖图(build.gradle.kts / libs.versions.toml / package.json → Package + DependsOn) ----
+// 收益定位:模块级依赖影响(模块 A 依赖 SDK X),非方法级调用链(后者需 Method 提取)。
+// 注意:实体是 path-scoped(EntityId 含 path),同名依赖跨文件不自动合并——
+// v1 接受;跨文件共享依赖合并需 resolve 层按 ecosystem+name 处理,留后续。
+
+/// package.json → 本模块 npm Package + 依赖 Package(--DependsOn)。
+fn extract_package_json(
+    file: &SourceFile,
+    path: &str,
+    entities: &mut Vec<Entity>,
+    edges: &mut Vec<Edge>,
+) {
+    // 仅处理 package.json(其它 .json 如 tsconfig 不提取依赖)
+    let is_pkg = file
+        .relative_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "package.json");
+    if !is_pkg {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&file.content) else {
+        return;
+    };
+    let module_name = value
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            file.relative_path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("npm-module")
+                .to_string()
+        });
+    let module = Entity::new(
+        EntityId::stable("workspace", path, EntityKind::Package, &module_name, "npm"),
+        EntityKind::Package,
+        &module_name,
+        &module_name,
+    )
+    .with_metadata(json!({"ecosystem": "npm"}))
+    .with_evidence(
+        path,
+        1,
+        1,
+        EvidenceClass::Fact,
+        1.0,
+        "npm package (package.json)",
+    );
+    let module_id = module.id.clone();
+    add_contained(file, path, module, 1, entities, edges);
+    for section in ["dependencies", "devDependencies", "peerDependencies"] {
+        let Some(obj) = value.get(section).and_then(|v| v.as_object()) else {
+            continue;
+        };
+        for dep_name in obj.keys() {
+            let dep = Entity::new(
+                EntityId::stable(
+                    "workspace",
+                    path,
+                    EntityKind::Package,
+                    dep_name.as_str(),
+                    "npm",
+                ),
+                EntityKind::Package,
+                dep_name.as_str(),
+                dep_name.as_str(),
+            )
+            .with_metadata(json!({"ecosystem": "npm"}))
+            .with_evidence(path, 1, 1, EvidenceClass::Fact, 1.0, "npm dependency");
+            edges.push(
+                Edge::new(module_id.clone(), dep.id.clone(), EdgeKind::DependsOn).with_evidence(
+                    path,
+                    1,
+                    1,
+                    EvidenceClass::Fact,
+                    1.0,
+                    "npm dependency declared in package.json",
+                ),
+            );
+            entities.push(dep);
+        }
+    }
+}
+
+/// build.gradle(.kts) → 模块 Gradle Package + 依赖 Package(--DependsOn)。
+fn extract_gradle(
+    file: &SourceFile,
+    path: &str,
+    entities: &mut Vec<Entity>,
+    edges: &mut Vec<Edge>,
+) {
+    // 模块名 = build 脚本所在目录名
+    let module_name = file
+        .relative_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("gradle-module")
+        .to_string();
+    let module = Entity::new(
+        EntityId::stable(
+            "workspace",
+            path,
+            EntityKind::Package,
+            &module_name,
+            "gradle",
+        ),
+        EntityKind::Package,
+        &module_name,
+        &module_name,
+    )
+    .with_metadata(json!({"ecosystem": "gradle"}))
+    .with_evidence(
+        path,
+        1,
+        1,
+        EvidenceClass::Fact,
+        1.0,
+        "Gradle module (build script)",
+    );
+    let module_id = module.id.clone();
+    add_contained(file, path, module, 1, entities, edges);
+
+    // implementation/api/... ("group:artifact:version") 或 (libs.xxx 别名)。
+    // 组1=引号坐标(group:artifact,版本剥离以利合并),组2=libs.xxx 别名。
+    static GRADLE_DEP: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?:implementation|api|compileOnly|runtimeOnly|testImplementation|developmentOnly)\s*\(\s*(?:"([^":]+:[^":]+)(?::[^"]*)?"|(libs\.[A-Za-z0-9_.]+))"#,
+        )
+        .unwrap()
+    });
+    for cap in GRADLE_DEP.captures_iter(&file.content) {
+        let dep_name = if let Some(m) = cap.get(1) {
+            m.as_str().to_string()
+        } else if let Some(m) = cap.get(2) {
+            m.as_str().to_string()
+        } else {
+            continue;
+        };
+        let dep = Entity::new(
+            EntityId::stable("workspace", path, EntityKind::Package, &dep_name, "gradle"),
+            EntityKind::Package,
+            &dep_name,
+            &dep_name,
+        )
+        .with_metadata(json!({"ecosystem": "gradle", "coordinate": dep_name}))
+        .with_evidence(path, 1, 1, EvidenceClass::Fact, 1.0, "Gradle dependency");
+        edges.push(
+            Edge::new(module_id.clone(), dep.id.clone(), EdgeKind::DependsOn).with_evidence(
+                path,
+                1,
+                1,
+                EvidenceClass::Fact,
+                1.0,
+                "Gradle dependency declared in build script",
+            ),
+        );
+        entities.push(dep);
+    }
+}
+
+/// libs.versions.toml → 别名 Package(libs.xxx,metadata.coordinate=group:artifact)。
+/// v1 限制:Gradle 版本目录的连字符转点别名规则(my-lib→libs.my.lib)未实现,
+/// 故 catalog 别名与 build 脚本里的 libs.xxx 引用暂不连通;本提取主要用于
+/// 记录别名→坐标映射。完整 TOML 解析需 toml crate(未引入),regex 足够。
+fn extract_version_catalog(
+    file: &SourceFile,
+    path: &str,
+    entities: &mut Vec<Entity>,
+    edges: &mut Vec<Edge>,
+) {
+    let _ = edges;
+    let is_catalog = file
+        .relative_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "libs.versions.toml");
+    if !is_catalog {
+        return;
+    }
+    static TOML_LIB: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?ms)^\[libraries\.([^\]]+)\][\s\S]*?module\s*=\s*"([^"]+)""#).unwrap()
+    });
+    for cap in TOML_LIB.captures_iter(&file.content) {
+        let alias = cap.get(1).unwrap().as_str();
+        let coord = cap.get(2).unwrap().as_str();
+        let alias_key = format!("libs.{alias}");
+        let entity = Entity::new(
+            EntityId::stable(
+                "workspace",
+                path,
+                EntityKind::Package,
+                &alias_key,
+                "gradle-catalog",
+            ),
+            EntityKind::Package,
+            &alias_key,
+            &alias_key,
+        )
+        .with_metadata(json!({"ecosystem": "gradle", "coordinate": coord, "alias": alias}))
+        .with_evidence(
+            path,
+            1,
+            1,
+            EvidenceClass::Fact,
+            1.0,
+            "Gradle version catalog alias",
+        );
+        entities.push(entity);
+    }
+}
+
 // ---- Spring Bean 依赖注入(基于 tree-sitter AST) ----
 // 正则无法把 "@Autowired 字段类型" 与所在类型可靠关联(多参数/泛型/跨行),
 // 故走 AST。当前覆盖:字段注入(@Autowired/@Resource)→DependsOn、
@@ -495,45 +1114,57 @@ fn visit_spring(
     signals: &mut HashMap<String, SpringSignals>,
 ) {
     match node.kind() {
-        "class_declaration" | "interface_declaration" | "record_declaration" | "enum_declaration" => {
-            if has_annotation(source, node, &["Transactional"]) {
-                if let Some(name_node) = node.child_by_field_name("name") {
+        "class_declaration"
+        | "interface_declaration"
+        | "record_declaration"
+        | "enum_declaration" => {
+            if has_annotation(source, node, &["Transactional"])
+                && let Some(name_node) = node.child_by_field_name("name") {
                     signals
                         .entry(node_text(source, name_node))
                         .or_default()
                         .transactional = true;
                 }
-            }
         }
         "method_declaration" => {
-            if has_annotation(source, node, &["Scheduled"]) {
-                if let Some((owner, _)) = enclosing_type(source, node) {
+            if has_annotation(source, node, &["Scheduled"])
+                && let Some((owner, _)) = enclosing_type(source, node) {
                     signals.entry(owner).or_default().scheduled = true;
                 }
-            }
-            if has_annotation(source, node, &["Bean"]) {
-                if let Some(type_node) = node.child_by_field_name("type") {
+            if has_annotation(source, node, &["Bean"])
+                && let Some(type_node) = node.child_by_field_name("type") {
                     let type_name = node_text(source, type_node);
-                    if !type_name.is_empty() {
-                        if let Some((owner_name, owner_kind)) = enclosing_type(source, node) {
+                    if !type_name.is_empty()
+                        && let Some((owner_name, owner_kind)) = enclosing_type(source, node) {
                             link_bean(
-                                file, path, &type_name, &owner_name, owner_kind,
-                                EdgeKind::Exposes, node, entities, edges,
+                                file,
+                                path,
+                                &type_name,
+                                &owner_name,
+                                owner_kind,
+                                EdgeKind::Exposes,
+                                node,
+                                entities,
+                                edges,
                             );
                         }
-                    }
                 }
-            }
         }
         "field_declaration" => {
-            if let Some(type_name) = injected_field_type(source, node) {
-                if let Some((owner_name, owner_kind)) = enclosing_type(source, node) {
+            if let Some(type_name) = injected_field_type(source, node)
+                && let Some((owner_name, owner_kind)) = enclosing_type(source, node) {
                     link_bean(
-                        file, path, &type_name, &owner_name, owner_kind, EdgeKind::DependsOn,
-                        node, entities, edges,
+                        file,
+                        path,
+                        &type_name,
+                        &owner_name,
+                        owner_kind,
+                        EdgeKind::DependsOn,
+                        node,
+                        entities,
+                        edges,
                     );
                 }
-            }
         }
         _ => {}
     }
@@ -576,14 +1207,13 @@ fn enclosing_type(source: &[u8], mut node: Node<'_>) -> Option<(String, EntityKi
 /// `modifiers` 子节点并递归收集其中所有注解名,对层级变化鲁棒。
 fn has_annotation(source: &[u8], node: Node<'_>, names: &[&str]) -> bool {
     for i in 0..node.named_child_count() {
-        if let Some(child) = node.named_child(i) {
-            if child.kind() == "modifiers" {
+        if let Some(child) = node.named_child(i)
+            && child.kind() == "modifiers" {
                 let found = collect_annotation_names(source, child);
                 if found.iter().any(|name| names.contains(&name.as_str())) {
                     return true;
                 }
             }
-        }
     }
     false
 }
@@ -614,7 +1244,8 @@ fn injected_field_type(source: &[u8], node: Node<'_>) -> Option<String> {
     if !has_annotation(source, node, &["Autowired", "Resource"]) {
         return None;
     }
-    node.child_by_field_name("type").map(|t| node_text(source, t))
+    node.child_by_field_name("type")
+        .map(|t| node_text(source, t))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -636,7 +1267,14 @@ fn link_bean(
         type_name,
         type_name,
     )
-    .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "Spring bean (DI target)");
+    .with_evidence(
+        path,
+        line,
+        line,
+        EvidenceClass::Fact,
+        1.0,
+        "Spring bean (DI target)",
+    );
     let owner_id = EntityId::stable("workspace", path, owner_kind, owner_name, "");
     let reason = match relation {
         EdgeKind::DependsOn => "field injection (@Autowired/@Resource)",
@@ -644,12 +1282,24 @@ fn link_bean(
         _ => "Spring bean relation",
     };
     edges.push(
-        Edge::new(owner_id, bean.id.clone(), relation)
-            .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, reason),
+        Edge::new(owner_id, bean.id.clone(), relation).with_evidence(
+            path,
+            line,
+            line,
+            EvidenceClass::Fact,
+            1.0,
+            reason,
+        ),
     );
     edges.push(
-        Edge::new(file.id.clone(), bean.id.clone(), EdgeKind::Contains)
-            .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "declared in file"),
+        Edge::new(file.id.clone(), bean.id.clone(), EdgeKind::Contains).with_evidence(
+            path,
+            line,
+            line,
+            EvidenceClass::Fact,
+            1.0,
+            "declared in file",
+        ),
     );
     entities.push(bean);
 }

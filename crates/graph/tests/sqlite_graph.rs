@@ -127,8 +127,10 @@ fn traverse_filters_by_edge_kind() {
     names.sort_unstable();
     assert_eq!(names, vec!["Alpha", "Beta", "Gamma"]);
     assert_eq!(calls_only.edges.len(), 2);
-    assert!(calls_only
-        .edges
-        .iter()
-        .all(|edge| edge.kind == EdgeKind::Calls));
+    assert!(
+        calls_only
+            .edges
+            .iter()
+            .all(|edge| edge.kind == EdgeKind::Calls)
+    );
 }

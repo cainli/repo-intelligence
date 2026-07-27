@@ -155,7 +155,8 @@ fn resolve_cross_stack(entities: Vec<Entity>) -> GraphPatch {
             EntityKind::Field
             | EntityKind::FrontendField
             | EntityKind::SqlField
-            | EntityKind::ApiField => {
+            | EntityKind::ApiField
+            | EntityKind::Column => {
                 fields.entry(entity.name.clone()).or_default().push(entity);
             }
             EntityKind::HttpEndpoint => endpoints.push(entity),
@@ -245,6 +246,7 @@ fn semantic_rank(kind: EntityKind) -> u8 {
         EntityKind::ApiField => 1,
         EntityKind::Field => 2,
         EntityKind::SqlField => 3,
+        EntityKind::Column => 4,
         _ => 4,
     }
 }
@@ -262,7 +264,10 @@ fn semantic_rank(kind: EntityKind) -> u8 {
 ///   `/orders/123`,需让 `{}` 通配——但这会显著抬高误报,慎用。
 /// - 当前不要求 HTTP method 之外的前缀词匹配;若噪声多,可加调用者白名单。
 fn segment_suffix_align(call_path: &str, endpoint_path: &str) -> bool {
-    let call_segments: Vec<&str> = call_path.split('/').filter(|segment| !segment.is_empty()).collect();
+    let call_segments: Vec<&str> = call_path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
     let endpoint_segments: Vec<&str> = endpoint_path
         .split('/')
         .filter(|segment| !segment.is_empty())
@@ -374,8 +379,8 @@ impl<'a> ImpactAnalyzer<'a> {
             // call(Contains)→ endpoint(MatchesEndpoint),让"改前端字段"的 blast
             // radius 能到后端端点。MatchesEndpoint 多为 Inferred,会拉低 confidence,
             // 与分级匹配呼应。启发式:同页面所有 endpoint 都纳入,靠 confidence 区分。
-            if entity.kind == EntityKind::FrontendField {
-                if let Some(file_id) = containing_file {
+            if entity.kind == EntityKind::FrontendField
+                && let Some(file_id) = containing_file {
                     let bridge = self.store.traverse(TraverseQuery {
                         start: file_id,
                         outbound: true,
@@ -396,7 +401,6 @@ impl<'a> ImpactAnalyzer<'a> {
                         }
                     }
                 }
-            }
             report.findings.push(ImpactFinding {
                 path,
                 evidence,
