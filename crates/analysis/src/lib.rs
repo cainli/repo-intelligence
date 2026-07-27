@@ -339,16 +339,22 @@ impl<'a> ImpactAnalyzer<'a> {
             // 让客户端能区分精确命中与推断命中。起点实体自身的存在证据不参与
             // (那是"它存在"的证据,不是"这样可达"的证据)。
             let mut confidence = 1.0_f32;
-            for traversal in [
-                self.store
-                    .traverse(TraverseQuery::outbound(entity.id.clone()).with_depth(depth))?,
-                self.store.traverse(TraverseQuery {
-                    start: entity.id.clone(),
-                    outbound: false,
-                    max_depth: depth,
-                    edge_kinds: Vec::new(),
-                })?,
-            ] {
+            let outbound_trav = self
+                .store
+                .traverse(TraverseQuery::outbound(entity.id.clone()).with_depth(depth))?;
+            let inbound_trav = self.store.traverse(TraverseQuery {
+                start: entity.id.clone(),
+                outbound: false,
+                max_depth: depth,
+                edge_kinds: Vec::new(),
+            })?;
+            // 所在 file:从 inbound 邻居里找 File 实体(file-桥接要用)。
+            let containing_file = inbound_trav
+                .entities
+                .iter()
+                .find(|related| related.kind == EntityKind::File)
+                .map(|file| file.id.clone());
+            for traversal in [outbound_trav, inbound_trav] {
                 for edge in traversal.edges {
                     for ev in &edge.evidence {
                         if ev.confidence < confidence {
@@ -360,6 +366,34 @@ impl<'a> ImpactAnalyzer<'a> {
                 for related in traversal.entities {
                     if !path.contains(&related.id) {
                         path.push(related.id);
+                    }
+                }
+            }
+            // 前端字段 file-桥接:字段是叶节点,单向 traverse 到所在 file 即停,
+            // 触及不到同 file 的 http_client_call。这里额外从 file outbound 到
+            // call(Contains)→ endpoint(MatchesEndpoint),让"改前端字段"的 blast
+            // radius 能到后端端点。MatchesEndpoint 多为 Inferred,会拉低 confidence,
+            // 与分级匹配呼应。启发式:同页面所有 endpoint 都纳入,靠 confidence 区分。
+            if entity.kind == EntityKind::FrontendField {
+                if let Some(file_id) = containing_file {
+                    let bridge = self.store.traverse(TraverseQuery {
+                        start: file_id,
+                        outbound: true,
+                        max_depth: 2,
+                        edge_kinds: vec![EdgeKind::Contains, EdgeKind::MatchesEndpoint],
+                    })?;
+                    for edge in bridge.edges {
+                        for ev in &edge.evidence {
+                            if ev.confidence < confidence {
+                                confidence = ev.confidence;
+                            }
+                        }
+                        evidence.extend(edge.evidence);
+                    }
+                    for related in bridge.entities {
+                        if !path.contains(&related.id) {
+                            path.push(related.id);
+                        }
                     }
                 }
             }
