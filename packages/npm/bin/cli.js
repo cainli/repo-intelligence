@@ -26,7 +26,7 @@ try {
 
 if (!binary) {
   console.error(
-    `Native package ${packageName} is unavailable. Reinstall @repo-intelligence/cli for ${process.platform}-${process.arch}.`,
+    `Native package ${packageName} is unavailable. Reinstall @cainli/repo-intelligence for ${process.platform}-${process.arch}.`,
   );
   process.exit(1);
 }

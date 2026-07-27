@@ -59,8 +59,14 @@ cargo build
 node packages/npm/bin/cli.js doctor --format json
 ```
 
-正式发布时，`@repo-intelligence/cli` 通过平台包携带对应原生二进制。支持矩阵为
-macOS arm64/x64、Linux glibc arm64/x64 和 Windows x64。
+公共 npm 预览包为 `@cainli/repo-intelligence`，当前首先提供 macOS arm64
+原生平台包。规划中的支持矩阵为 macOS arm64/x64、Linux glibc arm64/x64 和
+Windows x64；未发布平台包的平台不能运行。
+
+```bash
+npm install -g @cainli/repo-intelligence
+repo-intelligence doctor --format json
+```
 
 ## 验证
 

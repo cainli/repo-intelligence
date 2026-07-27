@@ -1,5 +1,5 @@
 {
-  "name": "@repo-intelligence/PLATFORM",
+  "name": "@cainli/repo-intelligence-PLATFORM",
   "version": "0.1.0",
   "os": ["OS"],
   "cpu": ["ARCH"],

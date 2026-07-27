@@ -1,8 +1,20 @@
 {
-  "name": "@repo-intelligence/cli",
+  "name": "@cainli/repo-intelligence",
   "version": "0.1.0",
   "private": false,
   "type": "module",
+  "description": "Local cross-stack repository intelligence and change impact analyzer",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cainli/repo-intelligence.git"
+  },
+  "homepage": "https://github.com/cainli/repo-intelligence#readme",
+  "bugs": "https://github.com/cainli/repo-intelligence/issues",
+  "files": [
+    "bin",
+    "lib"
+  ],
   "bin": {
     "repo-intelligence": "./bin/cli.js"
   },
@@ -13,10 +25,6 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@repo-intelligence/darwin-arm64": "0.1.0",
-    "@repo-intelligence/darwin-x64": "0.1.0",
-    "@repo-intelligence/linux-arm64-gnu": "0.1.0",
-    "@repo-intelligence/linux-x64-gnu": "0.1.0",
-    "@repo-intelligence/win32-x64": "0.1.0"
+    "@cainli/repo-intelligence-darwin-arm64": "0.1.0"
   }
 }
