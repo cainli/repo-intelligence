@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { platformPackage } from "../lib/platform.js";
@@ -27,4 +27,8 @@ test("rejects unsupported platforms clearly", () => {
 test("publishes an executable CLI entrypoint", () => {
   const cli = fileURLToPath(new URL("../bin/cli.js", import.meta.url));
   assert.notEqual(statSync(cli).mode & 0o111, 0);
+  const manifest = JSON.parse(
+    readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"),
+  );
+  assert.equal(manifest.bin["repo-intelligence"], "bin/cli.js");
 });
