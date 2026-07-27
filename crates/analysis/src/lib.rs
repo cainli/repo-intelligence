@@ -5,10 +5,19 @@ use std::time::Instant;
 use anyhow::{Result, anyhow};
 use repo_intelligence_graph::GraphStore;
 use repo_intelligence_model::{
-    ChangeRequest, Edge, EdgeKind, Entity, EntityKind, EvidenceClass, GraphPatch, ImpactFinding,
-    ImpactReport, SearchQuery,
+    ChangeOperation, ChangeRequest, Edge, EdgeKind, Entity, EntityKind, EvidenceClass, GraphPatch,
+    ImpactFinding, ImpactReport, SearchQuery, TraverseQuery,
 };
 use repo_intelligence_source::discover;
+
+/// Default page size for `analyze_change` when the caller omits `limit`. Keeps a
+/// single high-fan-out change (e.g. removing a widely-referenced field) from
+/// producing millions of characters of JSON the client cannot consume.
+const DEFAULT_IMPACT_LIMIT: usize = 100;
+/// Hard ceiling on `limit` to bound worst-case result volume.
+const MAX_IMPACT_LIMIT: usize = 500;
+/// Upper bound on the internal search fan-out used to populate a page.
+const MAX_SEARCH_LIMIT: usize = 1_000;
 
 #[derive(Clone, Debug, Default)]
 pub struct ScanSummary {
@@ -235,29 +244,59 @@ impl<'a> ImpactAnalyzer<'a> {
             .from
             .as_deref()
             .ok_or_else(|| anyhow!("change request is missing the source field"))?;
+        let limit = change
+            .limit
+            .unwrap_or(DEFAULT_IMPACT_LIMIT)
+            .clamp(1, MAX_IMPACT_LIMIT);
+        let offset = change.offset.unwrap_or(0);
+        let depth = change
+            .depth
+            .unwrap_or_else(|| default_depth(change.operation));
+        // Pull the full candidate set (capped) so `total` reflects the real
+        // fan-out and pagination stays accurate — the page window is applied in
+        // memory after ranking. Using `offset+limit` as the SQL LIMIT instead
+        // would silently cap `total` at the window size and break `has_more`.
+        // The cap bounds a runaway query; reaching it means `total` is a lower
+        // bound (surfaced as an open question below).
         let matches = self
             .store
-            .search(SearchQuery::new(source_name).with_limit(500))?;
-        let mut report = ImpactReport::default();
-        for matched in matches
+            .search(SearchQuery::new(source_name).with_limit(MAX_SEARCH_LIMIT))?;
+        // Only exact-name matches are real impact targets; substring hits are
+        // coincidence (e.g. a table named `customer_name_id`).
+        let mut candidates: Vec<Entity> = matches
             .into_iter()
             .filter(|matched| matched.entity.name == source_name)
-        {
-            let entity = matched.entity;
+            .map(|matched| matched.entity)
+            .collect();
+        let total = candidates.len();
+        // Rank by impact surface: user-visible planes (frontend/api/data)
+        // first, so a truncated page still shows the changes a human cares most
+        // about. Destructive remove/change ops get shallow depth by default.
+        candidates.sort_by(|a, b| {
+            plane_rank(b.kind)
+                .cmp(&plane_rank(a.kind))
+                .then_with(|| a.qualified_name.cmp(&b.qualified_name))
+        });
+        let has_more = offset.saturating_add(limit) < total;
+        let mut report = ImpactReport {
+            total,
+            limit,
+            offset,
+            has_more,
+            ..Default::default()
+        };
+        for entity in candidates.into_iter().skip(offset).take(limit) {
             let plane = plane_for(entity.kind).to_owned();
             let mut path = vec![entity.id.clone()];
             let mut evidence = entity.evidence.clone();
             for traversal in [
-                self.store.traverse(
-                    repo_intelligence_model::TraverseQuery::outbound(entity.id.clone())
-                        .with_depth(8),
-                )?,
                 self.store
-                    .traverse(repo_intelligence_model::TraverseQuery {
-                        start: entity.id.clone(),
-                        outbound: false,
-                        max_depth: 8,
-                    })?,
+                    .traverse(TraverseQuery::outbound(entity.id.clone()).with_depth(depth))?,
+                self.store.traverse(TraverseQuery {
+                    start: entity.id.clone(),
+                    outbound: false,
+                    max_depth: depth,
+                })?,
             ] {
                 for edge in traversal.edges {
                     evidence.extend(edge.evidence);
@@ -275,6 +314,11 @@ impl<'a> ImpactAnalyzer<'a> {
                 plane,
                 severity: "review_required".into(),
             });
+        }
+        if total >= MAX_SEARCH_LIMIT {
+            report.open_questions.push(format!(
+                "Impact search reached the {MAX_SEARCH_LIMIT}-candidate cap; `total` is a lower bound and additional matches may exist beyond it."
+            ));
         }
         if report.findings.is_empty() {
             report.open_questions.push(format!(
@@ -310,5 +354,35 @@ fn plane_for(kind: EntityKind) -> &'static str {
         EntityKind::TestCase => "test",
         EntityKind::ConfigFile => "delivery",
         _ => "code",
+    }
+}
+
+/// Default traversal depth per operation. Destructive operations (remove,
+/// type/nullable/format/semantics change) only need direct dependents — going
+/// deeper explodes the result for a question that is really "what breaks right
+/// here?". Add/rename want a wider net but are still capped.
+fn default_depth(operation: ChangeOperation) -> usize {
+    match operation {
+        ChangeOperation::Remove
+        | ChangeOperation::ChangeType
+        | ChangeOperation::ChangeNullable
+        | ChangeOperation::ChangeFormat
+        | ChangeOperation::ChangeSemantics => 1,
+        ChangeOperation::Add | ChangeOperation::Rename => 2,
+    }
+}
+
+/// Impact-surface priority for ranking truncated pages. Higher = more
+/// user-visible, so a capped page surfaces the planes a human reviews first.
+fn plane_rank(kind: EntityKind) -> u8 {
+    match kind {
+        EntityKind::FrontendField | EntityKind::VuePage | EntityKind::VueComponent => 4,
+        EntityKind::HttpEndpoint | EntityKind::ApiField | EntityKind::HttpClientCall => 3,
+        EntityKind::SqlField
+        | EntityKind::XmlStatement
+        | EntityKind::Table
+        | EntityKind::Column => 2,
+        EntityKind::Field => 1,
+        _ => 0,
     }
 }

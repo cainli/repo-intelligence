@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::Result;
 use repo_intelligence_analysis::{ImpactAnalyzer, WorkspaceIndexer};
 use repo_intelligence_graph::{GraphStore, SqliteGraphStore};
-use repo_intelligence_model::{ChangeRequest, SearchQuery};
+use repo_intelligence_model::{ChangeRequest, EntityKind, SearchQuery};
 use serde_json::{Value, json};
 
 /// Default row cap for the text-search tools when the caller omits `limit`.
@@ -86,14 +86,16 @@ fn finding_schema() -> Value {
 
 fn tool_specs() -> Vec<ToolSpec> {
     // The three text-search tools share one contract: a `query` (and optional
-    // `limit`) in, and a wrapped `{items, count}` object out.
+    // `limit`) in, and a wrapped `{items, count}` object out. `hint` is set only
+    // when a search comes back empty, explaining why — so an empty result reads
+    // as "nothing matched, here's what to try" rather than "tool broken".
     let search_input = json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Search text: an entity name, qualified name, or substring."
+                "description": "Search text: an entity name, qualified name, or substring. Matches indexed entity names/qualified names (case-insensitive substring); not annotations, comments, or natural language."
             },
             "limit": {
                 "type": "integer",
@@ -109,7 +111,8 @@ fn tool_specs() -> Vec<ToolSpec> {
         "additionalProperties": false,
         "properties": {
             "items": {"type": "array", "items": entity_schema()},
-            "count": {"type": "integer", "minimum": 0}
+            "count": {"type": "integer", "minimum": 0},
+            "hint": {"type": "string"}
         },
         "required": ["items", "count"]
     });
@@ -117,7 +120,7 @@ fn tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "scan_workspace",
-            description: "Index a workspace into the local system graph.",
+            description: "Index a workspace into the local system graph. Returns a health report (entity counts by kind and the excluded-directory list).",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -135,26 +138,31 @@ fn tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "files_indexed": {"type": "integer", "minimum": 0},
                     "entities_indexed": {"type": "integer", "minimum": 0},
-                    "edges_indexed": {"type": "integer", "minimum": 0}
+                    "edges_indexed": {"type": "integer", "minimum": 0},
+                    "entities_by_kind": {
+                        "type": "object",
+                        "additionalProperties": {"type": "integer"}
+                    },
+                    "excluded_dirs": {"type": "array", "items": {"type": "string"}}
                 },
-                "required": ["files_indexed", "entities_indexed", "edges_indexed"]
+                "required": ["files_indexed", "entities_indexed", "edges_indexed", "entities_by_kind", "excluded_dirs"]
             }),
         },
         ToolSpec {
             name: "search_entities",
-            description: "Search indexed entities.",
+            description: "Search indexed entities by name or qualified name (case-insensitive substring). Returns matches of any kind.",
             input_schema: search_input.clone(),
             output_schema: search_output.clone(),
         },
         ToolSpec {
             name: "find_endpoint",
-            description: "Find an HTTP endpoint.",
+            description: "Find HTTP/RPC endpoints by path or name. Only returns endpoint kinds (http_endpoint, http_client_call, api_field). Recognizes Spring MVC mappings and configured RPC annotations (@RmbMap, @DubboService).",
             input_schema: search_input.clone(),
             output_schema: search_output.clone(),
         },
         ToolSpec {
             name: "analyze_change",
-            description: "Analyze the impact of a structured change.",
+            description: "Analyze the impact of a structured change. Returns a paginated window of findings (use limit/offset) with bounded traversal depth; total + has_more indicate whether more findings exist.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -177,6 +185,23 @@ fn tool_specs() -> Vec<ToolSpec> {
                     "to": {
                         "type": "string",
                         "description": "New name for a rename, or target for an add."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": 100,
+                        "description": "Maximum findings to return."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Number of findings to skip (pagination)."
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Graph traversal depth around each finding. Defaults to an operation-appropriate value (destructive ops stay shallow) when omitted."
                     }
                 },
                 "required": ["target_kind", "operation", "from"]
@@ -186,28 +211,33 @@ fn tool_specs() -> Vec<ToolSpec> {
                 "additionalProperties": false,
                 "properties": {
                     "findings": {"type": "array", "items": finding_schema()},
-                    "open_questions": {"type": "array", "items": {"type": "string"}}
+                    "open_questions": {"type": "array", "items": {"type": "string"}},
+                    "total": {"type": "integer", "minimum": 0},
+                    "limit": {"type": "integer", "minimum": 0},
+                    "offset": {"type": "integer", "minimum": 0},
+                    "has_more": {"type": "boolean"}
                 },
-                "required": ["findings", "open_questions"]
+                "required": ["findings", "open_questions", "total", "limit", "offset", "has_more"]
             }),
         },
         ToolSpec {
             name: "analyze_requirement",
-            description: "Find candidate code locations for requirement text.",
+            description: "Find candidate code entities for a requirement keyword by matching indexed entity names/qualified names. Substring match only — not semantic or free-text search.",
             input_schema: search_input,
             output_schema: search_output,
         },
         ToolSpec {
             name: "show_system_view",
-            description: "Show a repository, API, or data system view.",
+            description: "Show a repository, API, or data system view as bounded counts grouped by entity kind (never full entities).",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
                     "view": {
                         "type": "string",
+                        "enum": ["repositories", "api", "data"],
                         "default": "repositories",
-                        "description": "Requested view name (e.g. repositories, api, data)."
+                        "description": "repositories: full overview. api: http_endpoint/api_field/http_client_call only. data: table/column/sql_field/xml_statement/result_map/mapper/mapper_method/datasource/database only."
                     }
                 }
             }),
@@ -221,7 +251,8 @@ fn tool_specs() -> Vec<ToolSpec> {
                     "entities_by_kind": {
                         "type": "object",
                         "additionalProperties": {"type": "integer"}
-                    }
+                    },
+                    "hint": {"type": "string"}
                 },
                 "required": ["view", "entity_count", "edge_count", "entities_by_kind"]
             }),
@@ -371,22 +402,58 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
     let arguments = &params["arguments"];
     let path = database.ok_or_else(|| anyhow::anyhow!("MCP server has no database configured"))?;
     let data = match name {
-        "search_entities" | "find_endpoint" | "analyze_requirement" => {
+        "search_entities" => {
             let query = arguments["query"].as_str().unwrap_or_default();
-            let limit = arguments["limit"]
-                .as_u64()
-                .map(|value| value.max(1) as usize)
-                .unwrap_or(DEFAULT_SEARCH_LIMIT);
+            let limit = parse_limit(arguments);
             let store = SqliteGraphStore::open(path)?;
-            let matches = store.search(SearchQuery::new(query).with_limit(limit))?;
-            let entities: Vec<_> = matches.into_iter().map(|matched| matched.entity).collect();
-            let count = entities.len();
-            // Wrap the array in an object: MCP forbids a bare array as
-            // structuredContent ("expected record, received array").
+            let (entities, count) = search_with_filter(&store, query, limit, None)?;
             json!({
                 "items": serde_json::to_value(&entities)?,
                 "count": count,
             })
+        }
+        "find_endpoint" => {
+            let query = arguments["query"].as_str().unwrap_or_default();
+            let limit = parse_limit(arguments);
+            let store = SqliteGraphStore::open(path)?;
+            let endpoint_kinds = [
+                EntityKind::HttpEndpoint,
+                EntityKind::HttpClientCall,
+                EntityKind::ApiField,
+            ];
+            let (entities, count) =
+                search_with_filter(&store, query, limit, Some(&endpoint_kinds))?;
+            let mut result = json!({
+                "items": serde_json::to_value(&entities)?,
+                "count": count,
+            });
+            if count == 0 {
+                result["hint"] = json!(
+                    "No endpoints matched. Endpoints are recognized from Spring MVC mappings \
+                     (@RequestMapping/@GetMapping/...) or configured RPC annotations (@RmbMap, \
+                     @DubboService). If this service uses another framework, its entry points \
+                     are not indexed."
+                );
+            }
+            result
+        }
+        "analyze_requirement" => {
+            let query = arguments["query"].as_str().unwrap_or_default();
+            let limit = parse_limit(arguments);
+            let store = SqliteGraphStore::open(path)?;
+            let (entities, count) = search_with_filter(&store, query, limit, None)?;
+            let mut result = json!({
+                "items": serde_json::to_value(&entities)?,
+                "count": count,
+            });
+            if count == 0 {
+                result["hint"] = json!(
+                    "No indexed entity name contains this text. This tool matches entity \
+                     names/qualified names (classes, fields, tables, endpoints) by substring, \
+                     not free text or natural language; try a concrete identifier."
+                );
+            }
+            result
         }
         "analyze_change" => {
             let change: ChangeRequest = serde_json::from_value(arguments.clone())?;
@@ -397,10 +464,16 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
             let workspace = arguments["workspace"].as_str().unwrap_or(".");
             let mut store = SqliteGraphStore::open(path)?;
             let summary = WorkspaceIndexer.scan(Path::new(workspace), &mut store)?;
+            // Echo the resulting kind distribution and the exclusion list so a
+            // caller can spot a polluted index (e.g. a worktree copy doubling
+            // every kind) from the scan result alone, without re-querying.
+            let entities_by_kind = store.counts_by_kind()?;
             json!({
                 "files_indexed": summary.files_indexed,
                 "entities_indexed": summary.entities_indexed,
-                "edges_indexed": summary.edges_indexed
+                "edges_indexed": summary.edges_indexed,
+                "entities_by_kind": entities_by_kind,
+                "excluded_dirs": repo_intelligence_source::EXCLUDED_DIRS,
             })
         }
         "get_index_status" => {
@@ -449,12 +522,27 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
             if let Some(kinds) = plane_kinds {
                 entities_by_kind.retain(|kind, _| kinds.contains(&kind.as_str()));
             }
-            json!({
+            let plane_total: u64 = entities_by_kind.values().sum();
+            let hint = if plane_kinds.is_some() && plane_total == 0 {
+                Some(json!(match view {
+                    "api" =>
+                        "No API-plane entities indexed. Endpoints are recognized from Spring MVC mappings or configured RPC annotations (@RmbMap, @DubboService); a service using another framework has no indexed entry points.",
+                    _ =>
+                        "No data-plane entities indexed. Data-plane entities come from MyBatis XML / SQL; a project without them has none.",
+                }))
+            } else {
+                None
+            };
+            let mut result = json!({
                 "view": view,
                 "entity_count": entity_count,
                 "edge_count": edge_count,
                 "entities_by_kind": entities_by_kind,
-            })
+            });
+            if let Some(hint) = hint {
+                result["hint"] = hint;
+            }
+            result
         }
         _ => return Err(anyhow::anyhow!("tool not implemented: {name}")),
     };
@@ -462,4 +550,30 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
         "content": [{"type": "text", "text": serde_json::to_string(&data)?}],
         "structuredContent": data
     }))
+}
+
+fn parse_limit(arguments: &Value) -> usize {
+    arguments["limit"]
+        .as_u64()
+        .map(|value| value.max(1) as usize)
+        .unwrap_or(DEFAULT_SEARCH_LIMIT)
+}
+
+/// Runs a name/qualified-name search and optionally narrows to a set of kinds.
+/// `find_endpoint` uses the filter so it only ever returns endpoint entities —
+/// never the unrelated classes/fields a plain `search_entities` would surface.
+fn search_with_filter(
+    store: &SqliteGraphStore,
+    query: &str,
+    limit: usize,
+    filter: Option<&[EntityKind]>,
+) -> Result<(Vec<repo_intelligence_model::Entity>, usize)> {
+    let matches = store.search(SearchQuery::new(query).with_limit(limit))?;
+    let entities: Vec<_> = matches
+        .into_iter()
+        .map(|matched| matched.entity)
+        .filter(|entity| filter.is_none_or(|kinds| kinds.contains(&entity.kind)))
+        .collect();
+    let count = entities.len();
+    Ok((entities, count))
 }

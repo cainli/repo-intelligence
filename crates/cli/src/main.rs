@@ -151,10 +151,18 @@ fn run() -> Result<()> {
         }
         Command::Overview { view, format } => {
             let store = SqliteGraphStore::open(&cli.database)?;
-            let entities = store.all_entities()?;
+            // Return a bounded distribution, not every entity: a large index
+            // would otherwise dump megabytes of JSON to stdout for a command
+            // whose purpose is a quick summary.
+            let (entity_count, edge_count) = store.counts()?;
             emit(
                 format,
-                serde_json::json!({"view": view, "entities": entities}),
+                serde_json::json!({
+                    "view": view,
+                    "entity_count": entity_count,
+                    "edge_count": edge_count,
+                    "entities_by_kind": store.counts_by_kind()?,
+                }),
             )
         }
         Command::Doctor { format } => {

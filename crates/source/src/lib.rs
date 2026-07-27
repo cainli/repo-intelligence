@@ -51,6 +51,20 @@ pub struct SourceFile {
     pub content: String,
 }
 
+/// Directory names always excluded from discovery (build artifacts, VCS, tooling
+/// worktrees, and this project's own index). Exposed so the MCP layer can echo
+/// it back in the scan health report.
+pub const EXCLUDED_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "build",
+    "dist",
+    ".gradle",
+    ".git",
+    ".claude",
+    ".repo-intelligence",
+];
+
 pub fn discover(root: &Path) -> Result<Vec<SourceFile>> {
     let mut files = Vec::new();
     let walker = WalkBuilder::new(root)
@@ -58,10 +72,8 @@ pub fn discover(root: &Path) -> Result<Vec<SourceFile>> {
         .git_ignore(true)
         .require_git(false)
         .filter_entry(|entry| {
-            !matches!(
-                entry.file_name().to_str(),
-                Some("node_modules" | "target" | "build" | "dist" | ".gradle" | ".git" | ".claude")
-            )
+            let name = entry.file_name().to_str();
+            !name.is_some_and(|value| EXCLUDED_DIRS.contains(&value))
         })
         .build();
     for entry in walker {

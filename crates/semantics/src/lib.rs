@@ -32,6 +32,20 @@ static HTTP_CALL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)\b(?:axios\.)?(get|post|put|delete|patch)\(\s*["'`]([^"'`]+)["'`]"#).unwrap()
 });
 
+/// Framework-specific endpoint annotations recognized in addition to Spring
+/// MVC. The first string literal in an annotation's argument list (if any) is
+/// taken as the endpoint identifier. Add entries here to teach the indexer
+/// about in-house RPC frameworks (RMB `@RmbMap`, Dubbo, ...) so the API view
+/// and `find_endpoint` work on non-Spring-MVC services.
+const CUSTOM_ENDPOINT_ANNOTATIONS: &[&str] = &["RmbMap", "DubboService", "RpcMapping"];
+
+static CUSTOM_ENDPOINT: LazyLock<Regex> = LazyLock::new(|| {
+    let alternation = CUSTOM_ENDPOINT_ANNOTATIONS.join("|");
+    Regex::new(&format!(r#"@({alternation})\b\s*(?:\(([^)]*)\))?"#)).unwrap()
+});
+
+static STRING_LITERAL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""([^"]*)""#).unwrap());
+
 pub fn extract(file: &SourceFile) -> Result<GraphPatch> {
     let path = file.relative_path.to_string_lossy().to_string();
     let file_entity = Entity::new(
@@ -172,6 +186,7 @@ fn extract_java(
         );
         add_contained(file, path, entity, line, entities, edges);
     }
+    extract_custom_endpoints(file, path, entities, edges);
     Ok(())
 }
 
@@ -361,6 +376,57 @@ fn extract_frontend(
             "frontend HTTP call",
         );
         add_contained(file, path, call, line, entities, edges);
+    }
+}
+
+fn extract_custom_endpoints(
+    file: &SourceFile,
+    path: &str,
+    entities: &mut Vec<Entity>,
+    edges: &mut Vec<Edge>,
+) {
+    for capture in CUSTOM_ENDPOINT.captures_iter(&file.content) {
+        let token = capture.get(0).unwrap();
+        let annotation = capture.get(1).unwrap();
+        let args = capture.get(2).map(|m| m.as_str()).unwrap_or("");
+        let value = STRING_LITERAL
+            .captures(args)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str())
+            .unwrap_or("");
+        let line = line_of(&file.content, token.start());
+        // Preserve the raw identifier (an RMB business code is not a URL path);
+        // normalizing it would distort the value users actually search for.
+        let endpoint_path = value.to_string();
+        let (name, discriminator) = if endpoint_path.is_empty() {
+            // No path argument: identify by file + line so each service entry
+            // stays distinct even when the annotation carries no value.
+            (annotation.as_str().to_string(), format!("{line}"))
+        } else {
+            (endpoint_path.clone(), String::new())
+        };
+        let entity = Entity::new(
+            EntityId::stable(
+                "workspace",
+                path,
+                EntityKind::HttpEndpoint,
+                &name,
+                &discriminator,
+            ),
+            EntityKind::HttpEndpoint,
+            &name,
+            &name,
+        )
+        .with_metadata(json!({"path": endpoint_path, "framework": "custom"}))
+        .with_evidence(
+            path,
+            line,
+            line,
+            EvidenceClass::Fact,
+            1.0,
+            "custom RPC framework mapping",
+        );
+        add_contained(file, path, entity, line, entities, edges);
     }
 }
 

@@ -34,6 +34,15 @@ fn discovery_honors_ignore_files_and_builtin_directory_exclusions() {
     )
     .unwrap();
 
+    // The project's own index directory must be excluded even when it holds a
+    // source-shaped file, so a stale index never re-enters the graph.
+    fs::create_dir_all(root.path().join(".repo-intelligence")).unwrap();
+    fs::write(
+        root.path().join(".repo-intelligence/Leak.java"),
+        "class Leak {}",
+    )
+    .unwrap();
+
     let files = discover(root.path()).unwrap();
     let paths: Vec<_> = files
         .iter()

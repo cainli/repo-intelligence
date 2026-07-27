@@ -170,3 +170,89 @@ fn rescanning_removes_entities_for_deleted_files() {
             .is_empty()
     );
 }
+
+#[test]
+fn recognizes_custom_rpc_endpoint_annotations() {
+    // Non-Spring-MVC services (RMB @RmbMap, Dubbo, ...) must still produce
+    // http_endpoint entities so the API view and find_endpoint work for them.
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("RmbService.java"),
+        r#"
+        @RmbMap("queryOrder")
+        class OrderService {}
+        "#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    let endpoint = store
+        .search(SearchQuery::new("queryOrder").with_limit(10))
+        .unwrap();
+    assert!(
+        endpoint
+            .iter()
+            .any(|matched| matched.entity.kind == EntityKind::HttpEndpoint),
+        "@RmbMap should produce an http_endpoint entity"
+    );
+}
+
+#[test]
+fn analyze_depth_defaults_shallow_for_destructive_operations() {
+    use repo_intelligence_model::{ChangeOperation, Edge, Entity, EntityId, GraphPatch};
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    let a = Entity::new(
+        EntityId::stable("repo", "A.java", EntityKind::Field, "target", ""),
+        EntityKind::Field,
+        "target",
+        "A.target",
+    );
+    let b = Entity::new(
+        EntityId::stable("repo", "B.java", EntityKind::Field, "mid", ""),
+        EntityKind::Field,
+        "mid",
+        "B.mid",
+    );
+    let c = Entity::new(
+        EntityId::stable("repo", "C.java", EntityKind::Field, "far", ""),
+        EntityKind::Field,
+        "far",
+        "C.far",
+    );
+    let edges = vec![
+        Edge::new(a.id.clone(), b.id.clone(), EdgeKind::DependsOn),
+        Edge::new(b.id.clone(), c.id.clone(), EdgeKind::DependsOn),
+    ];
+    store
+        .apply_patch(GraphPatch::add(vec![a, b, c], edges))
+        .unwrap();
+
+    let shallow = ImpactAnalyzer::new(&store)
+        .analyze(&ChangeRequest {
+            target_kind: "field".into(),
+            operation: ChangeOperation::Remove,
+            from: Some("target".into()),
+            to: None,
+            limit: None,
+            offset: None,
+            depth: None,
+        })
+        .unwrap();
+    // remove defaults to depth 1 → only the direct dependent (target → mid).
+    assert_eq!(shallow.findings.len(), 1);
+    assert_eq!(shallow.findings[0].path.len(), 2);
+
+    let deep = ImpactAnalyzer::new(&store)
+        .analyze(&ChangeRequest {
+            target_kind: "field".into(),
+            operation: ChangeOperation::Remove,
+            from: Some("target".into()),
+            to: None,
+            limit: None,
+            offset: None,
+            depth: Some(2),
+        })
+        .unwrap();
+    // Explicit depth 2 reaches target → mid → far.
+    assert_eq!(deep.findings[0].path.len(), 3);
+}

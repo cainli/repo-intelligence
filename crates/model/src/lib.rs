@@ -347,6 +347,16 @@ pub struct ChangeRequest {
     pub operation: ChangeOperation,
     pub from: Option<String>,
     pub to: Option<String>,
+    /// Maximum number of impact findings to return (server caps this).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Number of findings to skip — the result window is `[offset, offset+limit)`.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Graph traversal depth around each finding. `None` selects an
+    /// operation-appropriate default (destructive ops stay shallow).
+    #[serde(default)]
+    pub depth: Option<usize>,
 }
 
 impl ChangeRequest {
@@ -356,6 +366,9 @@ impl ChangeRequest {
             operation: ChangeOperation::Rename,
             from: Some(from.into()),
             to: Some(to.into()),
+            limit: None,
+            offset: None,
+            depth: None,
         }
     }
 }
@@ -373,4 +386,12 @@ pub struct ImpactFinding {
 pub struct ImpactReport {
     pub findings: Vec<ImpactFinding>,
     pub open_questions: Vec<String>,
+    /// Total candidate findings before pagination (the full fan-out count).
+    pub total: usize,
+    /// Page size in effect for this result.
+    pub limit: usize,
+    /// Offset in effect for this result.
+    pub offset: usize,
+    /// True when `offset + limit < total` — more findings are available.
+    pub has_more: bool,
 }

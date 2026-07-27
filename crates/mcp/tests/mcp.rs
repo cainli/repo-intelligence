@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::Cursor;
 
 use repo_intelligence_graph::{GraphStore, SqliteGraphStore};
@@ -317,4 +318,147 @@ fn tools_list_declares_typed_input_and_output_schemas() {
         "input schemas should be closed"
     );
     assert_eq!(analyze_change["outputSchema"]["type"], "object");
+}
+
+#[test]
+fn find_endpoint_returns_only_endpoint_kinds() {
+    // find_endpoint must filter to endpoint kinds — previously it shared the
+    // search_entities path verbatim and returned any matching class/field.
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    let mut store = SqliteGraphStore::open(&database).unwrap();
+    let entities = vec![
+        Entity::new(
+            EntityId::stable("repo", "Dto.java", EntityKind::Class, "OrderDto", ""),
+            EntityKind::Class,
+            "OrderDto",
+            "OrderDto",
+        ),
+        Entity::new(
+            EntityId::stable(
+                "repo",
+                "Api.java",
+                EntityKind::HttpEndpoint,
+                "GET /orders",
+                "",
+            ),
+            EntityKind::HttpEndpoint,
+            "GET /orders",
+            "GET /orders",
+        ),
+    ];
+    store
+        .apply_patch(GraphPatch::add(entities, vec![]))
+        .unwrap();
+    drop(store);
+
+    // "order" matches both OrderDto (class) and GET /orders (endpoint).
+    let input = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"find_endpoint","arguments":{"query":"order"}}}
+"#;
+    let mut output = Vec::new();
+    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database)).unwrap();
+    let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
+    let items = response["result"]["structuredContent"]["items"]
+        .as_array()
+        .unwrap();
+    assert_eq!(items.len(), 1, "only the endpoint should be returned");
+    assert_eq!(items[0]["kind"], "http_endpoint");
+}
+
+#[test]
+fn analyze_change_paginates_findings_and_reports_total() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    let mut store = SqliteGraphStore::open(&database).unwrap();
+    let entities: Vec<_> = (0..5)
+        .map(|index| {
+            Entity::new(
+                EntityId::stable(
+                    "repo",
+                    &format!("F{index}.java"),
+                    EntityKind::Field,
+                    "sharedName",
+                    &format!("{index}"),
+                ),
+                EntityKind::Field,
+                "sharedName",
+                format!("F{index}.sharedName"),
+            )
+        })
+        .collect();
+    store
+        .apply_patch(GraphPatch::add(entities, vec![]))
+        .unwrap();
+    drop(store);
+
+    let input = br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"analyze_change","arguments":{"target_kind":"field","operation":"remove","from":"sharedName","limit":2,"offset":0}}}
+"#;
+    let mut output = Vec::new();
+    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database)).unwrap();
+    let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
+    let structured = &response["result"]["structuredContent"];
+    assert_eq!(structured["findings"].as_array().unwrap().len(), 2);
+    assert_eq!(structured["total"], 5);
+    assert_eq!(structured["limit"], 2);
+    assert_eq!(structured["offset"], 0);
+    assert_eq!(structured["has_more"], true);
+}
+
+#[test]
+fn scan_workspace_reports_kind_distribution_and_excluded_dirs() {
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(
+        workspace.path().join("Dto.java"),
+        "class Dto { private String name; }",
+    )
+    .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {"name": "scan_workspace", "arguments": {"workspace": workspace.path()}}
+    });
+    let input = serde_json::to_string(&request).unwrap();
+
+    let mut output = Vec::new();
+    repo_intelligence_mcp::serve(Cursor::new(input.as_bytes()), &mut output, Some(&database))
+        .unwrap();
+    let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
+    let structured = &response["result"]["structuredContent"];
+    assert!(structured["entities_by_kind"].is_object());
+    assert!(
+        structured["entities_by_kind"]["class"]
+            .as_u64()
+            .is_some_and(|count| count >= 1)
+    );
+    let excluded = structured["excluded_dirs"]
+        .as_array()
+        .expect("excluded_dirs reported");
+    assert!(
+        excluded.iter().any(|value| value == ".repo-intelligence"),
+        "excluded_dirs must list .repo-intelligence, got: {excluded:?}"
+    );
+}
+
+#[test]
+fn empty_search_attaches_a_hint_instead_of_silent_zero() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    drop(SqliteGraphStore::open(&database).unwrap());
+
+    let input = br#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"analyze_requirement","arguments":{"query":"nonexistent"}}}
+"#;
+    let mut output = Vec::new();
+    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database)).unwrap();
+    let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
+    let structured = &response["result"]["structuredContent"];
+    assert_eq!(structured["count"], 0);
+    assert!(
+        structured["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("substring")),
+        "empty result should hint at substring matching, got: {structured}"
+    );
 }

@@ -9,6 +9,7 @@ anyhow.workspace = true
 repo-intelligence-analysis = { path = "../analysis" }
 repo-intelligence-graph = { path = "../graph" }
 repo-intelligence-model = { path = "../model" }
+repo-intelligence-source = { path = "../source" }
 repo-intelligence-protocol = { path = "../protocol" }
 serde_json.workspace = true
 

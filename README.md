@@ -3,7 +3,7 @@
 本地运行的跨技术栈代码知识图谱与字段变更影响分析引擎。核心使用 Rust、bundled
 SQLite、FTS5 和 Tree-sitter，通过 npm CLI 或原生二进制运行，不依赖图数据库。
 
-当前 Rust 引擎 `0.1.6`，已经支持：
+当前 Rust 引擎 `0.1.7`，已经支持：
 
 - 遵循 Git ignore 规则扫描 Java、Vue/TypeScript、MyBatis XML 等文件。
 - 使用 Tree-sitter 验证 Java 语法，并提取 Java 字段与 Spring Mapping。
@@ -15,7 +15,8 @@ SQLite、FTS5 和 Tree-sitter，通过 npm CLI 或原生二进制运行，不依
 ## 扫描范围与自动忽略
 
 扫描器会读取项目的 `.gitignore` 和 `.ignore`，并固定排除
-`.git/`、`node_modules/`、`target/`、`build/`、`dist/`、`.gradle`、`.claude/`。
+`.git/`、`node_modules/`、`target/`、`build/`、`dist/`、`.gradle`、`.claude/`、
+`.repo-intelligence/`。
 不支持的文件扩展名和超过 2 MiB 的单个文件也会跳过。项目可以在 `.ignore`
 中增加生成代码、日志、缓存或其他不需要分析的目录。
 

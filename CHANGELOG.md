@@ -7,6 +7,55 @@
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-07-27
+
+### Fixed
+
+- **`analyze_change` 结果体积失控**：删除或修改一个被广泛引用的字段曾产出数百万
+  字符的影响报告（双向深度 8 遍历 + 500 条硬上限），客户端无法直接消费。现在：
+  - 新增 `limit`（默认 100）/`offset` 分页参数，结果按影响平面（前端/API/数据
+    优先）排序后截断，并返回 `total`/`limit`/`offset`/`has_more`。
+  - `operation` 真正驱动遍历深度：`remove`/`change_*` 默认只取直接依赖方
+    （depth 1），`add`/`rename` 默认 depth 2，均可被 `depth` 参数覆盖。此前
+    `operation` 被反序列化后即丢弃，所有操作走同一条爆炸路径。
+- **`find_endpoint` 名不副实**：此前与 `search_entities` 共用同一段代码，返回任意
+  匹配实体（包括 DTO 类），而非端点。现在只返回端点类型（`http_endpoint`/
+  `http_client_call`/`api_field`）。
+- **非 Spring MVC 项目 API 视图与端点查找失效**：端点识别此前只认
+  `@RequestMapping`/`@GetMapping` 等 Spring MVC 注解，对 RMB `@RmbMap`、Dubbo
+  `@DubboService` 等自研 RPC 框架项目，`http_endpoint` 实体数为 0，API 视图与
+  `find_endpoint` 全空。现在内置可扩展的自定义端点注解识别（默认含 `@RmbMap`/
+  `@DubboService`/`@RpcMapping`，在 `CUSTOM_ENDPOINT_ANNOTATIONS` 增项即可接入）。
+- **扫描混入自身索引目录**：`.repo-intelligence/` 未排除，可能被重复扫入。
+  现已加入固定排除集。
+
+### Added
+
+- **`scan_workspace` 健康报告**：扫描结果新增 `entities_by_kind`（按实体类型分布）
+  与 `excluded_dirs`（被排除目录清单），可一眼发现索引污染（如 worktree 副本使
+  每个类型计数翻倍）。
+- **空结果提示**：`find_endpoint`/`analyze_requirement` 在零命中时返回 `hint`，
+  说明匹配范围（实体名子串，非全文/语义检索）或端点识别规则，避免误判"工具坏了"。
+  `show_system_view` 的 `api`/`data` 视图为空时同样给出提示。
+
+### Changed
+
+- `analyze_change` 的 `inputSchema` 补全 `limit`/`offset`/`depth`，`outputSchema`
+  补全 `total`/`limit`/`offset`/`has_more`。
+- `show_system_view` 的 `view` 改为 enum（`repositories`/`api`/`data`）。
+- `search_entities`/`find_endpoint`/`analyze_requirement` 的 `outputSchema` 新增可选
+  `hint` 字段；描述明确"按实体名/限定名子串匹配，非注解、全文或语义检索"。
+- CLI `overview` 命令从返回全量实体改为返回按类型分布的概览（避免大索引撑爆
+  stdout），与 MCP `show_system_view` 对齐。
+- 固定排除目录列表抽为 `repo_intelligence_source::EXCLUDED_DIRS` 公开常量。
+- 新增回归测试：`find_endpoint_returns_only_endpoint_kinds`、
+  `analyze_change_paginates_findings_and_reports_total`、
+  `scan_workspace_reports_kind_distribution_and_excluded_dirs`、
+  `empty_search_attaches_a_hint_instead_of_silent_zero`、
+  `recognizes_custom_rpc_endpoint_annotations`、
+  `analyze_depth_defaults_shallow_for_destructive_operations`，并扩展 discovery
+  测试覆盖 `.repo-intelligence/` 排除。
+
 ## [0.1.6] - 2026-07-27
 
 ### Added
