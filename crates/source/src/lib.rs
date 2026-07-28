@@ -14,10 +14,7 @@ pub enum FileKind {
     TypeScript,
     Vue,
     Xml,
-    Yaml,
-    Properties,
     Gradle,
-    Sql,
     Toml,
     Json,
     Unknown,
@@ -38,9 +35,9 @@ impl FileKind {
             Some("ts") | Some("tsx") => Self::TypeScript,
             Some("vue") => Self::Vue,
             Some("xml") => Self::Xml,
-            Some("yml") | Some("yaml") => Self::Yaml,
-            Some("properties") => Self::Properties,
-            Some("sql") => Self::Sql,
+            // 注意:yml/yaml/properties/sql 等无语义提取器的扩展名落到 Unknown,
+            // discover 会跳过(见下方 `if kind == Unknown`),不再把全文读进内存。
+            // 回归:yaml 曾被分类为 Yaml kind,大项目配置文件内容全驻留 → OOM/卡死。
             Some("toml") => Self::Toml,
             Some("json") => Self::Json,
             _ => Self::Unknown,
@@ -115,4 +112,56 @@ pub fn discover_with_config(root: &Path, config: &DiscoveryConfig) -> Result<Vec
         });
     }
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn unsupported_kinds_classify_as_unknown() {
+        // 无提取器的扩展名归 Unknown —— discover 跳过,不再把全文读进内存。
+        // 回归:yaml 曾被分类为支持的 kind,大项目配置文件内容全驻留 → OOM/卡死。
+        for ext in &["yaml", "yml", "properties", "sql", "log", "md", "txt"] {
+            let name = format!("config.{ext}");
+            assert_eq!(
+                FileKind::from_path(Path::new(&name)),
+                FileKind::Unknown,
+                ".{ext} 应归 Unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn supported_kinds_still_classified() {
+        assert_eq!(FileKind::from_path(Path::new("A.java")), FileKind::Java);
+        assert_eq!(FileKind::from_path(Path::new("m.xml")), FileKind::Xml);
+        assert_eq!(FileKind::from_path(Path::new("b.gradle")), FileKind::Gradle);
+        assert_eq!(
+            FileKind::from_path(Path::new("b.gradle.kts")),
+            FileKind::Gradle
+        );
+        assert_eq!(FileKind::from_path(Path::new("c.json")), FileKind::Json);
+        assert_eq!(FileKind::from_path(Path::new("c.toml")), FileKind::Toml);
+        assert_eq!(FileKind::from_path(Path::new("v.vue")), FileKind::Vue);
+        assert_eq!(FileKind::from_path(Path::new("a.js")), FileKind::JavaScript);
+        assert_eq!(FileKind::from_path(Path::new("a.ts")), FileKind::TypeScript);
+    }
+
+    #[test]
+    fn discover_skips_unsupported_files() {
+        // yaml/properties 归 Unknown → discover 不收集(不读内容、不进 Vec<SourceFile>)。
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big.yaml"), "key: value\n".repeat(50_000)).unwrap();
+        std::fs::write(dir.path().join("app.properties"), "k=v\n").unwrap();
+        std::fs::write(dir.path().join("B.java"), "class B {}").unwrap();
+        let files = discover(dir.path()).unwrap();
+        assert_eq!(files.len(), 1, "只收集 .java,跳过 .yaml/.properties");
+        assert_eq!(files[0].kind, FileKind::Java);
+        assert!(
+            files.iter().all(|f| f.kind != FileKind::Unknown),
+            "Unknown 不应进 Vec"
+        );
+    }
 }
