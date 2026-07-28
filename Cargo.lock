@@ -472,7 +472,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "repo-intelligence"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "clap",
@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-analysis"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "regex",
@@ -505,7 +505,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-config"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "serde",
@@ -515,7 +515,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-graph"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "repo-intelligence-model",
@@ -526,7 +526,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-mcp"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "repo-intelligence-analysis",
@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-model"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "blake3",
  "serde",
@@ -549,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-parsing"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "quick-xml",
@@ -562,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-protocol"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "repo-intelligence-model",
  "serde",
@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-semantics"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "regex",
@@ -585,7 +585,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-source"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "blake3",

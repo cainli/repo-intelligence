@@ -29,6 +29,11 @@ impl FileKind {
         if name.ends_with(".gradle") || name.ends_with(".gradle.kts") {
             return Self::Gradle;
         }
+        // minified 产物（.min.js/.min.css 等）跳过：压缩代码无语义价值，且巨大单行会让
+        // 前端提取器的正则/tree-sitter 灾难性卡死（如 echarts5.min.js 让 scan 在 parsing 卡死）。
+        if name.contains(".min.") {
+            return Self::Unknown;
+        }
         match path.extension().and_then(|value| value.to_str()) {
             Some("java") => Self::Java,
             Some("js") | Some("jsx") => Self::JavaScript,
@@ -198,5 +203,28 @@ mod tests {
         );
         assert!(names.iter().any(|n| n == "keep.json"), "keep.json 保留");
         assert!(names.iter().any(|n| n == "A.java"), "A.java 保留");
+    }
+
+    #[test]
+    fn minified_files_classify_as_unknown() {
+        // minified（.min.js 等）归 Unknown —— 压缩代码无语义,且卡前端提取器。
+        // 回归:echarts5.min.js 曾让 scan 在 parsing 阶段卡死。
+        for name in &["echarts5.min.js", "vue.min.js", "app.min.css"] {
+            let n = name.to_string();
+            assert_eq!(
+                FileKind::from_path(Path::new(&n)),
+                FileKind::Unknown,
+                "{name} 应归 Unknown"
+            );
+        }
+        // 普通 js 仍分类（不被 .min. 误伤）
+        let n = "app.js".to_string();
+        assert_eq!(FileKind::from_path(Path::new(&n)), FileKind::JavaScript);
+        let n = "admin.js".to_string();
+        assert_eq!(
+            FileKind::from_path(Path::new(&n)),
+            FileKind::JavaScript,
+            "admin.js 不含 .min.,不应误判"
+        );
     }
 }

@@ -7,6 +7,15 @@
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-07-28
+
+### Fixed
+
+- **scan 遇 minified JS（如 `echarts5.min.js`）卡死**：`.min.js`/`.min.css` 等压缩产物现归
+  `Unknown`，discover 跳过（不提取、不读）。压缩代码无语义价值，且巨大单行会让前端提取器
+  （frontend.rs）的正则/tree-sitter 灾难性卡死（parsing 阶段停在第 ~13400 个文件）。
+  回归测试覆盖 `.min.js`/普通 `.js`（不误伤 `admin.js`）。
+
 ## [0.1.14] - 2026-07-28
 
 ### Added
