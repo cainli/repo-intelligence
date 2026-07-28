@@ -2,7 +2,9 @@ use std::fs;
 use std::io::Cursor;
 
 use repo_intelligence_graph::{GraphStore, SqliteGraphStore};
-use repo_intelligence_model::{Edge, EdgeKind, Entity, EntityId, EntityKind, GraphPatch};
+use repo_intelligence_model::{
+    Edge, EdgeKind, Entity, EntityId, EntityKind, EvidenceClass, GraphPatch,
+};
 
 #[test]
 fn mcp_lists_supported_tools_over_json_rpc() {
@@ -733,4 +735,122 @@ fn trace_tools_declare_typed_schemas() {
             );
         }
     }
+}
+
+/// A field carrying two evidence rows, so a test can tell the compact view
+/// (evidence_count only) from the verbose view (evidence[] bodies expanded).
+fn field_with_evidence(name: &str) -> Entity {
+    Entity::new(
+        EntityId::stable("repo", "E.java", EntityKind::Field, name, ""),
+        EntityKind::Field,
+        name,
+        format!("E.{name}"),
+    )
+    .with_evidence("E.java", 10, 12, EvidenceClass::Fact, 1.0, "field declared here")
+    .with_evidence("Mapper.xml", 5, 5, EvidenceClass::Inferred, 0.7, "mapped in result map")
+}
+
+#[test]
+fn search_compact_omits_evidence_bodies_by_default() {
+    // 默认 compact 视图:扫几十条命中时不能把每条 evidence.reason 长串和
+    // metadata blob 都塞进响应 —— 只给识别用的 id/kind/name/qualified_name +
+    // evidence_count。这正是当初 search_entities("S27204") 撑到 ~11k token 的元凶。
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    let mut store = SqliteGraphStore::open(&database).unwrap();
+    store
+        .apply_patch(GraphPatch::add(vec![field_with_evidence("s27204_code")], vec![]))
+        .unwrap();
+    drop(store);
+
+    let structured = call_tool(
+        &database,
+        "search_entities",
+        serde_json::json!({"query": "s27204"}),
+    );
+    let item = &structured["items"][0];
+    assert_eq!(item["name"], "s27204_code");
+    assert_eq!(item["kind"], "field");
+    assert_eq!(item["evidence_count"], 2);
+    assert!(
+        item.get("evidence").is_none(),
+        "compact view must not include the evidence[] bodies, got: {item}"
+    );
+    assert!(
+        item.get("metadata").is_none(),
+        "compact view must not include metadata, got: {item}"
+    );
+    assert_eq!(structured["has_more"], false);
+}
+
+#[test]
+fn search_verbose_expands_the_full_entity() {
+    // verbose=true 才展开完整实体:LLM 拿到 compact 列表后,对想细看的条目
+    // 显式请求 verbose 取 evidence[].reason / metadata。
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    let mut store = SqliteGraphStore::open(&database).unwrap();
+    store
+        .apply_patch(GraphPatch::add(vec![field_with_evidence("s27204_code")], vec![]))
+        .unwrap();
+    drop(store);
+
+    let structured = call_tool(
+        &database,
+        "search_entities",
+        serde_json::json!({"query": "s27204", "verbose": true}),
+    );
+    let item = &structured["items"][0];
+    assert_eq!(
+        item["evidence"].as_array().unwrap().len(),
+        2,
+        "verbose view must expand evidence[], got: {item}"
+    );
+    assert!(item.get("metadata").is_some());
+}
+
+#[test]
+fn search_paginates_with_offset_and_reports_has_more() {
+    // 宽匹配(企业 ID 命名数十实体)用 limit/offset 翻页,has_more 由 peek
+    // limit+1 推断,无需 COUNT(*)。5 条命中、limit=2:前两页各 2 条且 has_more=true,
+    // 末页 1 条且 has_more=false。
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    let mut store = SqliteGraphStore::open(&database).unwrap();
+    let entities: Vec<_> = (0..5)
+        .map(|index| {
+            Entity::new(
+                EntityId::stable(
+                    "repo",
+                    "P.java",
+                    EntityKind::Field,
+                    &format!("page_{index}"),
+                    "",
+                ),
+                EntityKind::Field,
+                format!("page_{index}"),
+                format!("P.page_{index}"),
+            )
+        })
+        .collect();
+    store.apply_patch(GraphPatch::add(entities, vec![])).unwrap();
+    drop(store);
+
+    let page0 = call_tool(
+        &database,
+        "search_entities",
+        serde_json::json!({"query": "page_", "limit": 2, "offset": 0}),
+    );
+    let page2 = call_tool(
+        &database,
+        "search_entities",
+        serde_json::json!({"query": "page_", "limit": 2, "offset": 4}),
+    );
+
+    assert_eq!(page0["count"], 2);
+    assert_eq!(page0["limit"], 2);
+    assert_eq!(page0["offset"], 0);
+    assert_eq!(page0["has_more"], true);
+    assert_eq!(page2["count"], 1);
+    assert_eq!(page2["has_more"], false);
 }
