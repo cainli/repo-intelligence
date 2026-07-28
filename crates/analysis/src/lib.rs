@@ -9,22 +9,20 @@ use repo_intelligence_model::{
     ChangeOperation, ChangeRequest, Edge, EdgeKind, Entity, EntityId, EntityKind, EvidenceClass,
     GraphPatch, ImpactFinding, ImpactReport, TraverseQuery,
 };
-use repo_intelligence_source::discover_with_config;
-
-thread_local! {
-    /// extract 缓存:path → (content_hash, GraphPatch)。未变文件复用,跳过 parse/regex。
-    /// resolve 与 replace_snapshot 仍全量,故跨文件边一致;缓存代价是内存(存全部 patch)。
-    static EXTRACT_CACHE: std::cell::RefCell<HashMap<String, (String, GraphPatch)>> =
-        std::cell::RefCell::new(HashMap::new());
-}
+use repo_intelligence_source::{SourceFile, discover_with_config};
 
 #[derive(Clone, Debug, Default)]
 pub struct ScanSummary {
     pub files_indexed: usize,
-    /// 实际 extract 的文件数(变化/新增);未变文件复用缓存不计。增量可观测指标。
+    /// 实际 extract 的文件数(changed + added);增量下远小于 files_indexed。
     pub files_extracted: usize,
     pub entities_indexed: usize,
     pub edges_indexed: usize,
+    /// 增量统计(相对上次 file_state 快照);首次全量时全部计入 added。
+    pub files_added: usize,
+    pub files_changed: usize,
+    pub files_deleted: usize,
+    pub files_unchanged: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,8 +76,9 @@ impl WorkspaceIndexer {
         self.scan_with_config(root, store, &IndexerConfig::default(), report)
     }
 
-    /// 按 `IndexerConfig` 扫描并索引:发现阶段用 `config.discovery`,
-    /// 语义提取用 `config.semantics`。
+    /// 按 `IndexerConfig` 扫描并索引(增量):发现用 `config.discovery`,语义提取用
+    /// `config.semantics`。对比持久化的 `file_state` 快照,只对 changed/added 文件重提、
+    /// 对 deleted/changed 文件删旧子树;跨文件 resolve 边(resolved=1)每次全量重算。
     pub fn scan_with_config<F>(
         &self,
         root: &Path,
@@ -99,88 +98,118 @@ impl WorkspaceIndexer {
             elapsed_ms: 0,
         });
         let files = discover_with_config(root, &config.discovery)?;
+        let file_count = files.len();
         report(ScanProgress {
             phase: ScanPhase::Discovering,
-            processed: files.len(),
-            total: files.len(),
+            processed: file_count,
+            total: file_count,
             current_path: None,
             elapsed_ms: started.elapsed().as_millis(),
         });
         let mut summary = ScanSummary {
-            files_indexed: files.len(),
+            files_indexed: file_count,
             ..Default::default()
         };
+
+        // diff:旧 file_state(path → hash) vs 本次发现的文件。
+        let old_state = store.get_file_state()?;
+        let new_state: HashMap<String, String> = files
+            .iter()
+            .map(|file| {
+                (
+                    file.relative_path.to_string_lossy().to_string(),
+                    file.content_hash.clone(),
+                )
+            })
+            .collect();
+        let mut to_reindex: Vec<&SourceFile> = Vec::new(); // changed ∪ added
+        let mut to_delete: Vec<String> = Vec::new(); // deleted ∪ changed 的 path(删旧子树)
+        for file in &files {
+            let path = file.relative_path.to_string_lossy().to_string();
+            match old_state.get(&path) {
+                Some(hash) if *hash == file.content_hash => summary.files_unchanged += 1,
+                Some(_) => {
+                    summary.files_changed += 1;
+                    to_delete.push(path);
+                    to_reindex.push(file);
+                }
+                None => {
+                    summary.files_added += 1;
+                    to_reindex.push(file);
+                }
+            }
+        }
+        for path in old_state.keys() {
+            if !new_state.contains_key(path) {
+                summary.files_deleted += 1;
+                to_delete.push(path.clone());
+            }
+        }
+
+        // 删除阶段:deleted + changed 的旧子树。file_id 与 source::discover 的稳定公式一致。
+        report(ScanProgress {
+            phase: ScanPhase::Persisting,
+            processed: 0,
+            total: to_delete.len(),
+            current_path: None,
+            elapsed_ms: started.elapsed().as_millis(),
+        });
+        for path in &to_delete {
+            let file_id = EntityId::stable("workspace", path, EntityKind::File, path, "");
+            store.delete_file_subtree(&file_id)?;
+        }
+
+        // 提取 + 写入阶段:changed ∪ added。
         let mut combined = GraphPatch::default();
-        for (index, file) in files.iter().enumerate() {
+        for (index, file) in to_reindex.iter().enumerate() {
             report(ScanProgress {
                 phase: ScanPhase::Parsing,
                 processed: index,
-                total: files.len(),
+                total: to_reindex.len(),
                 current_path: Some(file.relative_path.to_string_lossy().to_string()),
                 elapsed_ms: started.elapsed().as_millis(),
             });
-            let patch = {
-                // 增量:content_hash 未变的文件复用上次 extract 的 patch,跳过 parse/regex。
-                let path_key = file.relative_path.to_string_lossy().to_string();
-                let cached = EXTRACT_CACHE.with(|cache| {
-                    cache
-                        .borrow()
-                        .get(&path_key)
-                        .filter(|(hash, _)| *hash == file.content_hash)
-                        .map(|(_, patch)| patch.clone())
-                });
-                match cached {
-                    Some(patch) => patch,
-                    None => {
-                        summary.files_extracted += 1;
-                        let patch = repo_intelligence_semantics::extract_with_config(
-                            file,
-                            &config.semantics,
-                        )?;
-                        EXTRACT_CACHE.with(|cache| {
-                            cache.borrow_mut().insert(
-                                path_key,
-                                (file.content_hash.clone(), patch.clone()),
-                            );
-                        });
-                        patch
-                    }
-                }
-            };
+            let patch =
+                repo_intelligence_semantics::extract_with_config(file, &config.semantics)?;
+            summary.files_extracted += 1;
             summary.entities_indexed += patch.add_entities.len();
             summary.edges_indexed += patch.add_edges.len();
             combined.add_entities.extend(patch.add_entities);
             combined.add_edges.extend(patch.add_edges);
         }
-        report(ScanProgress {
-            phase: ScanPhase::Parsing,
-            processed: files.len(),
-            total: files.len(),
-            current_path: None,
-            elapsed_ms: started.elapsed().as_millis(),
-        });
+        if !combined.add_entities.is_empty() || !combined.add_edges.is_empty() {
+            store.apply_patch(combined)?;
+        }
+
+        // 跨文件 resolve 全量重算:输入 = 当前全图实体 + 全部事实提取边(resolved=0)。
         report(ScanProgress {
             phase: ScanPhase::Resolving,
             processed: 0,
-            total: combined.add_entities.len(),
+            total: 0,
             current_path: None,
             elapsed_ms: started.elapsed().as_millis(),
         });
-        let resolution = resolve_cross_stack(&combined.add_entities, &combined.add_edges);
+        let all_entities = store.all_entities()?;
+        let extract_edges = store.extract_edges()?;
+        let resolution = resolve_cross_stack(&all_entities, &extract_edges);
         summary.edges_indexed += resolution.add_edges.len();
-        combined.add_edges.extend(resolution.add_edges);
+        store.replace_resolved_edges(resolution.add_edges)?;
+
+        // 写新 file_state 快照。
         report(ScanProgress {
             phase: ScanPhase::Persisting,
-            processed: 0,
-            total: combined.add_entities.len() + combined.add_edges.len(),
+            processed: to_delete.len() + to_reindex.len(),
+            total: file_count,
             current_path: None,
             elapsed_ms: started.elapsed().as_millis(),
         });
-        store.replace_snapshot(combined)?;
+        let new_state_vec: Vec<(String, String)> = new_state.into_iter().collect();
+        store.set_file_state(&new_state_vec)?;
+
         report(ScanProgress {
             phase: ScanPhase::Completed,
-            processed: summary.files_indexed,
-            total: summary.files_indexed,
+            processed: file_count,
+            total: file_count,
             current_path: None,
             elapsed_ms: started.elapsed().as_millis(),
         });

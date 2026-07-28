@@ -123,6 +123,10 @@ fn run() -> Result<()> {
                 serde_json::json!({
                     "files_indexed": summary.files_indexed,
                     "files_extracted": summary.files_extracted,
+                    "files_added": summary.files_added,
+                    "files_changed": summary.files_changed,
+                    "files_deleted": summary.files_deleted,
+                    "files_unchanged": summary.files_unchanged,
                     "entities_indexed": summary.entities_indexed,
                     "edges_indexed": summary.edges_indexed
                 }),

@@ -2,12 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use repo_intelligence_config::IndexerConfig;
 use repo_intelligence_analysis::{ImpactAnalyzer, WorkspaceIndexer};
 use repo_intelligence_graph::{GraphStore, SqliteGraphStore};
 use repo_intelligence_model::{
-    ChangeRequest, Edge, EdgeKind, Entity, EntityId, EntityKind, SearchQuery, TraverseQuery,
+    ChangeRequest, Edge, EdgeKind, Entity, EntityId, EntityKind, EvidenceClass, SearchQuery,
+    TraverseQuery,
 };
 use serde_json::{Value, json};
 
@@ -109,9 +110,11 @@ fn edge_schema() -> Value {
                     "reads_column", "writes_column", "depends_on", "submodule_of"
                 ]
             },
+            "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "tentative": {"type": "boolean"},
             "evidence": {"type": "array", "items": evidence_schema()}
         },
-        "required": ["source", "target", "kind", "evidence"]
+        "required": ["source", "target", "kind", "confidence", "tentative", "evidence"]
     })
 }
 
@@ -195,6 +198,13 @@ fn tool_specs() -> Vec<ToolSpec> {
                 },
                 "default": ["calls"],
                 "description": "Edge kinds to follow. Defaults to [\"calls\"] for a call chain; pass e.g. [\"depends_on\"] or [\"reads_table\",\"writes_table\"] to trace other dependency types."
+            },
+            "min_confidence": {
+                "type": "number",
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "default": 0.0,
+                "description": "Drop edges whose confidence is below this. Default 0 returns all edges (low-confidence ones still returned but marked `tentative`). Use e.g. 0.8 to keep only well-evidenced edges."
             }
         },
         "required": ["name"]
@@ -333,6 +343,53 @@ fn tool_specs() -> Vec<ToolSpec> {
             description: "Trace what an entity calls (outbound edges). Defaults to the `calls` edge for a call chain; set edge_kinds to follow other dependencies (depends_on, reads_table, ...). Resolves the start point by exact entity name, then BFS outward up to `depth`.",
             input_schema: trace_input,
             output_schema: trace_output,
+        },
+        ToolSpec {
+            name: "verify_edge",
+            description: "Verify a graph edge against source code: read the source entity's file and grep for the target name. Returns matched lines (verified=true) or reports the edge is likely a cross-file inference (verified=false). Use to independently check a `tentative` edge from trace_callers/trace_callees before trusting it — graph edges are inferred; this grounds one in source.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "Exact name of the edge's source entity. The file that gets grep'd is this entity's declared (evidence) file."
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "Name (or substring) of the target entity; matched literally inside the source file."
+                    },
+                    "workspace": {
+                        "type": "string",
+                        "default": ".",
+                        "description": "Workspace root to resolve the source entity's file path. Same as scan_workspace."
+                    }
+                },
+                "required": ["source", "target"]
+            }),
+            output_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "source": {"type": "string"},
+                    "source_file": {"type": "string"},
+                    "target": {"type": "string"},
+                    "verified": {"type": "boolean"},
+                    "match_count": {"type": "integer", "minimum": 0},
+                    "matches": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "line": {"type": "integer", "minimum": 1},
+                                "snippet": {"type": "string"}
+                            }
+                        }
+                    },
+                    "note": {"type": "string"}
+                },
+                "required": ["source", "target", "verified", "match_count", "matches"]
+            }),
         },
         ToolSpec {
             name: "show_system_view",
@@ -577,15 +634,30 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
             let name = arguments["name"].as_str().unwrap_or_default();
             let depth = parse_depth(arguments, DEFAULT_TRACE_DEPTH);
             let kinds = parse_edge_kinds(arguments)?;
+            let min_confidence = arguments["min_confidence"]
+                .as_f64()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0) as f32;
             let store = SqliteGraphStore::open(path)?;
-            trace_graph(&store, name, depth, kinds, false)?
+            trace_graph(&store, name, depth, kinds, false, min_confidence)?
         }
         "trace_callees" => {
             let name = arguments["name"].as_str().unwrap_or_default();
             let depth = parse_depth(arguments, DEFAULT_TRACE_DEPTH);
             let kinds = parse_edge_kinds(arguments)?;
+            let min_confidence = arguments["min_confidence"]
+                .as_f64()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0) as f32;
             let store = SqliteGraphStore::open(path)?;
-            trace_graph(&store, name, depth, kinds, true)?
+            trace_graph(&store, name, depth, kinds, true, min_confidence)?
+        }
+        "verify_edge" => {
+            let source = arguments["source"].as_str().unwrap_or_default();
+            let target = arguments["target"].as_str().unwrap_or_default();
+            let workspace = arguments["workspace"].as_str().unwrap_or(".");
+            let store = SqliteGraphStore::open(path)?;
+            verify_edge(&store, source, target, workspace)?
         }
         "scan_workspace" => {
             let workspace = arguments["workspace"].as_str().unwrap_or(".");
@@ -604,6 +676,10 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
             json!({
                 "files_indexed": summary.files_indexed,
                 "files_extracted": summary.files_extracted,
+                "files_added": summary.files_added,
+                "files_changed": summary.files_changed,
+                "files_deleted": summary.files_deleted,
+                "files_unchanged": summary.files_unchanged,
                 "entities_indexed": summary.entities_indexed,
                 "edges_indexed": summary.edges_indexed,
                 "entities_by_kind": entities_by_kind,
@@ -821,6 +897,28 @@ fn kinds_label(kinds: &[EdgeKind]) -> String {
     }
 }
 
+/// Edge view with top-level `confidence` + `tentative` so an agent can tell Fact
+/// edges (trust) from inferred ones at a glance, without digging into `evidence[]`.
+/// `tentative` = not Fact, and (confidence < 0.8 or classification is
+/// Inferred/RuntimeUnknown/missing). Full `evidence[]` is still preserved.
+fn edge_view(edge: &Edge) -> Value {
+    let evidence = edge.evidence.first();
+    let confidence = evidence.map(|item| item.confidence).unwrap_or(1.0);
+    let tentative = match evidence.map(|item| item.classification) {
+        Some(EvidenceClass::Fact) => false,
+        Some(EvidenceClass::Resolved) => confidence < 0.8,
+        Some(_) | None => true,
+    };
+    json!({
+        "source": edge.source.0,
+        "target": edge.target.0,
+        "kind": edge.kind.as_str(),
+        "confidence": confidence,
+        "tentative": tentative,
+        "evidence": serde_json::to_value(&edge.evidence).unwrap_or_default(),
+    })
+}
+
 /// Shared engine for `trace_callers`/`trace_callees`: resolve every entity
 /// whose name equals `name` exactly as a start point, then BFS along
 /// `outbound` edges of the requested kinds and return the visited entities and
@@ -837,6 +935,7 @@ fn trace_graph(
     depth: usize,
     edge_kinds: Vec<EdgeKind>,
     outbound: bool,
+    min_confidence: f32,
 ) -> Result<Value> {
     let matches = store.search(SearchQuery::new(name).with_limit(DEFAULT_SEARCH_LIMIT))?;
     let starts: Vec<Entity> = matches
@@ -894,10 +993,147 @@ fn trace_graph(
             b.kind.as_str(),
         ))
     });
+    // Wrap with edge_view (top-level confidence/tentative) and drop edges below
+    // `min_confidence`. Conservative: default 0 keeps everything, low-confidence
+    // edges are marked `tentative` rather than silently hidden.
+    let edge_views: Vec<Value> = edges
+        .iter()
+        .map(edge_view)
+        .filter(|view| view["confidence"].as_f64().unwrap_or(1.0) >= min_confidence as f64)
+        .collect();
     Ok(json!({
         "items": serde_json::to_value(&items)?,
-        "edges": serde_json::to_value(&edges)?,
+        "edges": edge_views,
         "count": items.len(),
         "start_count": starts.len(),
     }))
+}
+
+/// `verify_edge`: ground a graph edge in source code. Resolve the source entity
+/// (exact name) → its declared file → read it from `workspace` → grep the target
+/// name line by line. A hit (`verified=true`) is independent evidence the
+/// reference exists; a miss honestly signals the edge is a cross-file inference
+/// (resolved by name, e.g. matches_endpoint/mapped_from) or indirect — not a
+/// literal source reference.
+fn verify_edge(
+    store: &SqliteGraphStore,
+    source: &str,
+    target: &str,
+    workspace: &str,
+) -> Result<Value> {
+    let source_entity = store
+        .search_exact_name(source, 1)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            anyhow!(
+                "No entity is exactly named `{source}`. verify_edge resolves the source by exact \
+                 name; run search_entities first to find the precise identifier."
+            )
+        })?;
+    let Some(source_file) = source_entity.evidence.first().map(|item| item.file.clone()) else {
+        return Ok(json!({
+            "source": source,
+            "target": target,
+            "verified": false,
+            "match_count": 0,
+            "matches": [],
+            "note": format!("Source `{source}` has no evidence file recorded; cannot read its source.")
+        }));
+    };
+    let absolute = Path::new(workspace).join(&source_file);
+    let content = std::fs::read_to_string(&absolute)
+        .with_context(|| format!("read source file {}", absolute.display()))?;
+    let mut matches = Vec::new();
+    for (index, line) in content.lines().enumerate() {
+        if line.contains(target) {
+            matches.push(json!({"line": index + 1, "snippet": line.trim()}));
+        }
+    }
+    let verified = !matches.is_empty();
+    let note = if verified {
+        format!(
+            "`{target}` appears in `{source_file}` — consistent with the edge. Substring match is \
+             a heuristic; still confirm the reference is semantic, not a comment or string literal."
+        )
+    } else {
+        format!(
+            "`{target}` not found in `{source_file}` — the edge is likely a cross-file inference \
+             (e.g. matches_endpoint/mapped_from resolved by name) or an indirect reference. Treat \
+             it as unverified."
+        )
+    };
+    Ok(json!({
+        "source": source,
+        "source_file": source_file,
+        "target": target,
+        "verified": verified,
+        "match_count": matches.len(),
+        "matches": matches,
+        "note": note
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use repo_intelligence_model::GraphPatch;
+    use std::fs;
+
+    fn id(value: &str) -> EntityId {
+        EntityId(value.to_string())
+    }
+
+    #[test]
+    fn edge_view_marks_tentative_by_classification_and_confidence() {
+        // Fact → 不 tentative
+        let fact = Edge::new(id("a"), id("b"), EdgeKind::Calls)
+            .with_evidence("F.java", 1, 1, EvidenceClass::Fact, 1.0, "fact");
+        assert_eq!(edge_view(&fact)["tentative"], false);
+        assert_eq!(edge_view(&fact)["confidence"], 1.0);
+        // Inferred → 无论置信度都 tentative
+        let inferred = Edge::new(id("a"), id("b"), EdgeKind::MappedFrom)
+            .with_evidence("F.java", 1, 1, EvidenceClass::Inferred, 0.9, "inferred");
+        assert_eq!(edge_view(&inferred)["tentative"], true);
+        // Resolved 高置信 → 不 tentative
+        let resolved_hi = Edge::new(id("a"), id("b"), EdgeKind::MatchesEndpoint)
+            .with_evidence("F.java", 1, 1, EvidenceClass::Resolved, 0.95, "resolved");
+        assert_eq!(edge_view(&resolved_hi)["tentative"], false);
+        // Resolved 低置信 → tentative
+        let resolved_lo = Edge::new(id("a"), id("b"), EdgeKind::MatchesEndpoint)
+            .with_evidence("F.java", 1, 1, EvidenceClass::Resolved, 0.6, "low");
+        assert_eq!(edge_view(&resolved_lo)["tentative"], true);
+        // 无证据 → tentative
+        let no_evidence = Edge::new(id("a"), id("b"), EdgeKind::Calls);
+        assert_eq!(edge_view(&no_evidence)["tentative"], true);
+    }
+
+    #[test]
+    fn verify_edge_greps_source_file_for_target() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Svc.java"),
+            "class Svc {\n  void doIt() { helper.run(); }\n}\n",
+        )
+        .unwrap();
+        let mut store = SqliteGraphStore::open_in_memory().unwrap();
+        // 手动塞一个 Svc 实体,evidence.file 指向真实文件(不依赖 extractor 细节)。
+        let svc = Entity::new(
+            EntityId::stable("w", "Svc.java", EntityKind::Class, "Svc", ""),
+            EntityKind::Class,
+            "Svc",
+            "Svc",
+        )
+        .with_evidence("Svc.java", 1, 1, EvidenceClass::Fact, 1.0, "declared");
+        store
+            .apply_patch(GraphPatch::add(vec![svc], vec![]))
+            .unwrap();
+
+        let root = dir.path().to_str().unwrap();
+        let hit = verify_edge(&store, "Svc", "helper", root).unwrap();
+        assert_eq!(hit["verified"], true, "helper 出现在 Svc.java");
+        assert!(hit["match_count"].as_u64().unwrap() >= 1);
+        let miss = verify_edge(&store, "Svc", "nonexistentXYZ", root).unwrap();
+        assert_eq!(miss["verified"], false, "不存在的 target 未命中");
+    }
 }

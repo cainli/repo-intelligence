@@ -110,6 +110,10 @@ pub struct Evidence {
     pub classification: EvidenceClass,
     pub confidence: f32,
     pub reason: String,
+    /// 对应行的源码片段(scan 时从文件内容填充;跨文件推断边的 evidence file 非当前
+    /// 文件,留 None)。让 agent 不必 Read 文件即可快速判断该证据是否成立。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
 }
 
 impl Evidence {
@@ -128,6 +132,7 @@ impl Evidence {
             classification,
             confidence: confidence.clamp(0.0, 1.0),
             reason: reason.into(),
+            snippet: None,
         }
     }
 }

@@ -7,6 +7,36 @@
 
 ## [Unreleased]
 
+### Added
+
+- **增量扫描(P0)**：scan 改为 diff 驱动——对比持久化的 `file_state`(path→hash)快照,
+  只对 changed/added 文件重提、对 deleted/changed 文件删旧子树;跨文件推断边
+  (`resolved=1`)每次全量重算。改 1 个文件不再"DELETE 整表 + 重插全仓实体 + FTS 全重建",
+  agent 写循环可用。
+  - graph:edge 表加 `resolved` 列(0=事实提取边 / 1=跨文件推断边,旧库幂等迁移)+ `file_state`
+    表;`GraphStore` trait 加 `get/set_file_state`、`replace_resolved_edges`、`delete_file_subtree`
+    (按 `Contains` 边反推子实体级联删除)、`extract_edges`。
+  - `ScanSummary` 加 `files_added/changed/deleted/unchanged`;CLI `scan` 与 MCP `scan_workspace`
+    均输出。
+- **关系型输出可信度(P1)**：让 agent 不误信推断边。前提:`evidence`(file:line:confidence)
+  本已在 trace/analyze 返回里,P1 补的是"置信度显眼化 + 独立验证"。
+  - trace 返回的 edge 加顶层 `confidence` + `tentative`(Fact 不标;Inferred/无证据/Resolved<0.8
+    标 tentative),不必翻 `evidence[]` 即可区分可信/存疑。
+  - `trace_callers`/`trace_callees` 加 `min_confidence` 过滤(默认 0 全返回——标不滤,不悄悄藏边)。
+  - 新工具 `verify_edge(source, target)`：读 source 实体的源文件 grep target,命中=独立佐证,
+    未命中=诚实告知"跨文件推断(matches_endpoint/mapped_from 按名解析),非字面引用,视为未验证"。
+  - `Evidence` 加 `snippet`(对应源码行,extract 时从文件内容填),agent 免 `Read` 即可初判证据。
+
+### Changed
+
+- 移除进程内 `EXTRACT_CACHE`(0.1.10 的"假增量":只省 parse 且不持久化,CLI 新进程命中率 0),
+  由持久化的 `file_state` 快照取代。
+
+### Known Limitations
+
+- 跨文件推断边(`resolve_cross_stack`)每次 scan 仍全量重算,读为 O(实体数)(写已增量);
+  `MatchesEndpoint`/`MappedFrom` 边的 `evidence.snippet` 留 None(scan 层产生时无文件内容可读)。
+
 ## [0.1.10] - 2026-07-28
 
 ### Added

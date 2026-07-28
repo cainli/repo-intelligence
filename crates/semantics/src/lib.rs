@@ -13,7 +13,9 @@ pub use registry::{ExtractContext, Registry, SemanticExtractor};
 use anyhow::Result;
 use regex::Regex;
 use repo_intelligence_config::SemanticsConfig;
-use repo_intelligence_model::{Edge, EdgeKind, Entity, EntityKind, EvidenceClass, GraphPatch};
+use repo_intelligence_model::{
+    Edge, EdgeKind, Entity, EntityKind, Evidence, EvidenceClass, GraphPatch,
+};
 use repo_intelligence_source::SourceFile;
 use serde_json::json;
 
@@ -33,7 +35,34 @@ pub fn extract_with_config(
     let mut edges = Vec::new();
     let ctx = ExtractContext { config };
     Registry::default_java_stack().extract(&ctx, file, &path, &mut entities, &mut edges)?;
+    // 填 snippet:单文件证据(file==path)从 file.content 取对应行;跨文件 resolve 边
+    // 的 evidence file 非当前文件,留 None(它们在 scan 层产生,无 content 可读)。
+    fill_snippets(&mut entities, &mut edges, &path, &file.content);
     Ok(GraphPatch::add(entities, edges))
+}
+
+/// 给本文件产出的证据填充 `snippet`:取 start_line 对应的源码行(trim 缩进)。
+/// 只填 file==path 的证据,跨文件证据(file 指向别处)不动。
+fn fill_snippets(entities: &mut [Entity], edges: &mut [Edge], path: &str, content: &str) {
+    let lines: Vec<&str> = content.lines().collect();
+    let fill = |evidence: &mut Evidence| {
+        if evidence.snippet.is_none()
+            && evidence.file == path
+            && let Some(line) = lines.get(evidence.start_line.saturating_sub(1) as usize)
+        {
+            evidence.snippet = Some(line.trim().to_string());
+        }
+    };
+    for entity in entities.iter_mut() {
+        for evidence in entity.evidence.iter_mut() {
+            fill(evidence);
+        }
+    }
+    for edge in edges.iter_mut() {
+        for evidence in edge.evidence.iter_mut() {
+            fill(evidence);
+        }
+    }
 }
 
 /// File 实体(每个源文件的基础实体,所有提取器产出的实体由 Contains 边挂到它)。

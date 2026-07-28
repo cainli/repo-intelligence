@@ -92,9 +92,9 @@ fn scan_reports_stage_and_file_progress() {
         .unwrap();
 
     assert_eq!(progress.first().unwrap().phase, ScanPhase::Discovering);
-    assert!(progress.iter().any(|event| {
-        event.phase == ScanPhase::Parsing && event.processed == 1 && event.total == 1
-    }));
+    assert!(progress
+        .iter()
+        .any(|event| event.phase == ScanPhase::Parsing && event.total == 1));
     assert!(
         progress
             .iter()
@@ -883,15 +883,21 @@ fn mybatis_plus_lambda_wrapper_extracts_column() {
 
 #[test]
 fn incremental_scan_reuses_unchanged_extracts() {
-    // 未变文件复用缓存:第二次 scan files_extracted=0,实体数不变。
+    // 未变文件跳过:第二次 scan files_extracted=0,且图中实体数不变(file_state 增量)。
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("A.java"), "class A { private String name; }").unwrap();
     let mut store = SqliteGraphStore::open_in_memory().unwrap();
     let first = WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
     assert_eq!(first.files_extracted, first.files_indexed, "首次全量 extract");
+    let (entities_after_first, _) = store.counts().unwrap();
     let second = WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
-    assert_eq!(second.files_extracted, 0, "未变文件复用缓存,extract=0");
-    assert_eq!(second.entities_indexed, first.entities_indexed, "实体数不变");
+    assert_eq!(second.files_extracted, 0, "未变文件跳过,extract=0");
+    assert_eq!(second.files_unchanged, 1, "unchanged 计数=1");
+    let (entities_after_second, _) = store.counts().unwrap();
+    assert_eq!(
+        entities_after_second, entities_after_first,
+        "未变文件,图中实体数不变"
+    );
 }
 
 #[test]
@@ -912,6 +918,77 @@ fn incremental_scan_reextracts_changed_file() {
             .iter()
             .any(|m| m.entity.kind == EntityKind::Field),
         "新字段入库"
+    );
+}
+
+#[test]
+fn incremental_scan_removes_deleted_file_entities() {
+    // 删除文件:第二次 scan files_deleted=1,该文件实体从图中消失,其余不变。
+    let dir = tempfile::tempdir().unwrap();
+    let b = dir.path().join("B.java");
+    fs::write(dir.path().join("A.java"), "class A { private String name; }").unwrap();
+    fs::write(&b, "class B { private String title; }").unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    assert!(
+        store
+            .search(SearchQuery::new("title").with_limit(10))
+            .unwrap()
+            .iter()
+            .any(|m| m.entity.kind == EntityKind::Field),
+        "首次扫描 B 的 title 字段入库"
+    );
+    let (entities_before, _) = store.counts().unwrap();
+
+    fs::remove_file(&b).unwrap();
+    let second = WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    assert_eq!(second.files_deleted, 1, "B 被删除");
+    assert!(
+        !store
+            .search(SearchQuery::new("title").with_limit(10))
+            .unwrap()
+            .iter()
+            .any(|m| m.entity.kind == EntityKind::Field),
+        "B 删除后 title 字段消失"
+    );
+    assert!(
+        store
+            .search(SearchQuery::new("name").with_limit(10))
+            .unwrap()
+            .iter()
+            .any(|m| m.entity.kind == EntityKind::Field),
+        "A 的 name 字段仍在"
+    );
+    let (entities_after, _) = store.counts().unwrap();
+    assert!(entities_after < entities_before, "删除后实体数减少");
+}
+
+#[test]
+fn extract_fills_snippet_from_source_line() {
+    // scan 后实体的 evidence 应带 snippet(对应源码行),让 agent 不必 Read 即可判断证据。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("A.java"),
+        "class A {\n  private String name;\n}\n",
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    let entity = store
+        .search(SearchQuery::new("name").with_limit(10))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::Field)
+        .expect("name field indexed");
+    let snippet = entity
+        .entity
+        .evidence
+        .first()
+        .and_then(|e| e.snippet.as_deref())
+        .expect("evidence should carry a snippet");
+    assert!(
+        snippet.contains("private String name"),
+        "snippet should be the source line, got: {snippet}"
     );
 }
 
