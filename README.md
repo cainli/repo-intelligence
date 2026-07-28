@@ -16,9 +16,24 @@ SQLite、FTS5 和 Tree-sitter，通过 npm CLI 或原生二进制运行，不依
 
 扫描器会读取项目的 `.gitignore` 和 `.ignore`，并固定排除
 `.git/`、`node_modules/`、`target/`、`build/`、`dist/`、`.gradle`、`.claude/`、
-`.repo-intelligence/`。
-不支持的文件扩展名和超过 2 MiB 的单个文件也会跳过。项目可以在 `.ignore`
-中增加生成代码、日志、缓存或其他不需要分析的目录。
+`.repo-intelligence/`。不支持的文件扩展名和超过 2 MiB 的单个文件也会跳过。
+
+项目级排除可在 workspace 根目录的 `.repo-intelligence.toml` 配置：
+
+```toml
+[discovery]
+# 追加排除目录（builtin 8 个保留）
+excluded_dirs_extra = ["gen", "generated-sources"]
+# 文件名 glob 排除（匹配 basename 即跳过，不读内容）——治大配置文件卡死
+excluded_patterns = ["package-lock.json", "*.lock"]
+# 单文件大小上限（默认 2 MiB）
+max_file_bytes = 4194304
+```
+
+`excluded_dirs_extra` 排目录、`excluded_patterns` 排文件（basename glob，`*`/`?`，
+不支持 `!` 取反），两者与 `.ignore`/`.gitignore` 叠加生效。无需改代码即可排除
+package-lock.json、生成代码等导致 scan 卡死的大文件；也可临时用 `.ignore` 的
+`*.json` + `!package.json`（gitignore 语义，支持取反）做一次性排除。
 
 扫描日志和进度写入 stderr，JSON 结果仍单独写入 stdout。日志包含文件发现、
 解析、跨栈关系解析、SQLite 持久化和完成阶段；解析阶段每 100 个文件报告一次，

@@ -110,6 +110,12 @@ pub struct DiscoveryConfig {
     /// 追加到 builtin 排除目录（builtin 不动）。长列表用追加语义。
     #[serde(default)]
     pub excluded_dirs_extra: Vec<String>,
+    /// 文件名 glob 模式（匹配 basename 即排除文件），如 `["package-lock.json", "*.log"]`。
+    /// 与 `excluded_dirs_extra`（目录名）分工：这里排具体文件，那里排整目录。语法为
+    /// glob crate（`*`/`?`，`*` 不跨 `/`；basename 无 `/` 故无碍）。不支持 `!` 取反——
+    /// 要保留某文件（如 package.json）就别列它。
+    #[serde(default)]
+    pub excluded_patterns: Vec<String>,
     /// 单文件大小上限，超过则跳过。替换 builtin（2 MiB）。
     #[serde(default = "default_max_file_bytes")]
     pub max_file_bytes: u64,
@@ -119,6 +125,7 @@ impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
             excluded_dirs_extra: Vec::new(),
+            excluded_patterns: Vec::new(),
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
         }
     }
@@ -296,5 +303,23 @@ frontend_noise_extra = ["bizUtil", "formatDate"]
         f.write_all(b"this is not = valid = toml [[").unwrap();
         drop(f);
         assert!(IndexerConfig::load(dir.path()).is_err());
+    }
+
+    #[test]
+    fn excluded_patterns_default_empty_and_configurable() {
+        let cfg = IndexerConfig::default();
+        assert!(cfg.discovery.excluded_patterns.is_empty());
+        let toml = r#"
+[discovery]
+excluded_patterns = ["package-lock.json", "*.log"]
+"#;
+        let cfg: IndexerConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.discovery.excluded_patterns,
+            vec!["package-lock.json".to_string(), "*.log".to_string()]
+        );
+        // 未覆盖字段回填 builtin
+        assert_eq!(cfg.discovery.max_file_bytes, 2 * 1024 * 1024);
+        assert!(cfg.discovery.excluded_dirs_extra.is_empty());
     }
 }

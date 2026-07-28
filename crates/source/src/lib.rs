@@ -69,6 +69,11 @@ pub fn discover(root: &Path) -> Result<Vec<SourceFile>> {
 pub fn discover_with_config(root: &Path, config: &DiscoveryConfig) -> Result<Vec<SourceFile>> {
     let excluded: HashSet<String> = config.effective_excluded_dirs().into_iter().collect();
     let max_bytes = config.max_file_bytes;
+    let patterns: Vec<glob::Pattern> = config
+        .excluded_patterns
+        .iter()
+        .map(|p| glob::Pattern::new(p).with_context(|| format!("invalid excluded pattern: {p}")))
+        .collect::<Result<_>>()?;
     let mut files = Vec::new();
     let walker = WalkBuilder::new(root)
         .hidden(false)
@@ -87,6 +92,12 @@ pub fn discover_with_config(root: &Path, config: &DiscoveryConfig) -> Result<Vec
         let path = entry.path();
         let kind = FileKind::from_path(path);
         if kind == FileKind::Unknown {
+            continue;
+        }
+        // 文件名 glob 排除（excluded_patterns）：匹配 basename 即跳过，不读内容。
+        // 与目录排除（excluded_dirs）分工：排具体文件如 package-lock.json。
+        let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if patterns.iter().any(|pattern| pattern.matches(fname)) {
             continue;
         }
         let metadata = entry.metadata()?;
@@ -163,5 +174,29 @@ mod tests {
             files.iter().all(|f| f.kind != FileKind::Unknown),
             "Unknown 不应进 Vec"
         );
+    }
+
+    #[test]
+    fn discover_excludes_files_by_pattern() {
+        use repo_intelligence_config::DiscoveryConfig;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("A.java"), "class A {}").unwrap();
+        std::fs::write(dir.path().join("package-lock.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("keep.json"), "{}").unwrap();
+        let cfg = DiscoveryConfig {
+            excluded_patterns: vec!["package-lock.json".to_string()],
+            ..Default::default()
+        };
+        let files = discover_with_config(dir.path(), &cfg).unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|f| f.relative_path.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n == "package-lock.json"),
+            "package-lock.json 应被 pattern 排除"
+        );
+        assert!(names.iter().any(|n| n == "keep.json"), "keep.json 保留");
+        assert!(names.iter().any(|n| n == "A.java"), "A.java 保留");
     }
 }

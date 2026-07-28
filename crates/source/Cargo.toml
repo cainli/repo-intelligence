@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
+glob.workspace = true
 ignore.workspace = true
 repo-intelligence-config = { path = "../config" }
 repo-intelligence-model = { path = "../model" }

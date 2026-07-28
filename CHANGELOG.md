@@ -7,8 +7,32 @@
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-07-28
+
 ### Added
 
+- **文件名 glob 排除（`excluded_patterns`）**：`.repo-intelligence.toml` 的 `[discovery]` 段
+  新增 `excluded_patterns`（basename glob，匹配即排除文件），与 `excluded_dirs_extra`（目录名）
+  分工。治大配置文件（package-lock.json 等）内容驻留导致的 scan 卡死——不必改代码即可排除。
+  语法为 glob crate（`*`/`?`），不支持 `!` 取反；要保留某文件就别列它。新增 `glob` workspace 依赖。
+
+## [0.1.12] - 2026-07-28
+
+### Fixed
+
+- **scan 遇 yaml/properties/sql 卡死**：`from_path` 曾把这些扩展名分类为支持的 `FileKind`，
+  但 semantics 无对应提取器——内容被 `read_to_string` 全文读进内存并驻留 `Vec<SourceFile>`
+  整个 scan，零产出。大项目（几千配置文件）→ OOM/卡死。现归 `Unknown`，discover 跳过（不读内容）。
+  删 `FileKind::Yaml/Properties/Sql` dead 变体 + 回归测试。
+
+## [0.1.11] - 2026-07-28
+
+### Added
+
+- **agent 接力结构化产出（relay-schema）**：MCP `build_relay_doc` 端点与 CLI `relay <qn>` 共用
+  `build_relay`，按 qn 聚合入/出边，自动填结构层（qn / anchor file:line / edge_kind / edge_type
+  机械映射），语义层（bean/interface/business/inject_dead/跨文件调用链）留 `custom:needs-review`
+  给 agent。新增 `docs/relay-schema.md`；CLI 加 `--format yaml`（serde_yaml）。
 - **增量扫描(P0)**：scan 改为 diff 驱动——对比持久化的 `file_state`(path→hash)快照,
   只对 changed/added 文件重提、对 deleted/changed 文件删旧子树;跨文件推断边
   (`resolved=1`)每次全量重算。改 1 个文件不再"DELETE 整表 + 重插全仓实体 + FTS 全重建",
