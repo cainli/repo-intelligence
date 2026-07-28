@@ -178,7 +178,14 @@ impl WorkspaceIndexer {
             combined.add_edges.extend(patch.add_edges);
         }
         if !combined.add_entities.is_empty() || !combined.add_edges.is_empty() {
+            let n_ent = combined.add_entities.len();
+            let n_edg = combined.add_edges.len();
+            let t = std::time::Instant::now();
             store.apply_patch(combined)?;
+            eprintln!(
+                "[ri-diag] apply_patch: {n_ent} entities + {n_edg} edges in {:.2}s",
+                t.elapsed().as_secs_f64()
+            );
         }
 
         // 跨文件 resolve 全量重算:输入 = 当前全图实体 + 全部事实提取边(resolved=0)。
@@ -191,9 +198,20 @@ impl WorkspaceIndexer {
         });
         let all_entities = store.all_entities()?;
         let extract_edges = store.extract_edges()?;
+        let t = std::time::Instant::now();
         let resolution = resolve_cross_stack(&all_entities, &extract_edges);
-        summary.edges_indexed += resolution.add_edges.len();
+        let t_resolve = t.elapsed();
+        let n_resolved = resolution.add_edges.len();
+        summary.edges_indexed += n_resolved;
+        let t = std::time::Instant::now();
         store.replace_resolved_edges(resolution.add_edges)?;
+        eprintln!(
+            "[ri-diag] resolve_cross_stack: {} entities → {} edges in {:.2}s; replace_resolved in {:.2}s",
+            all_entities.len(),
+            n_resolved,
+            t_resolve.as_secs_f64(),
+            t.elapsed().as_secs_f64()
+        );
 
         // 写新 file_state 快照。
         report(ScanProgress {

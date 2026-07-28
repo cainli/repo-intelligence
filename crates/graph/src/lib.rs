@@ -91,6 +91,9 @@ impl SqliteGraphStore {
         self.connection.execute_batch(
             "
             PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA cache_size = -65536;
+            PRAGMA temp_store = MEMORY;
             PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS entity (
                 id TEXT PRIMARY KEY,

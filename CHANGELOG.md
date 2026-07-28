@@ -7,6 +7,20 @@
 
 ## [Unreleased]
 
+## [0.1.16] - 2026-07-28
+
+### Changed
+
+- **SQLite 写入优化 PRAGMA**：`synchronous=NORMAL`（WAL 下 commit 不 fsync）+ `cache_size=64MB`
+  + `temp_store=MEMORY`。批量 scan 写几十万实体时，默认 `synchronous=FULL` + 小 cache 把
+  `apply_patch` 拖到数分钟（>300s 被误判卡死）；此优化显著提速。（代价：崩溃可能丢最近未
+  checkpoint 的事务，scan 可重跑，可接受。）
+
+### Added
+
+- **scan 阶段耗时日志**（`[ri-diag]` 前缀，stderr）：`apply_patch` / `resolve_cross_stack` /
+  `replace_resolved` 各阶段耗时 + 实体/边数。定位 scan 卡死/慢的诊断辅助。
+
 ## [0.1.15] - 2026-07-28
 
 ### Fixed
