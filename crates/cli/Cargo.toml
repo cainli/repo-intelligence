@@ -18,6 +18,7 @@ repo-intelligence-mcp = { path = "../mcp" }
 repo-intelligence-model = { path = "../model" }
 repo-intelligence-protocol = { path = "../protocol" }
 serde_json.workspace = true
+serde_yaml.workspace = true
 serde.workspace = true
 
 [dev-dependencies]

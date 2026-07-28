@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use repo_intelligence_config::IndexerConfig;
 use repo_intelligence_analysis::{ImpactAnalyzer, ScanPhase, ScanProgress, WorkspaceIndexer};
 use repo_intelligence_graph::{GraphStore, SqliteGraphStore};
+use repo_intelligence_mcp::build_relay;
 use repo_intelligence_model::{ChangeRequest, SearchQuery};
 use repo_intelligence_protocol::Envelope;
 
@@ -68,6 +69,16 @@ enum Command {
         #[arg(long, value_enum, default_value = "text")]
         format: OutputFormat,
     },
+    /// Build a relay-schema skeleton around an entity, resolved by exact qualified
+    /// name. Same skeleton as the `build_relay_doc` MCP tool; semantic fields are
+    /// `custom:needs-review` for a consuming agent to fill.
+    Relay {
+        qn: String,
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        #[arg(long, value_enum, default_value = "json")]
+        format: OutputFormat,
+    },
     Mcp,
 }
 
@@ -75,6 +86,7 @@ enum Command {
 enum OutputFormat {
     Text,
     Json,
+    Yaml,
 }
 
 fn main() {
@@ -189,6 +201,15 @@ fn run() -> Result<()> {
                 }),
             )
         }
+        Command::Relay {
+            qn,
+            depth,
+            format,
+        } => {
+            let store = SqliteGraphStore::open(&cli.database)?;
+            let doc = build_relay(&store, &qn, depth, true)?;
+            emit(format, doc)
+        }
     }
 }
 
@@ -215,6 +236,7 @@ fn emit<T: serde::Serialize>(format: OutputFormat, data: T) -> Result<()> {
     match format {
         OutputFormat::Json => println!("{}", serde_json::to_string(&Envelope::success(data))?),
         OutputFormat::Text => println!("{}", serde_json::to_string_pretty(&data)?),
+        OutputFormat::Yaml => println!("{}", serde_yaml::to_string(&data)?),
     }
     Ok(())
 }

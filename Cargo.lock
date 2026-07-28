@@ -466,7 +466,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "repo-intelligence"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "clap",
@@ -478,12 +478,13 @@ dependencies = [
  "repo-intelligence-protocol",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tempfile",
 ]
 
 [[package]]
 name = "repo-intelligence-analysis"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "regex",
@@ -498,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-config"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "serde",
@@ -508,7 +509,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-graph"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "repo-intelligence-model",
@@ -519,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-mcp"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "repo-intelligence-analysis",
@@ -533,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-model"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "blake3",
  "serde",
@@ -542,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-parsing"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "quick-xml",
@@ -555,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-protocol"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "repo-intelligence-model",
  "serde",
@@ -564,7 +565,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-semantics"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "regex",
@@ -578,7 +579,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-source"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "blake3",
@@ -615,6 +616,12 @@ dependencies = [
  "linux-raw-sys",
  "windows-sys",
 ]
+
+[[package]]
+name = "ryu"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "same-file"
@@ -676,6 +683,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
 ]
 
 [[package]]
@@ -802,6 +822,12 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "utf8parse"

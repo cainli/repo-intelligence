@@ -7,8 +7,8 @@ use repo_intelligence_config::IndexerConfig;
 use repo_intelligence_analysis::{ImpactAnalyzer, WorkspaceIndexer};
 use repo_intelligence_graph::{GraphStore, SqliteGraphStore};
 use repo_intelligence_model::{
-    ChangeRequest, Edge, EdgeKind, Entity, EntityId, EntityKind, EvidenceClass, SearchQuery,
-    TraverseQuery,
+    ChangeRequest, Edge, EdgeKind, Entity, EntityId, EntityKind, Evidence, EvidenceClass,
+    SearchQuery, TraverseQuery,
 };
 use serde_json::{Value, json};
 
@@ -439,6 +439,50 @@ fn tool_specs() -> Vec<ToolSpec> {
                 "required": ["database", "indexed", "entity_count", "edge_count"]
             }),
         },
+        ToolSpec {
+            name: "build_relay_doc",
+            description: "Build a structured 'relay doc' skeleton (relay-schema v1) around a target entity, resolved by exact qualified name. Collects inbound (who points at it) and outbound (what it points at) edges, each with a call-site anchor and a machine-mapped edge_type. Fills the structure layer (qn, file:line anchors, tool edge_kind → edge_type); semantic fields are marked `custom:needs-review` for the consuming agent. Known limit: Java `calls` edges are extracted only within the same file, so cross-file inbound callers may be missing.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "qn": {
+                        "type": "string",
+                        "description": "Exact qualified name of the target entity. Resolved by exact qualified_name match (not substring); use search_entities first if unsure of the precise qn."
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 1,
+                        "description": "Edge hops to follow. 1 = direct neighbors only (the relay default)."
+                    },
+                    "verbose": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true, include full evidence[] on each edge. Default false keeps the skeleton small."
+                    }
+                },
+                "required": ["qn"]
+            }),
+            output_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "schema_version": {"type": "string"},
+                    "target": {"type": "object"},
+                    "edges": {
+                        "type": "object",
+                        "properties": {
+                            "inbound": {"type": "array"},
+                            "outbound": {"type": "array"}
+                        }
+                    },
+                    "related": {"type": "object"},
+                    "hint": {"type": "string"}
+                },
+                "required": ["schema_version", "target", "edges"]
+            }),
+        },
     ]
 }
 
@@ -761,6 +805,13 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
             }
             result
         }
+        "build_relay_doc" => {
+            let qn = arguments["qn"].as_str().unwrap_or_default();
+            let depth = parse_depth(arguments, 1);
+            let verbose = arguments["verbose"].as_bool().unwrap_or(false);
+            let store = SqliteGraphStore::open(path)?;
+            build_relay(&store, qn, depth, verbose)?
+        }
         _ => return Err(anyhow::anyhow!("tool not implemented: {name}")),
     };
     Ok(json!({
@@ -1074,6 +1125,202 @@ fn verify_edge(
     }))
 }
 
+/// Relay-schema 生产者(`build_relay_doc` 端点与 `relay` CLI 共用):把目标(按
+/// `qualified_name` 精确定位)周围的边聚合成 "agent 接力文档" 骨架(schema v1)。
+///
+/// 机器填结构层 —— qn、调用点 anchor(`edge.evidence[0]` 的 file:line)、工具原生
+/// edge_kind → edge_type 机械映射;语义层(bean 实例 id / interface / business /
+/// framework_dispatch / inject_dead / 跨文件调用链)图里没有,留 `custom:needs-review`
+/// 给消费 agent 补。**机器填结构,agent 填语义。**
+///
+/// 入站(outbound=false,谁指向 target)与出站(outbound=true,target 指向谁)各跑一次
+/// `traverse`,沿接力相关 edge_kinds,过滤纯结构边(contains/declares/exposes/submodule_of)。
+/// 每条边的 peer(对端)qn 经一次 `all_entities()` join 出。
+///
+/// 已知限制(写入 hint):Java `calls` 边只在同文件内提取 —— 被跨文件调度的目标
+/// (如 Spring bean 入口)inbound 可能不全,这正是 agent 要补的部分。
+pub fn build_relay(
+    store: &SqliteGraphStore,
+    qn: &str,
+    depth: usize,
+    verbose: bool,
+) -> Result<Value> {
+    let target = store
+        .search(SearchQuery::new(qn).with_limit(DEFAULT_SEARCH_LIMIT))?
+        .into_iter()
+        .map(|matched| matched.entity)
+        .find(|entity| entity.qualified_name == qn)
+        .ok_or_else(|| {
+            anyhow!(
+                "No entity has qualified_name == `{qn}`. build_relay_doc resolves the target by \
+                 exact qualified name (not substring); run search_entities to find the precise qn."
+            )
+        })?;
+
+    // 接力相关 edge_kinds:调用/依赖/HTTP/DB/字段传播。排除纯结构边(contains 等)——
+    // 它们只表达归属,不表达"谁进来/我调谁",拖进 relay 只是噪音。
+    let relay_kinds: Vec<EdgeKind> = vec![
+        EdgeKind::Calls,
+        EdgeKind::DependsOn,
+        EdgeKind::MatchesEndpoint,
+        EdgeKind::SendsHttpRequest,
+        EdgeKind::ReadsTable,
+        EdgeKind::WritesTable,
+        EdgeKind::ReadsColumn,
+        EdgeKind::WritesColumn,
+        EdgeKind::MappedFrom,
+    ];
+    let inbound = store.traverse(TraverseQuery {
+        start: target.id.clone(),
+        outbound: false,
+        max_depth: depth,
+        edge_kinds: relay_kinds.clone(),
+    })?;
+    let outbound = store.traverse(TraverseQuery {
+        start: target.id.clone(),
+        outbound: true,
+        max_depth: depth,
+        edge_kinds: relay_kinds,
+    })?;
+
+    // 一次 all_entities 建 id→entity 索引,为每条边解出对端 qn/short/kind(无批量
+    // get_entity,这是 analysis 层 ImpactAnalyzer 同款 join 模式)。
+    let index: HashMap<EntityId, Entity> = store
+        .all_entities()?
+        .into_iter()
+        .map(|entity| (entity.id.clone(), entity))
+        .collect();
+
+    // inbound 的对端是调用方(edge.source);outbound 的对端是被调方(edge.target)。
+    let inbound_edges: Vec<Value> = inbound
+        .edges
+        .iter()
+        .map(|edge| relay_edge_json(edge, &edge.source, &index, verbose))
+        .collect();
+    let outbound_edges: Vec<Value> = outbound
+        .edges
+        .iter()
+        .map(|edge| relay_edge_json(edge, &edge.target, &index, verbose))
+        .collect();
+
+    // related.homonyms:同名(qn 不同)实体,防 agent 把同名不同物误连。
+    let homonyms: Vec<Value> = store
+        .search_exact_name(&target.name, DEFAULT_SEARCH_LIMIT)?
+        .into_iter()
+        .filter(|entity| entity.id != target.id)
+        .map(|entity| homonym_json(&entity))
+        .collect();
+
+    Ok(json!({
+        "schema_version": "1",
+        "target": target_json(&target),
+        "edges": {
+            "inbound": inbound_edges,
+            "outbound": outbound_edges,
+        },
+        "related": { "homonyms": homonyms },
+        "hint": "Machine-filled skeleton (structure layer). Fields marked `custom:needs-review` \
+                 must be completed by the consuming agent. Known limit: Java `calls` edges are \
+                 extracted only within the same file, so cross-file callers (inbound) may be \
+                 missing; framework_dispatch / inject_dead / business / bean(instance id) are \
+                 not derivable from the graph."
+    }))
+}
+
+/// 一条 relay 边:peer(对端 qn/short)、edge_type(机械映射)、原生 edge_kind、
+/// layer、调用点 anchor。`peer` 在 inbound=调用方(source)、outbound=被调方(target)。
+fn relay_edge_json(
+    edge: &Edge,
+    peer: &EntityId,
+    index: &HashMap<EntityId, Entity>,
+    verbose: bool,
+) -> Value {
+    let peer_entity = index.get(peer);
+    let peer_kind = peer_entity.map(|entity| entity.kind);
+    let mut view = json!({
+        "peer": {
+            "qn": peer_entity.map(|e| e.qualified_name.clone()).unwrap_or_default(),
+            "short": peer_entity.map(|e| e.name.clone()).unwrap_or_default(),
+        },
+        "edge_type": relay_edge_type(edge.kind, peer_kind),
+        "edge_kind": edge.kind.as_str(),
+        "layer": peer_kind.map(relay_layer).unwrap_or("custom:needs-review"),
+        "anchor": anchor_json(edge.evidence.first()),
+    });
+    if verbose {
+        view["evidence"] = serde_json::to_value(&edge.evidence).unwrap_or_default();
+    }
+    view
+}
+
+/// 工具原生 EdgeKind → relay edge_type。能机械映射的映射,映射不了标 needs-review。
+fn relay_edge_type(kind: EdgeKind, peer_kind: Option<EntityKind>) -> String {
+    use EdgeKind as E;
+    use EntityKind as K;
+    match kind {
+        E::ReadsTable | E::ExecutesSql | E::ReadsColumn | E::BindsToStatement => "db_read",
+        E::WritesTable | E::WritesColumn => "db_write",
+        E::MatchesEndpoint | E::SendsHttpRequest => "http_out",
+        E::MappedFrom => "field_propagate",
+        E::Calls => "call",
+        E::DependsOn => match peer_kind {
+            // @Autowired/@Resource 注入字段 → SpringBean
+            Some(K::SpringBean) => "inject",
+            // 依赖表/列/库,视作读侧
+            Some(K::Table | K::Column | K::Database) => "db_read",
+            _ => "custom:needs-review",
+        },
+        _ => "custom:needs-review",
+    }
+    .to_string()
+}
+
+/// 被调方(对端)实体类型 → 架构层。粗粒度,消费方可按 layer 聚合。
+fn relay_layer(kind: EntityKind) -> &'static str {
+    use EntityKind as K;
+    match kind {
+        K::Table | K::Column | K::Database | K::Datasource | K::Mapper | K::MapperMethod
+        | K::XmlStatement | K::ResultMap | K::SqlField => "db_mapper",
+        K::HttpEndpoint | K::HttpClientCall | K::ApiField => "remote",
+        K::SpringBean | K::Class | K::Interface | K::Method | K::Field => "domain",
+        _ => "infra",
+    }
+}
+
+/// 调用点/定义点 anchor:file + line(单行 int,多行 [start,end])。无 evidence → needs-review。
+/// 目前提取器 end_line==start_line,故多为单行;结构支持范围,留待提取器补全。
+fn anchor_json(evidence: Option<&Evidence>) -> Value {
+    match evidence {
+        Some(ev) if ev.end_line > ev.start_line => {
+            json!({"file": ev.file, "line": [ev.start_line, ev.end_line]})
+        }
+        Some(ev) => json!({"file": ev.file, "line": ev.start_line}),
+        None => json!({"needs_review": "no evidence recorded"}),
+    }
+}
+
+fn target_json(target: &Entity) -> Value {
+    json!({
+        "qn": target.qualified_name,
+        "short": target.name,
+        "kind": target.kind.as_str(),
+        "anchor": anchor_json(target.evidence.first()),
+        // 语义层:图里无数据,显式标 needs-review 让 agent 补。
+        "bean": "custom:needs-review",
+        "interface": "custom:needs-review",
+        "business": "custom:needs-review",
+    })
+}
+
+fn homonym_json(entity: &Entity) -> Value {
+    json!({
+        "qn": entity.qualified_name,
+        "short": entity.name,
+        "kind": entity.kind.as_str(),
+        "anchor": anchor_json(entity.evidence.first()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1135,5 +1382,72 @@ mod tests {
         assert!(hit["match_count"].as_u64().unwrap() >= 1);
         let miss = verify_edge(&store, "Svc", "nonexistentXYZ", root).unwrap();
         assert_eq!(miss["verified"], false, "不存在的 target 未命中");
+    }
+
+    #[test]
+    fn build_relay_fills_skeleton_and_filters_structural_edges() {
+        use repo_intelligence_model::GraphPatch;
+        let mut store = SqliteGraphStore::open_in_memory().unwrap();
+
+        let svc = Entity::new(id("svc"), EntityKind::Class, "Svc", "com.example.Svc")
+            .with_evidence("Svc.java", 10, 10, EvidenceClass::Fact, 1.0, "declared");
+        let caller =
+            Entity::new(id("caller"), EntityKind::Class, "Caller", "com.example.Caller")
+                .with_evidence("Caller.java", 1, 1, EvidenceClass::Fact, 1.0, "declared");
+        let mapper = Entity::new(id("mapper"), EntityKind::Mapper, "UserMapper", "com.example.UserMapper")
+            .with_evidence("UserMapper.java", 1, 1, EvidenceClass::Fact, 1.0, "mapper");
+        let field1 = Entity::new(id("field1"), EntityKind::Field, "field1", "com.example.Svc.field1")
+            .with_evidence("Svc.java", 20, 20, EvidenceClass::Fact, 1.0, "field");
+
+        let edges = vec![
+            // inbound: Caller → Svc(call)
+            Edge::new(id("caller"), id("svc"), EdgeKind::Calls)
+                .with_evidence("Caller.java", 5, 5, EvidenceClass::Inferred, 0.7, "call"),
+            // outbound: Svc → Mapper(db_read)
+            Edge::new(id("svc"), id("mapper"), EdgeKind::ReadsTable)
+                .with_evidence("Svc.java", 12, 12, EvidenceClass::Fact, 1.0, "reads"),
+            // 结构边:应被 relay_kinds 过滤,不进 outbound
+            Edge::new(id("svc"), id("field1"), EdgeKind::Contains)
+                .with_evidence("Svc.java", 20, 20, EvidenceClass::Fact, 1.0, "contains"),
+        ];
+        store
+            .apply_patch(GraphPatch::add(vec![svc, caller, mapper, field1], edges))
+            .unwrap();
+
+        let doc = build_relay(&store, "com.example.Svc", 1, false).unwrap();
+
+        // target 结构层自动填 + 语义层 needs-review
+        assert_eq!(doc["target"]["qn"], "com.example.Svc");
+        assert_eq!(doc["target"]["bean"], "custom:needs-review");
+        assert_eq!(doc["target"]["business"], "custom:needs-review");
+        assert_eq!(doc["target"]["anchor"]["file"], "Svc.java");
+        assert_eq!(doc["target"]["anchor"]["line"], 10);
+
+        // inbound: 一条 call 边,peer=caller,anchor=调用点
+        let inbound = doc["edges"]["inbound"].as_array().unwrap();
+        assert_eq!(inbound.len(), 1);
+        assert_eq!(inbound[0]["edge_type"], "call");
+        assert_eq!(inbound[0]["edge_kind"], "calls");
+        assert_eq!(inbound[0]["peer"]["qn"], "com.example.Caller");
+        assert_eq!(inbound[0]["anchor"]["file"], "Caller.java");
+        assert_eq!(inbound[0]["anchor"]["line"], 5);
+
+        // outbound: 仅 db_read(ReadsTable),Contains 被过滤
+        let outbound = doc["edges"]["outbound"].as_array().unwrap();
+        assert_eq!(outbound.len(), 1, "Contains 结构边应被过滤");
+        assert_eq!(outbound[0]["edge_type"], "db_read");
+        assert_eq!(outbound[0]["edge_kind"], "reads_table");
+        assert_eq!(outbound[0]["peer"]["qn"], "com.example.UserMapper");
+        assert_eq!(outbound[0]["layer"], "db_mapper");
+
+        // hint 标注语义层需 agent 补
+        assert!(doc["hint"].as_str().unwrap().contains("needs-review"));
+    }
+
+    #[test]
+    fn build_relay_errors_on_unknown_qn() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let result = build_relay(&store, "does.not.Exist", 1, false);
+        assert!(result.is_err(), "未知 qn 应返回 Err 而非空骨架");
     }
 }
