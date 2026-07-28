@@ -7,6 +7,40 @@
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-07-28
+
+### Added
+
+- **search 类工具响应瘦身 + 分页**（`search_entities`/`find_endpoint`/`analyze_requirement`）：默认返回
+  compact 视图 `{id, kind, name, qualified_name, evidence_count}`，新增 `verbose`（true 时返回完整
+  entity，含 `evidence[].reason` 与 `metadata`）与 `limit`/`offset` 分页 + `has_more`。此前默认
+  `limit=100` × 完整 Entity 在宽匹配（如企业编号命中数十实体）下可撑到上万 token；`has_more` 用
+  peek `limit+1` 推断，不查 `COUNT(*)`。
+- **增量扫描缓存**（analysis）：extract 按 `path → (content_hash, GraphPatch)` 缓存，未变文件复用上次
+  patch、跳过 parse/regex；`resolve` 与 `replace_snapshot` 仍全量，跨文件边一致。代价是内存（缓存全部 patch）。
+- **跨文件 Mapper→Table 绑定**（analysis）：`resolve_cross_stack` 新增一轮 ——
+  `Mapper.metadata.entity_type` 命中同名 `Class` → 其 `DependsOn` 的 `Table`，补足 MyBatis Plus
+  实体与 mapper 分文件场景（同文件绑定由 `extract_mybatis_plus` 产）。
+- **LambdaQueryWrapper 列提取**（补 0.1.9 限制）：方法引用形式（`.eq(Entity::getName)`）现提取为
+  `Column` + `reads_column`，不再仅 `QueryWrapper` 字符串首参。
+- **Method/Calls 与 Spring 构造器注入**（semantics）：同文件方法声明与方法间 `calls` 边提取；单构造器
+  自动注入、`@Autowired` 构造器 → `DependsOn`，多构造器无 `@Autowired` 不注入。
+- **配置层**（config crate）：`EXCLUDED_DIRS`/`FRONTEND_NOISE`/`CUSTOM_ENDPOINT_ANNOTATIONS` 及限制值等
+  硬编码常量解耦到 `crates/config`，支持 `.repo-intelligence.toml` 覆盖（标量 + 短列表替换，长列表用
+  `_extra` 追加）。CLI `scan` 与 MCP `scan_workspace` 自动 `IndexerConfig::load(workspace)` 发现配置。
+
+### Changed
+
+- **semantics 提取器 trait 化**（内部重构，行为不变）：原 `lib.rs`（1227 行）拆为
+  `lib`/`registry`/`java`/`xml`/`frontend`/`build`，引入 `SemanticExtractor` trait（`supports`+`extract`）
+  + `Registry::default_java_stack`；新增语言/框架只需 `impl trait + register`，不动核心分发。
+
+### Known Limitations
+
+- `find_endpoint` 带 kind 过滤，而 SQL `LIMIT/OFFSET` 作用在过滤前候选上，其 `has_more` 是"候选窗口
+  近似"（可能提前停止翻页，但不丢数据）；`search_entities`/`analyze_requirement`（无过滤）分页精确。
+- 增量扫描缓存以内存换 CPU（缓存全部 patch）；超大工作区首次扫描后常驻内存上升。
+
 ## [0.1.9] - 2026-07-27
 
 ### Added
