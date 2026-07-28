@@ -234,8 +234,12 @@ impl SqliteGraphStore {
             let mut insert_fts = transaction.prepare_cached(
                 "INSERT INTO entity_fts(entity_id, name, qualified_name) VALUES(?1, ?2, ?3)",
             )?;
+            let n_ent = patch.add_entities.len();
+            let mut t_upsert = std::time::Duration::ZERO;
+            let mut t_fts = std::time::Duration::ZERO;
             for entity in patch.add_entities {
                 let json = serde_json::to_string(&entity)?;
+                let s = std::time::Instant::now();
                 upsert_entity.execute(params![
                     entity.id.0,
                     entity.kind.as_str(),
@@ -243,11 +247,19 @@ impl SqliteGraphStore {
                     entity.qualified_name,
                     json
                 ])?;
+                t_upsert += s.elapsed();
+                let s = std::time::Instant::now();
                 if let Some(statement) = delete_fts.as_mut() {
                     statement.execute([&entity.id.0])?;
                 }
                 insert_fts.execute(params![entity.id.0, entity.name, entity.qualified_name])?;
+                t_fts += s.elapsed();
             }
+            eprintln!(
+                "[ri-diag] write_patch entities: {n_ent} (upsert={:.2}s fts={:.2}s)",
+                t_upsert.as_secs_f64(),
+                t_fts.as_secs_f64()
+            );
         }
 
         {
@@ -257,6 +269,8 @@ impl SqliteGraphStore {
                  ON CONFLICT(source_id, target_id, kind) DO UPDATE SET
                    json=excluded.json, resolved=0",
             )?;
+            let n_edg = patch.add_edges.len();
+            let t = std::time::Instant::now();
             for edge in patch.add_edges {
                 let json = serde_json::to_string(&edge)?;
                 upsert_edge.execute(params![
@@ -266,6 +280,10 @@ impl SqliteGraphStore {
                     json
                 ])?;
             }
+            eprintln!(
+                "[ri-diag] write_patch edges: {n_edg} in {:.2}s",
+                t.elapsed().as_secs_f64()
+            );
         }
         Ok(())
     }

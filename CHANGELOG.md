@@ -7,6 +7,14 @@
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-07-28
+
+### Added
+
+- **write_patch 内部计时**（`[ri-diag]`，stderr）：entity upsert / FTS5 insert / edge 三段分开
+  计时。PRAGMA 写优化后 apply_patch 仍卡的下一层诊断——区分瓶颈在 FTS5 全文索引（每实体 insert
+  分词）还是 entity 表 upsert（B-tree + 索引）。
+
 ## [0.1.16] - 2026-07-28
 
 ### Changed
