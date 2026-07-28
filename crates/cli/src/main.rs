@@ -214,10 +214,17 @@ fn run() -> Result<()> {
 }
 
 fn log_scan_progress(progress: ScanProgress) {
+    // RI_LOG_EVERY 控制 Parsing 阶段日志频率(默认每 100 个文件)。诊断卡死时设
+    // RI_LOG_EVERY=1 让每个文件都打,卡住时最后一行的 file= 即为元凶文件。
+    let every: usize = std::env::var("RI_LOG_EVERY")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(100);
     if progress.phase == ScanPhase::Parsing
         && progress.current_path.is_some()
         && progress.processed != 0
-        && !progress.processed.is_multiple_of(100)
+        && every > 1
+        && !progress.processed.is_multiple_of(every)
     {
         return;
     }
