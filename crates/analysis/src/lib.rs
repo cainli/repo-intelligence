@@ -169,8 +169,28 @@ impl WorkspaceIndexer {
                 current_path: Some(file.relative_path.to_string_lossy().to_string()),
                 elapsed_ms: started.elapsed().as_millis(),
             });
-            let patch =
-                repo_intelligence_semantics::extract_with_config(file, &config.semantics)?;
+            // extract 容错:单个文件提取 panic(畸形 AST / 索引越界 / tree-sitter 异常)
+            // 不应让整个 scan 崩溃。catch_unwind 捕获后跳过该文件并记 stderr,其余文件
+            // 继续——对应 mes/mos 在 parsing 末尾整体崩溃的场景(坏文件被跳过即可完成)。
+            let patch = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                repo_intelligence_semantics::extract_with_config(file, &config.semantics)
+            })) {
+                Ok(Ok(patch)) => patch,
+                Ok(Err(err)) => return Err(err),
+                Err(payload) => {
+                    let msg = payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                        .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                    eprintln!(
+                        "[ri-diag] extract panicked, skipping {}: {}",
+                        file.relative_path.to_string_lossy(),
+                        msg
+                    );
+                    continue;
+                }
+            };
             summary.files_extracted += 1;
             summary.entities_indexed += patch.add_entities.len();
             summary.edges_indexed += patch.add_edges.len();
@@ -310,6 +330,228 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
             }
             edges.push(edge);
         }
+    }
+
+    // 跨文件 method 调用:method.metadata.invokes 的 callee 名 + 所属类型的注入依赖
+    // (DependsOn→SpringBean type)→ 在注入 type 声明的 method 里按名匹配,补
+    // Controller→Service→Mapper 跨文件调用链(同文件 calls 由 extract_java 产)。
+    // 低保真:方法名 + 注入类型匹配;同名歧义(多个注入 type 都有该方法)则跳过。
+    let entity_by_id_cf: HashMap<&EntityId, &Entity> =
+        entities.iter().map(|entity| (&entity.id, entity)).collect();
+    let mut type_methods: HashMap<&str, HashMap<&str, &EntityId>> = HashMap::new();
+    let mut method_owner: HashMap<&EntityId, &str> = HashMap::new();
+    for edge in input_edges {
+        if edge.kind == EdgeKind::Declares
+            && let (Some(owner), Some(m)) =
+                (entity_by_id_cf.get(&edge.source), entity_by_id_cf.get(&edge.target))
+            && matches!(owner.kind, EntityKind::Class | EntityKind::Interface)
+            && m.kind == EntityKind::Method
+        {
+            method_owner.insert(&edge.target, owner.name.as_str());
+            type_methods
+                .entry(owner.name.as_str())
+                .or_default()
+                .insert(m.name.as_str(), &edge.target);
+        }
+    }
+    let mut owner_injected: HashMap<&str, Vec<&str>> = HashMap::new();
+    for edge in input_edges {
+        if edge.kind == EdgeKind::Injects
+            && let (Some(owner), Some(bean)) =
+                (entity_by_id_cf.get(&edge.source), entity_by_id_cf.get(&edge.target))
+            && matches!(owner.kind, EntityKind::Class | EntityKind::Interface)
+            && bean.kind == EntityKind::SpringBean
+        {
+            owner_injected
+                .entry(owner.name.as_str())
+                .or_default()
+                .push(bean.name.as_str());
+        }
+    }
+    for entity in entities {
+        if entity.kind != EntityKind::Method {
+            continue;
+        }
+        let Some(invokes) = entity.metadata.get("invokes").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let Some(&owner) = method_owner.get(&entity.id) else {
+            continue;
+        };
+        let Some(injected) = owner_injected.get(owner) else {
+            continue;
+        };
+        for invoke in invokes {
+            let Some(callee_name) = invoke.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let line = invoke.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let mut hits: Vec<&EntityId> = Vec::new();
+            for type_name in injected {
+                if let Some(ms) = type_methods.get(*type_name)
+                    && let Some(callee_id) = ms.get(callee_name).copied()
+                {
+                    hits.push(callee_id);
+                }
+            }
+            // 仅在唯一命中且非自调用时建边;多命中=歧义跳过,避免连错。
+            if hits.len() == 1 && hits[0] != &entity.id {
+                let evidence = entity.evidence.first();
+                let mut edge = Edge::new(entity.id.clone(), hits[0].clone(), EdgeKind::Calls);
+                if let Some(ev) = evidence {
+                    edge = edge.with_evidence(
+                        &ev.file,
+                        line,
+                        line,
+                        EvidenceClass::Inferred,
+                        0.6,
+                        "cross-file call via injected dependency (matched by name)",
+                    );
+                }
+                edges.push(edge);
+            }
+        }
+    }
+
+    // implements:跨文件 class.metadata.implements → 全局 interface 实体(EntityId 是
+    // path-scoped,extract 层建不了跨文件边,故 metadata 传递 + 这里按 interface 名解析)。
+    // 同时建 class→interface depends_on 边 + 反向索引 interface→impl,供下面的桥接。
+    let interfaces_by_name: HashMap<&str, &EntityId> = entities
+        .iter()
+        .filter(|e| e.kind == EntityKind::Interface)
+        .map(|e| (e.name.as_str(), &e.id))
+        .collect();
+    let mut interface_to_impls: HashMap<&str, Vec<&str>> = HashMap::new();
+    for entity in entities {
+        if entity.kind != EntityKind::Class {
+            continue;
+        }
+        let Some(impls) = entity.metadata.get("implements").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for iface_val in impls {
+            let Some(iface_name) = iface_val.as_str() else { continue };
+            let Some(&iface_id) = interfaces_by_name.get(iface_name) else { continue };
+            let mut edge = Edge::new(entity.id.clone(), iface_id.clone(), EdgeKind::DependsOn);
+            if let Some(ev) = entity.evidence.first() {
+                edge = edge.with_evidence(
+                    &ev.file,
+                    ev.start_line,
+                    ev.end_line,
+                    EvidenceClass::Fact,
+                    1.0,
+                    "class implements interface",
+                );
+            }
+            edges.push(edge);
+            interface_to_impls
+                .entry(iface_name)
+                .or_default()
+                .push(entity.name.as_str());
+        }
+    }
+    for edge in input_edges {
+        if edge.kind == EdgeKind::Declares
+            && let (Some(iface), Some(m)) =
+                (entity_by_id_cf.get(&edge.source), entity_by_id_cf.get(&edge.target))
+            && iface.kind == EntityKind::Interface
+            && m.kind == EntityKind::Method
+            && let Some(impls) = interface_to_impls.get(iface.name.as_str())
+        {
+            let mut hits: Vec<&EntityId> = Vec::new();
+            for impl_name in impls {
+                if let Some(ms) = type_methods.get(*impl_name)
+                    && let Some(impl_m_id) = ms.get(m.name.as_str()).copied()
+                {
+                    hits.push(impl_m_id);
+                }
+            }
+            // 唯一实现且非自环时建桥接边;多实现=歧义跳过。
+            if hits.len() == 1 && hits[0] != &edge.target {
+                let mut bridge = Edge::new(edge.target.clone(), hits[0].clone(), EdgeKind::Calls);
+                if let Some(ev) = m.evidence.first() {
+                    bridge = bridge.with_evidence(
+                        &ev.file,
+                        ev.start_line,
+                        ev.end_line,
+                        EvidenceClass::Inferred,
+                        0.7,
+                        "interface dispatch to implementation",
+                    );
+                }
+                edges.push(bridge);
+            }
+        }
+    }
+
+    // Mapper method → Table:method 的 owner interface 与同文件同名 Mapper entity(MP_MAPPER)
+    // 是同一物的两面。Mapper entity 的 entity_type 命中的 Class→Table(extract_mybatis_plus
+    // 产 @TableName 类→Table,在 extract 边里)即 method 操作的表。建 method→Table ReadsTable,
+    // 让调用链从 Mapper method 抵达 data 层。不依赖 resolve 产的跨文件 Mapper→Table 边
+    // (那些不在本次 input_edges 里)。
+    let class_to_table_m2t: HashMap<&str, &EntityId> = input_edges
+        .iter()
+        .filter_map(|edge| {
+            if edge.kind != EdgeKind::DependsOn {
+                return None;
+            }
+            let (Some(cls), Some(tbl)) =
+                (entity_by_id_cf.get(&edge.source), entity_by_id_cf.get(&edge.target))
+            else {
+                return None;
+            };
+            if cls.kind == EntityKind::Class && tbl.kind == EntityKind::Table {
+                Some((cls.name.as_str(), &edge.target))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mapper_by_key: HashMap<(&str, &str), &Entity> = entities
+        .iter()
+        .filter_map(|e| {
+            if e.kind != EntityKind::Mapper {
+                return None;
+            }
+            e.evidence
+                .first()
+                .map(|ev| ((e.name.as_str(), ev.file.as_str()), e))
+        })
+        .collect();
+    for edge in input_edges {
+        if edge.kind != EdgeKind::Declares {
+            continue;
+        }
+        let (Some(owner), Some(method)) =
+            (entity_by_id_cf.get(&edge.source), entity_by_id_cf.get(&edge.target))
+        else {
+            continue;
+        };
+        if owner.kind != EntityKind::Interface || method.kind != EntityKind::Method {
+            continue;
+        }
+        let Some(ev) = owner.evidence.first() else { continue };
+        let Some(mapper) = mapper_by_key.get(&(owner.name.as_str(), ev.file.as_str())) else {
+            continue;
+        };
+        let Some(entity_type) = mapper.metadata.get("entity_type").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(table_id) = class_to_table_m2t.get(entity_type) else {
+            continue;
+        };
+        let mut m2t = Edge::new(edge.target.clone(), (*table_id).clone(), EdgeKind::ReadsTable);
+        if let Some(mev) = method.evidence.first() {
+            m2t = m2t.with_evidence(
+                &mev.file,
+                mev.start_line,
+                mev.end_line,
+                EvidenceClass::Inferred,
+                0.7,
+                "mapper method reads table (BaseMapper<entity_type> → @TableName class → table)",
+            );
+        }
+        edges.push(m2t);
     }
 
     for call in calls {

@@ -203,7 +203,6 @@ impl SqliteGraphStore {
             transaction.execute_batch(
                 "
                 DELETE FROM edge;
-                DELETE FROM entity_fts;
                 DELETE FROM entity;
                 ",
             )?;
@@ -213,7 +212,6 @@ impl SqliteGraphStore {
                     "DELETE FROM edge WHERE source_id = ?1 OR target_id = ?1",
                     [&id.0],
                 )?;
-                transaction.execute("DELETE FROM entity_fts WHERE entity_id = ?1", [&id.0])?;
                 transaction.execute("DELETE FROM entity WHERE id = ?1", [&id.0])?;
             }
         }
@@ -226,20 +224,15 @@ impl SqliteGraphStore {
                    kind=excluded.kind, name=excluded.name,
                    qualified_name=excluded.qualified_name, json=excluded.json",
             )?;
-            let mut delete_fts = if replacing_snapshot {
-                None
-            } else {
-                Some(transaction.prepare_cached("DELETE FROM entity_fts WHERE entity_id = ?1")?)
-            };
-            let mut insert_fts = transaction.prepare_cached(
-                "INSERT INTO entity_fts(entity_id, name, qualified_name) VALUES(?1, ?2, ?3)",
-            )?;
+            // entity_fts(FTS5 全文索引)是死索引:grep 全仓库无任何 SELECT FROM entity_fts /
+            // MATCH 读取——search 走 entity 表 LIKE,search_exact_name 走 entity.name =。但每实体
+            // 都 INSERT 一次 FTS5(分词+建索引),mes/mos 22 万实体花了 2054s(apply_patch 的
+            // 99.7%、整个 scan 的 99.5%)。移除写入后 write_patch 从 ~2060s 降到 ~5s。表保留
+            // (CREATE 不动)以兼容旧 db,只是不再写入、永远为空。
             let n_ent = patch.add_entities.len();
-            let mut t_upsert = std::time::Duration::ZERO;
-            let mut t_fts = std::time::Duration::ZERO;
+            let t = std::time::Instant::now();
             for entity in patch.add_entities {
                 let json = serde_json::to_string(&entity)?;
-                let s = std::time::Instant::now();
                 upsert_entity.execute(params![
                     entity.id.0,
                     entity.kind.as_str(),
@@ -247,18 +240,10 @@ impl SqliteGraphStore {
                     entity.qualified_name,
                     json
                 ])?;
-                t_upsert += s.elapsed();
-                let s = std::time::Instant::now();
-                if let Some(statement) = delete_fts.as_mut() {
-                    statement.execute([&entity.id.0])?;
-                }
-                insert_fts.execute(params![entity.id.0, entity.name, entity.qualified_name])?;
-                t_fts += s.elapsed();
             }
             eprintln!(
-                "[ri-diag] write_patch entities: {n_ent} (upsert={:.2}s fts={:.2}s)",
-                t_upsert.as_secs_f64(),
-                t_fts.as_secs_f64()
+                "[ri-diag] write_patch entities: {n_ent} in {:.2}s",
+                t.elapsed().as_secs_f64()
             );
         }
 
@@ -373,13 +358,10 @@ impl GraphStore for SqliteGraphStore {
         {
             let mut delete_edges = transaction
                 .prepare_cached("DELETE FROM edge WHERE source_id = ?1 OR target_id = ?1")?;
-            let mut delete_fts =
-                transaction.prepare_cached("DELETE FROM entity_fts WHERE entity_id = ?1")?;
             let mut delete_entity =
                 transaction.prepare_cached("DELETE FROM entity WHERE id = ?1")?;
             for id in &ids {
                 delete_edges.execute([id])?;
-                delete_fts.execute([id])?;
                 delete_entity.execute([id])?;
             }
         }
@@ -411,19 +393,47 @@ impl GraphStore for SqliteGraphStore {
     }
 
     fn search(&self, query: SearchQuery) -> Result<Vec<EntityMatch>> {
-        let mut statement = self.connection.prepare(
-            "SELECT e.json
-             FROM entity e
-             WHERE lower(e.name) LIKE lower(?1)
-                OR lower(e.qualified_name) LIKE lower(?1)
-             ORDER BY CASE WHEN lower(e.name) = lower(?2) THEN 0 ELSE 1 END, e.name
-             LIMIT ?3 OFFSET ?4",
-        )?;
-        let pattern = format!("%{}%", query.text);
-        let rows = statement.query_map(
-            params![pattern, query.text, query.limit as i64, query.offset as i64],
-            Self::row_entity,
-        )?;
+        // 拆词 OR:多词查询(如 "user login")任一词命中即召回,避免整串子串匹配
+        // (lower(name) LIKE "%user login%")对无空格标识符返回空。单词保持原整串行为。
+        // 每个词一个 LIKE pattern,同时匹配 name 与 qualified_name;动态 ?N 占位参数化。
+        let words: Vec<String> = {
+            let split: Vec<&str> = query.text.split_whitespace().collect();
+            if split.len() <= 1 {
+                vec![format!("%{}%", query.text)]
+            } else {
+                split.into_iter().map(|w| format!("%{}%", w)).collect()
+            }
+        };
+        let or_clauses: Vec<String> = words
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let idx = i + 1;
+                format!(
+                    "(lower(e.name) LIKE lower(?{idx}) OR lower(e.qualified_name) LIKE lower(?{idx}))"
+                )
+            })
+            .collect();
+        let where_clause = or_clauses.join(" OR ");
+        let name_idx = words.len() + 1;
+        let limit_idx = words.len() + 2;
+        let offset_idx = words.len() + 3;
+        let sql = format!(
+            "SELECT e.json FROM entity e WHERE {where_clause} \
+             ORDER BY CASE WHEN lower(e.name) = lower(?{name_idx}) THEN 0 ELSE 1 END, e.name \
+             LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let limit = query.limit as i64;
+        let offset = query.offset as i64;
+        let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(words.len() + 3);
+        for w in &words {
+            params_vec.push(w);
+        }
+        params_vec.push(&query.text);
+        params_vec.push(&limit);
+        params_vec.push(&offset);
+        let rows = statement.query_map(params_vec.as_slice(), Self::row_entity)?;
         rows.map(|result| result.map(|entity| EntityMatch { entity, score: 1.0 }))
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)

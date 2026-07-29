@@ -329,13 +329,13 @@ fn extracts_spring_bean_dependency_injection() {
         .find(|matched| matched.entity.kind == EntityKind::SpringBean)
         .expect("SpringBean for OrderRepo")
         .entity;
-    // DependsOn 方向:owner(OrderService) → bean(OrderRepo)。从 bean 反向遍历应到 owner。
+    // Injects 方向:owner(OrderService) → bean(OrderRepo)。从 bean 反向遍历应到 owner。
     let owners = store
         .traverse(TraverseQuery {
             start: bean.id,
             outbound: false,
             max_depth: 1,
-            edge_kinds: vec![EdgeKind::DependsOn],
+            edge_kinds: vec![EdgeKind::Injects],
         })
         .unwrap();
     assert!(
@@ -709,8 +709,8 @@ fn scan_with_config_honors_custom_endpoint_replacement() {
 }
 
 #[test]
-fn spring_autowired_constructor_injection_produces_depends_on() {
-    // @Autowired 构造器:OrderService(OrderRepo) → DependsOn OrderRepo bean。
+fn spring_autowired_constructor_injection_produces_injects() {
+    // @Autowired 构造器:OrderService(OrderRepo) → Injects OrderRepo bean。
     let dir = tempfile::tempdir().unwrap();
     fs::write(
         dir.path().join("OrderService.java"),
@@ -737,12 +737,12 @@ fn spring_autowired_constructor_injection_produces_depends_on() {
             start: bean.id,
             outbound: false,
             max_depth: 1,
-            edge_kinds: vec![EdgeKind::DependsOn],
+            edge_kinds: vec![EdgeKind::Injects],
         })
         .unwrap();
     assert!(
         owners.entities.iter().any(|e| e.name == "OrderService"),
-        "OrderService 应经构造器注入 DependsOn OrderRepo"
+        "OrderService 应经构造器注入 Injects OrderRepo"
     );
 }
 
@@ -1026,4 +1026,29 @@ fn method_declarations_and_same_file_calls_extracted() {
     let names: Vec<&str> = chain.entities.iter().map(|e| e.name.as_str()).collect();
     assert!(names.contains(&"methodB"), "methodA 调用 methodB");
     assert!(names.contains(&"methodC"), "调用链达 methodC");
+}
+
+#[test]
+fn implements_custom_interface_becomes_endpoint() {
+    // 回归 P1-4:implements ApiHandler(自研 RMB 入口模式)→ HttpEndpoint,name=类名(交易码)。
+    // mes/mos 的 RMB 入口用 `@MosApi + implements ApiHandler`,纯注解识别覆盖不到。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("S27204.java"),
+        r#"
+        class S27204 implements ApiHandler<S27204Req, Object> {
+          public Object handle(S27204Req req) { return null; }
+        }
+        "#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    let endpoint = store
+        .search(SearchQuery::new("S27204").with_limit(20))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::HttpEndpoint)
+        .expect("implements ApiHandler 应产出 HttpEndpoint");
+    assert_eq!(endpoint.entity.name, "S27204");
 }

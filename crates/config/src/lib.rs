@@ -37,6 +37,11 @@ pub const DEFAULT_EXCLUDED_DIRS: &[&str] = &[
 pub const DEFAULT_CUSTOM_ENDPOINT_ANNOTATIONS: &[&str] =
     &["RmbMap", "DubboService", "RpcMapping"];
 
+/// 自研 RPC 框架的入口标记接口：implements 这些接口的类视为业务入口（mes/mos 的 RMB
+/// 入口普遍用 `@MosApi + implements ApiHandler`、`implements IBizProcess` 这套自定义框架，
+/// 纯注解识别覆盖不到）。
+pub const DEFAULT_CUSTOM_ENDPOINT_INTERFACES: &[&str] = &["ApiHandler", "IBizProcess"];
+
 /// 前端属性访问噪声词（原 `semantics::FRONTEND_NOISE`）。
 pub const DEFAULT_FRONTEND_NOISE: &[&str] = &[
     "length", "size", "toString", "valueOf", "prototype", "constructor",
@@ -73,6 +78,12 @@ fn default_max_search_limit() -> usize {
 }
 fn default_custom_endpoint_annotations() -> Vec<String> {
     DEFAULT_CUSTOM_ENDPOINT_ANNOTATIONS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+fn default_custom_endpoint_interfaces() -> Vec<String> {
+    DEFAULT_CUSTOM_ENDPOINT_INTERFACES
         .iter()
         .map(|s| (*s).to_string())
         .collect()
@@ -157,6 +168,10 @@ pub struct SemanticsConfig {
     /// 用户填写则完全替换（自控全集）。
     #[serde(default = "default_custom_endpoint_annotations")]
     pub custom_endpoint_annotations: Vec<String>,
+    /// 自研 RPC 入口标记接口（implements 这些接口的类 = 业务入口）。短列表替换语义：
+    /// 默认注入 builtin 2 个（ApiHandler/IBizProcess），用户填写则完全替换。
+    #[serde(default = "default_custom_endpoint_interfaces")]
+    pub custom_endpoint_interfaces: Vec<String>,
 }
 
 impl Default for SemanticsConfig {
@@ -164,6 +179,7 @@ impl Default for SemanticsConfig {
         Self {
             frontend_noise_extra: Vec::new(),
             custom_endpoint_annotations: default_custom_endpoint_annotations(),
+            custom_endpoint_interfaces: default_custom_endpoint_interfaces(),
         }
     }
 }

@@ -7,6 +7,98 @@
 
 ## [Unreleased]
 
+## [0.1.20] - 2026-07-29
+
+### Added
+
+- **注入边 `Injects`，trace 默认跟随，治 Java 业务调用链失效（P0-1/P0-2 同根）**：把
+  `@Autowired`/`@Resource` 字段注入、构造器与 Lombok 构造器注入，从与表依赖混用的
+  `DependsOn` 拆出独立 `Injects` 边（`EdgeKind::Injects`，`as_str="injects"`）。
+  `trace_callers`/`trace_callees` 默认 `edge_kinds` 由 `[calls]` 改为 `[calls, injects]`，让
+  Spring Bean 注入这条 Java 跨文件主干进入调用链。驱动自 mes/mos `S27204` 实测反馈：注入边
+  此前不在默认 trace 范围 → 起点周围无边 → inbound/outbound 退化为同一份起点集（方向丢失，
+  P0-1）；注入链路同时缺失（P0-2）。边回来后方向随之恢复，新增回归测试钉死
+  `trace_callers ≠ trace_callees`。
+
+### Changed
+
+- **`DependsOn` 语义收敛为表/库依赖**：`@TableName` Class→Table、Mapper→Table、跨文件
+  Mapper→Table 解析仍产 `DependsOn`；class implements interface 的 `DependsOn` 不变。
+  `resolve_cross_stack` 的注入收集（`owner_injected`）改读 `Injects`，其余按 `entity.kind`
+  分流的 `DependsOn` 判断不动。
+- **relay 层同步**：`build_relay` 的 `relay_kinds` 白名单加 `Injects`；`relay_edge_type` 新增
+  `Injects => "inject"`，`DependsOn` 精简为表/列/库 → `db_read`。
+- **trace 工具描述**点明默认 `calls+injects`，跨文件注入/调用为低保真推断，建议用 `verify_edge`
+  落地 `tentative` 边。
+- 零边起点提示：`trace_graph` 在起点无目标边时显式 hint，说明"零边时 inbound/outbound 退化为
+  同一份起点集"，建议 `search_entities` 按 qualified_name 消歧。
+- **trace 起点 `qualified_name` 精确优先 + 多同名消歧（P0-3）**：`trace_*("S27204")` 仍合并
+  所有同名起点，但 `name` 精确等于某 `qualified_name` 时优先锁定单个（消歧 mos 入口 vs mes
+  处理器）；多同名时附 hint 列出每个起点的 qn/kind/file，不盲目自动排除测试类。
+- **`search_entities`/`analyze_requirement` 加 `kind` 过滤（P1-5）**：传 `kind: ["class","method"]`
+  只返回指定类型实体，切掉宽标识符（企业交易码）命中的 field/column 噪声。复用 `run_search`
+  既有 kinds 过滤，find_endpoint 的硬编码 kinds 不受影响。
+- **`implements` 接口入口识别（P1-4）**：新增 `custom_endpoint_interfaces` 配置（默认
+  `ApiHandler`/`IBizProcess`），implements 这些接口的类视为自研 RMB 入口，补 `HttpEndpoint`
+  （name=类名/交易码）让 `find_endpoint` 命中——mes/mos 的 `@MosApi + implements ApiHandler`
+  自定义框架此前完全漏识别。`@MosApi` 注解仍走 `custom_endpoint_annotations`（用户按需配）。
+
+### ⚠️ 需重新索引
+
+- 注入边由 `depends_on` 改名 `injects`，**旧索引库需重新 `scan_workspace`** 才能让 trace 默认
+  跟随注入链；沿用旧库时注入仍是 `depends_on`，默认 trace 看不到。
+
+## [0.1.19] - 2026-07-29
+
+### Fixed
+
+- **移除死 FTS5 索引,scan 提速 ~200×**：`entity_fts` 全文索引只写不读（grep 全仓库无
+  `SELECT FROM entity_fts` / `MATCH`；search 走 entity 表 LIKE，search_exact_name 走
+  `entity.name`），但每实体都 INSERT 一次 FTS5（分词+建索引）。mes/mos 22 万实体 FTS5 花了
+  **2054s**（apply_patch 的 99.7%、整个 scan 34 分钟的 99.5%）。移除写入后 write_patch 从
+  ~2060s 降到 ~5s。ruoyi write_patch 1.62s → 0.02s，scan 2s → 0.6s。`entity_fts` 表保留
+  （CREATE 不动）兼容旧 db，只是不再写入、永远为空。曾误判为崩溃（加 catch_unwind 容错），
+  实为纯性能问题——容错保留无害。
+
+## [0.1.18] - 2026-07-28
+
+### Added
+
+- **Class→Method 层级边（Declares）**：method 提取时建 `owner→method` Declares 边，让
+  relay/impact 能从类型（class/interface）到达其方法。修 ruoyi 实践发现的"relay 对 class
+  空壳"（method/endpoint 只挂 file 下，不挂 class）。
+- **method→HTTP 端点关联（Exposes）**：offset 配对 mapping 注解 → 所在 method，建
+  `method→endpoint` Exposes 边。修"endpoint 孤悬、find_endpoint/relay 无法从 URL 追到处理
+  方法"。ruoyi 230 个端点全部正确配对（`SysUserController#list → GET /system/user/list`）。
+- **Lombok 构造器注入识别**：`@RequiredArgsConstructor`（final 字段）/`@AllArgsConstructor`
+  （全字段）按注解把字段类型当注入参数，补 `owner→bean` DependsOn。修 ruoyi 用 Lombok 构造器
+  注入（非显式 constructor_declaration）导致 Controller→Service 注入边缺失。
+- **跨文件 method 调用（calls）**：method 调用意图存 `metadata.invokes`，resolve_cross_stack
+  按"所属类型的注入依赖类型 + 方法名"跨文件匹配，补 Controller→Service→Mapper 调用链
+  （同文件 calls 由 extract 产）。低保真：方法名歧义（多注入 type 同名）跳过。
+- **interface→impl 桥接**：提取 `implements` 关系（regex，跨文件经 metadata 传递 + resolve
+  按全局 interface 名解析），resolve 建 `interface method → impl method` Calls（运行时分发），
+  让调用链穿透 interface 抵达实现。ruoyi 全链贯通：
+  `Controller#list → ISysUserService → SysUserServiceImpl → SysUserMapper → sys_user`。
+- **Mapper method→Table 桥接**：Mapper interface 声明的 method 补 `method→Table` ReadsTable
+  （经 Mapper entity_type → @TableName class → Table），让调用链从 Mapper method 抵达 data 层
+  （否则 method 挂 interface 实体、Table 挂 Mapper 实体，同名不同 kind 不相连，链断在 method）。
+
+### Changed
+
+- **relay_kinds 扩充**：加入 `Declares`/`Exposes`，relay_edge_type 补映射（`Declares`→declares，
+  `Exposes`→peer HttpEndpoint=http_out / peer SpringBean=exposes）。relay 对 class 现展示其
+  方法成员，对 method 展示其暴露的端点。
+
+### Fixed
+
+- **extract panic 容错**：scan 提取单文件 panic（畸形 AST/越界）现 catch_unwind 捕获，跳过
+  该文件并记 stderr，其余文件继续——不再因一个坏文件让整个 scan 崩溃（对应 mes/mos 在
+  parsing 末尾整体退出的场景）。
+- **BaseMapperPlus Mapper 识别**：MP_MAPPER regex 仅匹配 `BaseMapper<T>`，遗漏 ruoyi 等自研
+  `BaseMapperPlus<T, V>`（双泛型），致全库 0 个 Mapper entity（Mapper→Table 链全断）。
+  现兼容两者（取首个泛型为实体类型）。ruoyi 修复后 30 个 Mapper entity 落地。
+
 ## [0.1.17] - 2026-07-28
 
 ### Added

@@ -107,7 +107,7 @@ fn edge_schema() -> Value {
                     "contains", "declares", "calls", "exposes", "sends_http_request",
                     "matches_endpoint", "has_response_field", "serialized_from", "mapped_from",
                     "binds_to_statement", "executes_sql", "reads_table", "writes_table",
-                    "reads_column", "writes_column", "depends_on", "submodule_of"
+                    "reads_column", "writes_column", "depends_on", "injects", "submodule_of"
                 ]
             },
             "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
@@ -147,6 +147,11 @@ fn tool_specs() -> Vec<ToolSpec> {
                 "type": "boolean",
                 "default": false,
                 "description": "When true, return full entities (metadata + evidence[] with reason strings). Default false returns a compact {id, kind, name, qualified_name, evidence_count} view so a wide match stays small; pass verbose=true only for the few items you want to inspect."
+            },
+            "kind": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Restrict matches to these entity kinds, e.g. [\"class\",\"method\"] or [\"spring_bean\"]. Default: any kind. Use to filter out field/column noise when a wide identifier (an enterprise ID that names many fields of a Req/Resp class) otherwise matches dozens of low-value entities."
             }
         },
         "required": ["query"]
@@ -193,11 +198,11 @@ fn tool_specs() -> Vec<ToolSpec> {
                         "contains", "declares", "calls", "exposes", "sends_http_request",
                         "matches_endpoint", "has_response_field", "serialized_from", "mapped_from",
                         "binds_to_statement", "executes_sql", "reads_table", "writes_table",
-                        "reads_column", "writes_column", "depends_on", "submodule_of"
+                        "reads_column", "writes_column", "depends_on", "injects", "submodule_of"
                     ]
                 },
-                "default": ["calls"],
-                "description": "Edge kinds to follow. Defaults to [\"calls\"] for a call chain; pass e.g. [\"depends_on\"] or [\"reads_table\",\"writes_table\"] to trace other dependency types."
+                "default": ["calls", "injects"],
+                "description": "Edge kinds to follow. Defaults to [\"calls\", \"injects\"] so a call chain includes Spring bean injection (@Autowired/@Resource) — the dominant cross-file link in Java business code, since cross-file method calls are inferred from injected types. Pass e.g. [\"depends_on\"] for table deps or [\"reads_table\",\"writes_table\"] for data flow."
             },
             "min_confidence": {
                 "type": "number",
@@ -334,13 +339,13 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "trace_callers",
-            description: "Trace who calls an entity (inbound edges). Defaults to the `calls` edge for a call chain; set edge_kinds to follow other dependencies (depends_on, reads_table, ...). Resolves the start point by exact entity name, then BFS inward up to `depth`.",
+            description: "Trace who calls an entity (inbound edges). Defaults to `calls` + `injects` so the chain covers both method calls and Spring bean injection (@Autowired) — the dominant cross-file link in Java business code. Resolves the start point by exact entity name, then BFS inward up to `depth`. Cross-file calls/injections are low-confidence inferences; use verify_edge to ground a `tentative` edge in source before trusting it. Set edge_kinds to follow other dependencies (depends_on, reads_table, ...).",
             input_schema: trace_input.clone(),
             output_schema: trace_output.clone(),
         },
         ToolSpec {
             name: "trace_callees",
-            description: "Trace what an entity calls (outbound edges). Defaults to the `calls` edge for a call chain; set edge_kinds to follow other dependencies (depends_on, reads_table, ...). Resolves the start point by exact entity name, then BFS outward up to `depth`.",
+            description: "Trace what an entity calls (outbound edges). Defaults to `calls` + `injects` so the chain covers both method calls and Spring bean injection (@Autowired) — the dominant cross-file link in Java business code. Resolves the start point by exact entity name, then BFS outward up to `depth`. Cross-file calls/injections are low-confidence inferences; use verify_edge to ground a `tentative` edge in source before trusting it. Set edge_kinds to follow other dependencies (depends_on, reads_table, ...).",
             input_schema: trace_input,
             output_schema: trace_output,
         },
@@ -880,7 +885,11 @@ fn run_search(
     let limit = parse_limit(arguments);
     let offset = parse_offset(arguments);
     let verbose = arguments["verbose"].as_bool().unwrap_or(false);
-    let (entities, count, has_more) = search_with_filter(store, query, limit, offset, filter)?;
+    // 外部硬编码 filter(find_endpoint 的 endpoint kinds)优先;否则读调用方传入的 `kind`,
+    // 让 search_entities 能按 kind 过滤,切掉宽标识符(如企业交易码)命中的 field/column 噪声。
+    let parsed_kinds = parse_entity_kinds(arguments)?;
+    let (entities, count, has_more) =
+        search_with_filter(store, query, limit, offset, filter.or(parsed_kinds.as_deref()))?;
     let items: Vec<Value> = entities
         .iter()
         .map(|entity| entity_to_json(entity, verbose))
@@ -892,6 +901,24 @@ fn run_search(
         "offset": offset,
         "has_more": has_more,
     }))
+}
+
+/// 解析 `kind` 参数(单个 string 或数组)为 EntityKind 列表;None = 不过滤。复用 EntityKind
+/// 的 serde(rename_all="snake_case"),接受 "class"/"method"/"spring_bean" 等 snake_case 名。
+fn parse_entity_kinds(arguments: &Value) -> Result<Option<Vec<EntityKind>>> {
+    match &arguments["kind"] {
+        Value::Null => Ok(None),
+        Value::String(_) => Ok(Some(vec![serde_json::from_value(arguments["kind"].clone())?])),
+        Value::Array(items) => Ok(Some(
+            items
+                .iter()
+                .map(|item| serde_json::from_value::<EntityKind>(item.clone()))
+                .collect::<Result<_, _>>()?,
+        )),
+        other => anyhow::bail!(
+            "`kind` must be a string or array of entity-kind names (e.g. \"class\"), got {other}"
+        ),
+    }
 }
 
 /// Serialize an entity for search results.
@@ -930,7 +957,7 @@ fn parse_depth(arguments: &Value, default: usize) -> usize {
 /// containment or table-read edges; an explicit array overrides it.
 fn parse_edge_kinds(arguments: &Value) -> Result<Vec<EdgeKind>> {
     match &arguments["edge_kinds"] {
-        Value::Null => Ok(vec![EdgeKind::Calls]),
+        Value::Null => Ok(vec![EdgeKind::Calls, EdgeKind::Injects]),
         value => Ok(serde_json::from_value(value.clone())?),
     }
 }
@@ -989,11 +1016,20 @@ fn trace_graph(
     min_confidence: f32,
 ) -> Result<Value> {
     let matches = store.search(SearchQuery::new(name).with_limit(DEFAULT_SEARCH_LIMIT))?;
-    let starts: Vec<Entity> = matches
-        .into_iter()
-        .map(|matched| matched.entity)
-        .filter(|entity| entity.name == name)
+    let matched: Vec<Entity> = matches.into_iter().map(|m| m.entity).collect();
+    // 优先按 qualified_name 精确解析,让调用方能消歧同名实体(mos 的 S27204 入口 vs mes 的
+    // S27204 处理器);无 qn 精确命中再回退到 name 精确匹配。
+    let mut starts: Vec<Entity> = matched
+        .iter()
+        .filter(|entity| entity.qualified_name == name)
+        .cloned()
         .collect();
+    if starts.is_empty() {
+        starts = matched
+            .into_iter()
+            .filter(|entity| entity.name == name)
+            .collect();
+    }
     if starts.is_empty() {
         return Ok(json!({
             "items": [],
@@ -1052,12 +1088,55 @@ fn trace_graph(
         .map(edge_view)
         .filter(|view| view["confidence"].as_f64().unwrap_or(1.0) >= min_confidence as f64)
         .collect();
-    Ok(json!({
+    let edges_empty = edge_views.is_empty();
+    let direction = if outbound {
+        "outbound (callees)"
+    } else {
+        "inbound (callers)"
+    };
+    let mut result = json!({
         "items": serde_json::to_value(&items)?,
         "edges": edge_views,
         "count": items.len(),
         "start_count": starts.len(),
-    }))
+    });
+    // 多同名起点是调用链最关键的分叉点(mos 的 S27204 入口 vs mes 的 S27204 处理器)。
+    // 合并 trace 之外,显式列出每个起点的 qualified_name/kind/file,让调用方能按 qn 精确重查。
+    if starts.len() > 1 {
+        let candidates = starts
+            .iter()
+            .map(|entity| {
+                let file = entity
+                    .evidence
+                    .first()
+                    .map(|item| item.file.as_str())
+                    .unwrap_or("?");
+                format!(
+                    "  • {} [{}] @ {}",
+                    entity.qualified_name,
+                    entity.kind.as_str(),
+                    file
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        result["hint"] = json!(format!(
+            "Multiple ({n}) entities are named `{name}` — results merge all of them. These are \
+             likely different classes sharing an ID; re-run with the exact `qualified_name` to \
+             trace just one:\n{candidates}",
+            n = starts.len(),
+        ));
+    } else if edges_empty {
+        // 单起点但无边:方向性靠边的朝向体现,零边时 inbound/outbound 退化为同一份起点集。
+        result["hint"] = json!(format!(
+            "No {direction} edges of kind {kinds} reachable from the {n} start point(s). \
+             Direction is carried by edge orientation — with zero edges, inbound and outbound \
+             both reduce to the same start set. Pass edge_kinds to follow other dependency types.",
+            kinds = kinds_label(&edge_kinds),
+            n = starts.len(),
+        ));
+    }
+    Ok(result)
 }
 
 /// `verify_edge`: ground a graph edge in source code. Resolve the source entity
@@ -1162,6 +1241,9 @@ pub fn build_relay(
     let relay_kinds: Vec<EdgeKind> = vec![
         EdgeKind::Calls,
         EdgeKind::DependsOn,
+        EdgeKind::Injects,
+        EdgeKind::Declares,
+        EdgeKind::Exposes,
         EdgeKind::MatchesEndpoint,
         EdgeKind::SendsHttpRequest,
         EdgeKind::ReadsTable,
@@ -1263,10 +1345,17 @@ fn relay_edge_type(kind: EdgeKind, peer_kind: Option<EntityKind>) -> String {
         E::MatchesEndpoint | E::SendsHttpRequest => "http_out",
         E::MappedFrom => "field_propagate",
         E::Calls => "call",
+        E::Declares => "declares",
+        E::Exposes => match peer_kind {
+            // Controller 方法暴露的 HTTP 端点
+            Some(K::HttpEndpoint) => "http_out",
+            // @Bean 工厂方法暴露的 SpringBean
+            Some(K::SpringBean) => "exposes",
+            _ => "custom:needs-review",
+        },
+        E::Injects => "inject",
         E::DependsOn => match peer_kind {
-            // @Autowired/@Resource 注入字段 → SpringBean
-            Some(K::SpringBean) => "inject",
-            // 依赖表/列/库,视作读侧
+            // 依赖表/列/库(@TableName、Mapper→Table),视作读侧
             Some(K::Table | K::Column | K::Database) => "db_read",
             _ => "custom:needs-review",
         },

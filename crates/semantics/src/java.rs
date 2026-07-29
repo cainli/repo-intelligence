@@ -31,6 +31,15 @@ static METHOD_MAPPING: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"@(Get|Post|Put|Delete|Patch)Mapping\(\s*"([^"]*)"\s*\)"#).unwrap()
 });
 static STRING_LITERAL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""([^"]*)""#).unwrap());
+// class Name(可选泛型/extends)implements Iface1<Gen>, Iface2 { ... —— 组1=类名,
+// 组2=接口列表(含泛型,到 class body 的 {)。跨行靠 [^{] 匹配换行(否定字符类含 \n)。
+// 用 regex 而非 tree-sitter:implements 子句节点结构随 grammar 版本不稳,正则最可靠。
+static JAVA_IMPLEMENTS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\bclass\s+([A-Za-z_]\w*)[^{]*?\bimplements\s+([^<{]+(?:<[^>]*>)?(?:\s*,\s*[^<{]+(?:<[^>]*>)?)*)",
+    )
+    .unwrap()
+});
 
 // ---- MyBatis Plus 持久层(MP 3.5.7 主力 ORM:注解实体 + BaseMapper + Wrapper) ----
 // 注解-声明关联用 offset 配对(见 extract_mybatis_plus),不走 AST,避免 grammar 改动。
@@ -44,8 +53,10 @@ static MP_TABLE_ID_VAL: LazyLock<Regex> =
 static MP_NON_EXISTENT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"@TableField\s*\([^)]*exist\s*=\s*false").unwrap());
 static MP_MAPPER: LazyLock<Regex> = LazyLock::new(|| {
+    // 兼容 MyBatis Plus BaseMapper<T> 与 ruoyi 等自研增强 BaseMapperPlus<T, V>
+    // (取首个泛型为实体类型 T;第二个 V 是 VO,忽略)。不锚定闭合 >,以容忍双泛型。
     Regex::new(
-        r"\binterface\s+([A-Za-z_]\w*)\s*(?:extends|,)\s*BaseMapper\s*<\s*([A-Za-z_]\w*)\s*>",
+        r"\binterface\s+([A-Za-z_]\w*)\s*(?:extends|,)\s*BaseMapper(?:Plus)?\s*<\s*([A-Za-z_]\w*)",
     )
     .unwrap()
 });
@@ -96,6 +107,8 @@ fn extract_java(
     let mut signals: HashMap<String, SpringSignals> = HashMap::new();
     let mut methods: HashMap<String, EntityId> = HashMap::new();
     let mut invocations: Vec<(String, String, u32)> = Vec::new();
+    // 每个 method 的 (name 节点 offset, id),供 endpoint 注解 offset 配对到所在 method。
+    let mut method_spans: Vec<(usize, EntityId)> = Vec::new();
     if let Some(tree) = parsed.tree.as_ref() {
         visit_spring(
             tree.root_node(),
@@ -115,6 +128,7 @@ fn extract_java(
             edges,
             &mut methods,
             &mut invocations,
+            &mut method_spans,
             None,
         );
     }
@@ -134,6 +148,30 @@ fn extract_java(
                 ),
             );
         }
+    }
+    // 把调用意图存入 method 实体 metadata.invokes,供 resolve_cross_stack 跨文件解析
+    // (Controller→Service 这类跨文件调用 = 注入依赖类型 + 方法名匹配)。按 caller short
+    // name 分组回填;文件内方法名通常唯一,重名时后者覆盖前者。
+    let mut invokes_by_caller: HashMap<&str, Vec<serde_json::Value>> = HashMap::new();
+    for (caller, callee, line) in &invocations {
+        invokes_by_caller
+            .entry(caller.as_str())
+            .or_default()
+            .push(json!({"name": callee, "line": line}));
+    }
+    for entity in entities.iter_mut() {
+        if entity.kind != EntityKind::Method {
+            continue;
+        }
+        let Some(calls) = invokes_by_caller.get(entity.name.as_str()) else {
+            continue;
+        };
+        let mut meta = match entity.metadata.clone() {
+            serde_json::Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        meta.insert("invokes".into(), serde_json::Value::Array(calls.clone()));
+        entity.metadata = serde_json::Value::Object(meta);
     }
     for capture in JAVA_CLASS.captures_iter(&file.content) {
         let name = capture.get(2).unwrap();
@@ -194,6 +232,8 @@ fn extract_java(
         .captures(&file.content)
         .map(|capture| capture[1].to_string())
         .unwrap_or_default();
+    // method_spans 按 offset 排序,供 endpoint 注解 offset 配对到所在 method。
+    method_spans.sort_by_key(|(offset, _)| *offset);
     for capture in METHOD_MAPPING.captures_iter(&file.content) {
         let matched = capture.get(0).unwrap();
         let method = capture[1].to_uppercase();
@@ -208,10 +248,32 @@ fn extract_java(
         )
         .with_metadata(json!({"method": method, "path": endpoint_path}))
         .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "Spring mapping annotation");
+        let endpoint_id = entity.id.clone();
         add_contained(file, path, entity, line, entities, edges);
+        // method→endpoint(Exposes):mapping 注解贴在方法声明前,配对"注解 offset 之后
+        // 最近的 method",让 find_endpoint/relay 能从 URL 追到处理方法。
+        let ann_offset = matched.start();
+        if let Some((_, method_id)) = method_spans
+            .iter()
+            .filter(|(offset, _)| *offset > ann_offset)
+            .min_by_key(|(offset, _)| *offset)
+        {
+            edges.push(
+                Edge::new(method_id.clone(), endpoint_id, EdgeKind::Exposes).with_evidence(
+                    path,
+                    line,
+                    line,
+                    EvidenceClass::Fact,
+                    1.0,
+                    "controller method exposes HTTP endpoint",
+                ),
+            );
+        }
     }
     extract_custom_endpoints(file, path, entities, edges, config);
     extract_mybatis_plus(file, path, entities, edges);
+    extract_implements(file, entities);
+    extract_interface_endpoints(file, path, entities, edges, config);
     Ok(())
 }
 
@@ -578,6 +640,118 @@ fn extract_mybatis_plus(
     }
 }
 
+/// implements 关系提取:把 class 实现的接口名列表存入 class 实体 metadata.implements。
+/// EntityId 是 path-scoped(每文件独立命名空间),class 在本文件、interface 实体在定义
+/// 文件,extract 层建不了跨文件边(id 不匹配)。故只传递接口名,由 resolve_cross_stack
+/// 按全局 interface 实体名解析建边(与跨文件 Mapper→Table 同模式)。
+fn extract_implements(file: &SourceFile, entities: &mut [Entity]) {
+    let content = &file.content;
+    let caps: Vec<(String, Vec<serde_json::Value>)> = JAVA_IMPLEMENTS
+        .captures_iter(content)
+        .filter_map(|cap| {
+            let class_name = cap[1].to_string();
+            let list = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+            let ifaces: Vec<serde_json::Value> = list
+                .split(',')
+                .filter_map(|raw| {
+                    let iface = raw.split('<').next().unwrap_or("").trim();
+                    // 合法 Java 标识符(首字母、后续字母数字下划线),过滤泛型残余如 "V>"
+                    let valid = !iface.is_empty()
+                        && iface.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+                        && iface.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                    if valid {
+                        Some(serde_json::Value::String(iface.to_string()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if ifaces.is_empty() {
+                None
+            } else {
+                Some((class_name, ifaces))
+            }
+        })
+        .collect();
+    for (class_name, ifaces) in caps {
+        for entity in entities.iter_mut() {
+            if entity.kind == EntityKind::Class && entity.name == class_name {
+                let mut meta = match entity.metadata.clone() {
+                    serde_json::Value::Object(map) => map,
+                    _ => serde_json::Map::new(),
+                };
+                meta.insert("implements".into(), serde_json::Value::Array(ifaces.clone()));
+                entity.metadata = serde_json::Value::Object(meta);
+            }
+        }
+    }
+}
+
+/// implements 约定接口(ApiHandler/IBizProcess 等)的类视为自研 RPC 入口,补一个 HttpEndpoint
+/// 实体(name=类名,即交易码/业务码),让 find_endpoint 能命中——mes/mos 的 RMB 入口普遍用
+/// `@MosApi + implements ApiHandler` 这套自定义框架,纯注解识别覆盖不到。metadata.implements
+/// 已由 extract_implements 填(接口名去泛型),故须在其后调用。
+fn extract_interface_endpoints(
+    file: &SourceFile,
+    path: &str,
+    entities: &mut Vec<Entity>,
+    edges: &mut Vec<Edge>,
+    config: &SemanticsConfig,
+) {
+    let interfaces: &[String] = &config.custom_endpoint_interfaces;
+    if interfaces.is_empty() {
+        return;
+    }
+    // 先收集命中类,避免遍历自身(建实体时会 push 进 entities)。
+    let hits: Vec<(String, u32, String)> = entities
+        .iter()
+        .filter(|entity| entity.kind == EntityKind::Class)
+        .filter_map(|entity| {
+            let impls = entity
+                .metadata
+                .get("implements")
+                .and_then(|value| value.as_array())?;
+            let iface = impls.iter().find_map(|item| {
+                let name = item.as_str()?;
+                interfaces
+                    .iter()
+                    .find(|wanted| *wanted == name)
+                    .map(|_| name.to_string())
+            })?;
+            let line = entity
+                .evidence
+                .first()
+                .map(|evidence| evidence.start_line)
+                .unwrap_or(0);
+            Some((entity.name.clone(), line, iface))
+        })
+        .collect();
+    for (class_name, line, iface) in hits {
+        let entity = Entity::new(
+            EntityId::stable(
+                "workspace",
+                path,
+                EntityKind::HttpEndpoint,
+                &class_name,
+                &format!("iface:{iface}"),
+            ),
+            EntityKind::HttpEndpoint,
+            &class_name,
+            &class_name,
+        )
+        .with_metadata(json!({"path": class_name, "framework": format!("implements {iface}")}))
+        .with_evidence(
+            path,
+            line,
+            line,
+            EvidenceClass::Inferred,
+            0.8,
+            "custom RPC entry (implements framework interface)",
+        );
+        add_contained(file, path, entity, line, entities, edges);
+    }
+}
+
 // ---- Spring Bean 依赖注入(基于 tree-sitter AST) ----
 // 正则无法把 "@Autowired 字段类型" 与所在类型可靠关联(多参数/泛型/跨行),
 // 故走 AST。当前覆盖:字段注入(@Autowired/@Resource)→DependsOn、
@@ -610,7 +784,7 @@ fn visit_spring(
         | "enum_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = node_text(source, name_node);
-                let sig = signals.entry(name).or_default();
+                let sig = signals.entry(name.clone()).or_default();
                 if has_annotation(source, node, &["Transactional"]) {
                     sig.transactional = true;
                 }
@@ -629,6 +803,46 @@ fn visit_spring(
                     }
                 }
                 sig.constructor_count = ctors;
+                // Lombok 构造器注入:@RequiredArgsConstructor(final 字段)/
+                // @AllArgsConstructor(全部字段)生成构造器,但 AST 里无显式
+                // constructor_declaration 节点,故按注解把字段类型当作注入参数,
+                // 补 DependsOn(owner→bean)。这是 Controller→Service 跨文件链的前提。
+                let owner_kind = match node.kind() {
+                    "interface_declaration" => EntityKind::Interface,
+                    _ => EntityKind::Class,
+                };
+                let all_args = has_annotation(source, node, &["AllArgsConstructor"]);
+                if all_args || has_annotation(source, node, &["RequiredArgsConstructor"]) {
+                    for bi in 0..node.named_child_count() {
+                        let Some(body) = node.named_child(bi) else { continue };
+                        for ci in 0..body.named_child_count() {
+                            let Some(member) = body.named_child(ci) else { continue };
+                            if member.kind() != "field_declaration" {
+                                continue;
+                            }
+                            if !all_args && !field_is_final(source, member) {
+                                continue;
+                            }
+                            let Some(type_node) = member.child_by_field_name("type") else {
+                                continue;
+                            };
+                            let type_name = node_text(source, type_node);
+                            if !type_name.is_empty() {
+                                link_bean(
+                                    file,
+                                    path,
+                                    &type_name,
+                                    &name,
+                                    owner_kind,
+                                    EdgeKind::Injects,
+                                    member,
+                                    entities,
+                                    edges,
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
         "constructor_declaration" => {
@@ -646,7 +860,7 @@ fn visit_spring(
                                 &param_type,
                                 &owner_name,
                                 owner_kind,
-                                EdgeKind::DependsOn,
+                                EdgeKind::Injects,
                                 node,
                                 entities,
                                 edges,
@@ -693,7 +907,7 @@ fn visit_spring(
                     &type_name,
                     &owner_name,
                     owner_kind,
-                    EdgeKind::DependsOn,
+                    EdgeKind::Injects,
                     node,
                     entities,
                     edges,
@@ -721,6 +935,7 @@ fn visit_methods(
     edges: &mut Vec<Edge>,
     methods: &mut HashMap<String, EntityId>,
     invocations: &mut Vec<(String, String, u32)>,
+    method_spans: &mut Vec<(usize, EntityId)>,
     current_method: Option<&str>,
 ) {
     if node.kind() == "method_declaration"
@@ -737,7 +952,23 @@ fn visit_methods(
         .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "Java method declaration");
         let id = entity.id.clone();
         add_contained(file, path, entity, line, entities, edges);
-        methods.insert(name.clone(), id);
+        methods.insert(name.clone(), id.clone());
+        // Class→Method 层级边(Declares):让 relay/impact 从类型到达其方法。
+        // owner id 与 extract_java 的 class/interface entity 对齐(stable path+kind+name)。
+        if let Some((owner_name, owner_kind)) = enclosing_type(source, node) {
+            let owner_id = EntityId::stable("workspace", path, owner_kind, &owner_name, "");
+            edges.push(
+                Edge::new(owner_id, id.clone(), EdgeKind::Declares).with_evidence(
+                    path,
+                    line,
+                    line,
+                    EvidenceClass::Fact,
+                    1.0,
+                    "method declared by type",
+                ),
+            );
+        }
+        method_spans.push((name_node.start_byte(), id));
         for i in 0..node.named_child_count() {
             if let Some(child) = node.named_child(i) {
                 visit_methods(
@@ -749,6 +980,7 @@ fn visit_methods(
                     edges,
                     methods,
                     invocations,
+                    method_spans,
                     Some(&name),
                 );
             }
@@ -779,6 +1011,7 @@ fn visit_methods(
                 edges,
                 methods,
                 invocations,
+                method_spans,
                 current_method,
             );
         }
@@ -859,6 +1092,22 @@ fn injected_field_type(source: &[u8], node: Node<'_>) -> Option<String> {
         .map(|t| node_text(source, t))
 }
 
+/// 字段是否带 `final` 修饰符(Lombok @RequiredArgsConstructor 只注入 final 字段)。
+/// 取 field_declaration 的 modifiers 子节点文本,按空白切分匹配 `final` 关键字;
+/// 注解参数里即便出现 final 字样也不会作为独立 token,故不会误判。
+fn field_is_final(source: &[u8], field_node: Node<'_>) -> bool {
+    for i in 0..field_node.named_child_count() {
+        if let Some(child) = field_node.named_child(i)
+            && child.kind() == "modifiers"
+        {
+            return node_text(source, child)
+                .split_whitespace()
+                .any(|token| token == "final");
+        }
+    }
+    false
+}
+
 /// 构造器的参数类型列表(formal_parameters → formal_parameter.type)。
 fn constructor_param_types(source: &[u8], node: Node<'_>) -> Vec<String> {
     let mut types = Vec::new();
@@ -901,7 +1150,7 @@ fn link_bean(
     .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "Spring bean (DI target)");
     let owner_id = EntityId::stable("workspace", path, owner_kind, owner_name, "");
     let reason = match relation {
-        EdgeKind::DependsOn => "field injection (@Autowired/@Resource)",
+        EdgeKind::Injects => "constructor/field injection (@Autowired/@Resource/Lombok)",
         EdgeKind::Exposes => "@Bean factory method",
         _ => "Spring bean relation",
     };

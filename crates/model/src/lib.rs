@@ -209,6 +209,7 @@ pub enum EdgeKind {
     ReadsColumn,
     WritesColumn,
     DependsOn,
+    Injects,
     SubmoduleOf,
 }
 
@@ -231,6 +232,7 @@ impl EdgeKind {
             Self::ReadsColumn => "reads_column",
             Self::WritesColumn => "writes_column",
             Self::DependsOn => "depends_on",
+            Self::Injects => "injects",
             Self::SubmoduleOf => "submodule_of",
         }
     }

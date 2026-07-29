@@ -538,6 +538,51 @@ fn index_call_chain(database: &std::path::Path) {
         .unwrap();
 }
 
+/// Seed an injection chain S27501 --injects--> S27204 --injects--> S27000,
+/// mirroring the mes/mos @Autowired scenario behind the S27204 feedback:
+/// cross-file links are Spring bean injection, so the default trace filter must
+/// follow `injects` to recover the chain (and keep inbound ≠ outbound).
+fn index_injection_chain(database: &std::path::Path) {
+    let mut store = SqliteGraphStore::open(database).unwrap();
+    let make = |name: &str| {
+        Entity::new(
+            EntityId::stable("repo", name, EntityKind::Class, name, ""),
+            EntityKind::Class,
+            name,
+            format!("mes.{name}"),
+        )
+    };
+    let s27501 = make("S27501");
+    let s27204 = make("S27204");
+    let s27000 = make("S27000");
+    let edges = vec![
+        Edge::new(s27501.id.clone(), s27204.id.clone(), EdgeKind::Injects),
+        Edge::new(s27204.id.clone(), s27000.id.clone(), EdgeKind::Injects),
+    ];
+    store
+        .apply_patch(GraphPatch::add(vec![s27501, s27204, s27000], edges))
+        .unwrap();
+}
+
+/// Seed two same-named classes (mos entry vs mes handler) sharing the ID
+/// `S27204`, mirroring the disambiguation scenario from the feedback.
+fn index_ambiguous_name(database: &std::path::Path) {
+    let mut store = SqliteGraphStore::open(database).unwrap();
+    let make = |qn: &str, disc: &str| {
+        Entity::new(
+            EntityId::stable("repo", "S27204", EntityKind::Class, "S27204", disc),
+            EntityKind::Class,
+            "S27204",
+            qn,
+        )
+    };
+    let mos = make("mos.rmb.api.S27204", "mos");
+    let mes = make("mes.process.S27204", "mes");
+    store
+        .apply_patch(GraphPatch::add(vec![mos, mes], vec![]))
+        .unwrap();
+}
+
 /// Drive a single `tools/call` and return its `structuredContent`.
 fn call_tool(
     database: &std::path::Path,
@@ -656,6 +701,112 @@ fn trace_follows_a_non_default_edge_kind() {
 }
 
 #[test]
+fn trace_follows_injects_edges_by_default() {
+    // 回归 mes/mos S27204 反馈:跨文件链接是 @Autowired 注入(Injects 边),默认 trace
+    // 必须跟随,否则注入链缺失、inbound/outbound 退化为同一份起点集(P0-1/P0-2 同根)。
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    index_injection_chain(&database);
+
+    // trace_callers(S27204):inbound —— 谁注入了 S27204 → S27501。
+    let callers = call_tool(
+        &database,
+        "trace_callers",
+        serde_json::json!({"name": "S27204"}),
+    );
+    let caller_names = entity_names(&callers);
+    assert!(
+        caller_names.contains(&"S27501".to_owned()),
+        "injecting owner must be reachable as a caller: {callers}"
+    );
+    assert!(
+        !caller_names.contains(&"S27000".to_owned()),
+        "outbound injection target must not appear in callers: {callers}"
+    );
+    assert_eq!(callers["edges"].as_array().unwrap().len(), 1);
+    assert_eq!(callers["edges"][0]["kind"], "injects");
+
+    // trace_callees(S27204):outbound —— S27204 注入了谁 → S27000。
+    let callees = call_tool(
+        &database,
+        "trace_callees",
+        serde_json::json!({"name": "S27204"}),
+    );
+    let callee_names = entity_names(&callees);
+    assert!(
+        callee_names.contains(&"S27000".to_owned()),
+        "injected bean must be reachable as a callee: {callees}"
+    );
+    assert!(
+        !callee_names.contains(&"S27501".to_owned()),
+        "inbound injecting owner must not appear in callees: {callees}"
+    );
+
+    // P0-1 核心:边存在时,两个方向的 items 必须不同(方向语义恢复)。
+    assert_ne!(
+        caller_names, callee_names,
+        "inbound and outbound must differ once edges exist: callers={caller_names:?} callees={callee_names:?}"
+    );
+}
+
+#[test]
+fn trace_disambiguates_same_name_by_qualified_name() {
+    // 回归 P0-3:同名实体(mos 入口 vs mes 处理器)合并 trace + 消歧 hint;qn 精确锁定一个。
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    index_ambiguous_name(&database);
+
+    let by_name = call_tool(
+        &database,
+        "trace_callers",
+        serde_json::json!({"name": "S27204"}),
+    );
+    assert_eq!(by_name["start_count"], 2, "both same-named starts merge: {by_name}");
+    assert!(
+        by_name["hint"].as_str().is_some(),
+        "ambiguous starts should attach a disambiguation hint: {by_name}"
+    );
+
+    let by_qn = call_tool(
+        &database,
+        "trace_callers",
+        serde_json::json!({"name": "mes.process.S27204"}),
+    );
+    assert_eq!(
+        by_qn["start_count"], 1,
+        "qualified_name should pin one start: {by_qn}"
+    );
+}
+
+#[test]
+fn search_entities_filters_by_kind() {
+    // 回归 P1-5:kind 过滤切噪声。fixture 全是 Method,kind=["class"] 应清零。
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    index_call_chain(&database);
+
+    let only_classes = call_tool(
+        &database,
+        "search_entities",
+        serde_json::json!({"query": "S27", "kind": ["class"]}),
+    );
+    assert_eq!(
+        only_classes["count"], 0,
+        "kind=class should filter out Methods: {only_classes}"
+    );
+
+    let only_methods = call_tool(
+        &database,
+        "search_entities",
+        serde_json::json!({"query": "S27", "kind": ["method"]}),
+    );
+    assert!(
+        only_methods["count"].as_u64().unwrap_or(0) >= 3,
+        "kind=method should keep all S27* methods: {only_methods}"
+    );
+}
+
+#[test]
 fn trace_respects_depth() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("graph.sqlite");
@@ -718,7 +869,7 @@ fn trace_tools_declare_typed_schemas() {
         assert_eq!(input_props["depth"]["default"], 2);
         assert_eq!(
             input_props["edge_kinds"]["default"],
-            serde_json::json!(["calls"])
+            serde_json::json!(["calls", "injects"])
         );
         assert_eq!(tool["inputSchema"]["additionalProperties"], false);
         assert_eq!(tool["outputSchema"]["type"], "object");
