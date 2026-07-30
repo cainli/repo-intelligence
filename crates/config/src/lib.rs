@@ -70,10 +70,17 @@ pub const DEFAULT_SCHEDULER_ANNOTATIONS: &[&str] = &["Scheduled", "XxlJob", "Job
 
 /// 值得索引的注解白名单（@Transactional 等业务/框架注解）。命中 → Annotation 实体 +
 /// Annotated 边。默认白名单而非全扫：全扫会让 @Override/@Autowired 等噪音边爆炸，
-/// 在 250k 实体的企业项目里不可接受。
+/// 在 250k 实体的企业项目里不可接受。覆盖：事务/异步/缓存/事件、持久层标识（JPA/MyBatis）、
+/// 装配条件/环境（开关/profile 语义）。Lombok（@Slf4j/@Data）等泛滥且语义低的不纳入；
+/// annotation_blacklist 兜底过滤误命中噪音。
 pub const DEFAULT_ANNOTATION_WHITELIST: &[&str] = &[
-    "Transactional", "Async", "Cacheable", "CacheEvict", "EventListener",
+    // 事务 / 异步 / 缓存 / 事件 —— 业务行为注解，查询价值高。
+    "Transactional", "Async", "Cacheable", "CacheEvict", "CachePut", "EventListener",
     "PostConstruct", "PreDestroy", "TransactionalEventListener", "Aspect",
+    // 持久层标识（JPA/MyBatis）—— 让"@Entity 标注的类""@Mapper 接口"可查。
+    "Entity", "Table", "Mapper", "Repository",
+    // Spring Boot 装配条件 / 环境 —— 开关与 profile 语义，影响面分析价值高。
+    "ConditionalOnProperty", "Profile",
 ];
 
 /// 注解黑名单（即便被白名单规则意外命中也绝不索引的噪音）。

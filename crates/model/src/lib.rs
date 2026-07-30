@@ -229,6 +229,10 @@ pub enum EdgeKind {
     Implements,
     /// job -[Schedules]-> handler:调度入口触发的方法(Fact,注解贴在方法前)。
     Schedules,
+    /// superclass -[SuperclassOf]-> subclass:类继承(Fact,跨文件按名解析)。outbound 方向
+    /// 让 trace 从超类(含 abstract 抽象基类)下钻到具体子类——业务逻辑常在子类,abstract
+    /// 类自身方法不直接调 Dao,需经此边追到子类的表依赖。
+    SuperclassOf,
 }
 
 impl EdgeKind {
@@ -257,6 +261,7 @@ impl EdgeKind {
             Self::Tests => "tests",
             Self::Implements => "implements",
             Self::Schedules => "schedules",
+            Self::SuperclassOf => "superclass_of",
         }
     }
 }

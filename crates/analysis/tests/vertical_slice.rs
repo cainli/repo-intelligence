@@ -1341,3 +1341,356 @@ fn frontend_constant_url_call() {
         .entity;
     assert!(call.name.contains("/api/x"), "name={}", call.name);
 }
+
+#[test]
+fn cross_file_static_call_on_named_type() {
+    // Step A:JsonUtil.stringify(x) —— receiver 为类型名 JsonUtil → 跨文件 Calls 连到
+    // JsonUtil.stringify(0.7)。注入型匹配覆盖不到静态工具调用,这是 classify_receiver 新增能力。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("OrderService.java"),
+        r#"
+        class OrderService {
+          void m(Object x) { String s = JsonUtil.stringify(x); }
+        }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("JsonUtil.java"),
+        r#"
+        class JsonUtil {
+          static String stringify(Object o) { return String.valueOf(o); }
+        }
+        "#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    let m = store
+        .search(SearchQuery::new("m").with_limit(100))
+        .unwrap()
+        .into_iter()
+        .find(|x| x.entity.kind == EntityKind::Method && x.entity.name == "m")
+        .expect("method m");
+    let chain = store
+        .traverse(
+            TraverseQuery::outbound(m.entity.id.clone())
+                .with_kinds(vec![EdgeKind::Calls]),
+        )
+        .unwrap();
+    let names: Vec<&str> = chain.entities.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names.contains(&"stringify"),
+        "静态调用 JsonUtil.stringify 应跨文件连上, got {names:?}"
+    );
+}
+
+#[test]
+fn chain_and_new_receivers_do_not_create_cross_file_calls() {
+    // Step A 安全降级:new Builder().build()(object_creation_expression)、
+    // getCache().put()(method_invocation 链式)接收者无法可靠解析 → 不建跨文件边。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("Svc.java"),
+        r#"
+        class Svc {
+          void m() {
+            new Builder().build();
+            getCache().put();
+          }
+        }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("Builder.java"),
+        r#"class Builder { void build() {} }"#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    let m = store
+        .search(SearchQuery::new("m").with_limit(100))
+        .unwrap()
+        .into_iter()
+        .find(|x| x.entity.kind == EntityKind::Method && x.entity.name == "m")
+        .expect("method m");
+    let chain = store
+        .traverse(
+            TraverseQuery::outbound(m.entity.id.clone())
+                .with_kinds(vec![EdgeKind::Calls]),
+        )
+        .unwrap();
+    let names: Vec<&str> = chain.entities.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        !names.contains(&"build"),
+        "new Builder().build() 不应跨文件连上, got {names:?}"
+    );
+    assert!(
+        !names.contains(&"put"),
+        "getCache().put() 不应跨文件连上, got {names:?}"
+    );
+}
+
+#[test]
+fn injected_field_call_reaches_injected_type_method() {
+    // Step B 基本场景:OrderController 构造器注入 service(OrderService),this.service.getOrder()
+    // → OrderService.getOrder(字段名 service 经 injected_fields 精确解析到注入类型)。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("OrderController.java"),
+        r#"
+        class OrderController {
+          private final OrderService service;
+          OrderController(OrderService service) { this.service = service; }
+          Object get() { return this.service.getOrder(); }
+        }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("OrderService.java"),
+        r#"class OrderService { Object getOrder() { return null; } }"#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    let get = store
+        .search(SearchQuery::new("get").with_limit(100))
+        .unwrap()
+        .into_iter()
+        .find(|x| x.entity.kind == EntityKind::Method && x.entity.name == "get")
+        .expect("method get");
+    let chain = store
+        .traverse(
+            TraverseQuery::outbound(get.entity.id.clone()).with_kinds(vec![EdgeKind::Calls]),
+        )
+        .unwrap();
+    let names: Vec<&str> = chain.entities.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names.contains(&"getOrder"),
+        "this.service.getOrder 应跨文件连上, got {names:?}"
+    );
+}
+
+#[test]
+fn injected_field_call_disambiguates_same_named_methods() {
+    // Step B 歧义消歧:Ctrl 注入 a(ServiceA)、b(ServiceB),两者都有 save()。
+    // this.a.save() → ServiceA.save,this.b.save() → ServiceB.save。旧逻辑无字段名,
+    // 多 type 同名方法 hits.len()==2 被一票否决全丢;字段名精确锁定后两条边都建上。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("Ctrl.java"),
+        r#"
+        class Ctrl {
+          private final ServiceA a;
+          private final ServiceB b;
+          Ctrl(ServiceA a, ServiceB b) { this.a = a; this.b = b; }
+          void go() { this.a.save(); this.b.save(); }
+        }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("ServiceA.java"),
+        r#"class ServiceA { void save() {} }"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("ServiceB.java"),
+        r#"class ServiceB { void save() {} }"#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    let go = store
+        .search(SearchQuery::new("go").with_limit(100))
+        .unwrap()
+        .into_iter()
+        .find(|x| x.entity.kind == EntityKind::Method && x.entity.name == "go")
+        .expect("method go");
+    let chain = store
+        .traverse(
+            TraverseQuery::outbound(go.entity.id.clone())
+                .with_depth(2)
+                .with_kinds(vec![EdgeKind::Calls]),
+        )
+        .unwrap();
+    let save_count = chain.entities.iter().filter(|e| e.name == "save").count();
+    assert!(
+        save_count >= 2,
+        "注入字段应分别连上 ServiceA.save 与 ServiceB.save, got {save_count} 个 save"
+    );
+}
+
+#[test]
+fn injected_field_call_without_explicit_this_resolves_via_field() {
+    // Java 主流写法:省略 this 的 service.foo()(receiver=identifier → name kind)。
+    // name 优先当注入字段试,精确解析到注入类型 0.7(覆盖绝大多数注入调用,不止显式 this)。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("OrderController.java"),
+        r#"
+        class OrderController {
+          private final OrderService service;
+          OrderController(OrderService service) { this.service = service; }
+          Object get() { return service.getOrder(); }
+        }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("OrderService.java"),
+        r#"class OrderService { Object getOrder() { return null; } }"#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    let get = store
+        .search(SearchQuery::new("get").with_limit(100))
+        .unwrap()
+        .into_iter()
+        .find(|x| x.entity.kind == EntityKind::Method && x.entity.name == "get")
+        .expect("method get");
+    let chain = store
+        .traverse(
+            TraverseQuery::outbound(get.entity.id.clone()).with_kinds(vec![EdgeKind::Calls]),
+        )
+        .unwrap();
+    let names: Vec<&str> = chain.entities.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names.contains(&"getOrder"),
+        "service.getOrder()(省略 this)应经字段解析连上, got {names:?}"
+    );
+}
+
+#[test]
+fn native_mybatis_binds_method_to_statement_to_table() {
+    // 原生 MyBatis(无 @TableName/BaseMapper):Dao 接口方法经 namespace + id 绑定到
+    // Mapper.xml 的 statement,statement→ReadsTable/WritesTable→table。补 BindsToStatement
+    // 边前,method↔statement 断链,trace 到 table 必 0 命中(MES/MOS 场景)。
+    // namespace 后缀匹配 interface 的物理 path,故需搭出 Maven 包目录结构。
+    let dir = tempfile::tempdir().unwrap();
+    let pkg = dir.path().join("src/main/java/com/example/dao");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(
+        pkg.join("UserDao.java"),
+        r#"package com.example.dao;
+        public interface UserDao {
+          Object findById(Long id);
+          int insert(Object u);
+        }"#,
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("src/main/resources/mapper")).unwrap();
+    fs::write(
+        dir.path().join("src/main/resources/mapper/UserDao.xml"),
+        r#"<mapper namespace="com.example.dao.UserDao">
+        <select id="findById" resultType="User">
+          SELECT id, name FROM t_user WHERE id = #{id}
+        </select>
+        <insert id="insert">
+          INSERT INTO t_user (id, name) VALUES (#{id}, #{name})
+        </insert>
+        </mapper>"#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+
+    // findById method 经 BindsToStatement 直达 statement,再 ReadsTable 到 t_user。
+    let find_method = store
+        .search(SearchQuery::new("findById").with_limit(20))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::Method)
+        .expect("UserDao.findById method")
+        .entity;
+    let chain = store
+        .traverse(
+            TraverseQuery::outbound(find_method.id)
+                .with_depth(3)
+                .with_kinds(vec![EdgeKind::BindsToStatement, EdgeKind::ReadsTable]),
+        )
+        .unwrap();
+    assert!(
+        chain
+            .entities
+            .iter()
+            .any(|e| e.kind == EntityKind::XmlStatement && e.name == "findById"),
+        "findById method 应 BindsToStatement 到 statement findById, got {:?}",
+        chain.entities
+    );
+    assert!(
+        chain
+            .entities
+            .iter()
+            .any(|e| e.kind == EntityKind::Table && e.name == "t_user"),
+        "findById → statement → ReadsTable → t_user 应连通, got {:?}",
+        chain.entities
+    );
+
+    // insert method 走 WritesTable 抵达 t_user(写侧对照)。
+    let insert_method = store
+        .search(SearchQuery::new("insert").with_limit(20))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::Method)
+        .expect("UserDao.insert method")
+        .entity;
+    let write_chain = store
+        .traverse(
+            TraverseQuery::outbound(insert_method.id)
+                .with_depth(3)
+                .with_kinds(vec![EdgeKind::BindsToStatement, EdgeKind::WritesTable]),
+        )
+        .unwrap();
+    assert!(
+        write_chain
+            .entities
+            .iter()
+            .any(|e| e.name == "t_user"),
+        "insert → statement → WritesTable → t_user 应连通, got {:?}",
+        write_chain.entities
+    );
+}
+
+#[test]
+fn superclass_of_edge_links_superclass_to_subclass() {
+    // class Concrete extends AbstractBase → SuperclassOf(AbstractBase→Concrete,outbound)。
+    // trace 从 abstract 基类出发应下钻到具体子类(业务逻辑常在子类)。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("Hier.java"),
+        r#"
+        abstract class AbstractBase {
+          void shared() {}
+        }
+        class Concrete extends AbstractBase {
+          void doWork() {}
+        }
+        "#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    let base = store
+        .search(SearchQuery::new("AbstractBase").with_limit(20))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::Class)
+        .expect("AbstractBase")
+        .entity;
+    let chain = store
+        .traverse(
+            TraverseQuery::outbound(base.id.clone())
+                .with_kinds(vec![EdgeKind::SuperclassOf]),
+        )
+        .unwrap();
+    let names: Vec<&str> = chain.entities.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names.contains(&"Concrete"),
+        "AbstractBase 经 SuperclassOf 应到 Concrete, got {names:?}"
+    );
+}

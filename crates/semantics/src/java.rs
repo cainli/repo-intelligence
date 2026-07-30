@@ -64,6 +64,15 @@ static JAVA_IMPLEMENTS: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
+// class Sub extends Super —— 组1=子类,组2=超类简单名(去泛型)。只匹配 class(非 interface),
+// 故不与 BaseMapper 的 interface extends 冲突。跨文件继承边由 resolve_cross_stack 按 superclass 名解析。
+static JAVA_EXTENDS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\bclass\s+([A-Za-z_]\w*)[^{]*?\bextends\s+([A-Za-z_]\w*)").unwrap()
+});
+// abstract class Foo —— abstract 修饰符(不论有无 extends)。存 metadata.abstract 供 trace 标注。
+static JAVA_ABSTRACT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\babstract\s+class\s+([A-Za-z_]\w*)").unwrap()
+});
 
 // ---- MyBatis Plus 持久层(MP 3.5.7 主力 ORM:注解实体 + BaseMapper + Wrapper) ----
 // 注解-声明关联用 offset 配对(见 extract_mybatis_plus),不走 AST,避免 grammar 改动。
@@ -129,8 +138,9 @@ fn extract_java(
     // 先跑 AST 遍历:产出 Bean DI 边 + 收集 Spring 信号(事务/定时),后者作为
     // metadata 挂到对应 class 实体,故必须在 class 实体创建前完成。
     let mut signals: HashMap<String, SpringSignals> = HashMap::new();
+    let mut injected_fields: HashMap<String, Vec<(String, String)>> = HashMap::new();
     let mut methods: HashMap<String, EntityId> = HashMap::new();
-    let mut invocations: Vec<(String, String, u32)> = Vec::new();
+    let mut invocations: Vec<Invocation> = Vec::new();
     // 每个 method 的 (name 节点 offset, id),供 endpoint 注解 offset 配对到所在 method。
     let mut method_spans: Vec<(usize, EntityId)> = Vec::new();
     if let Some(tree) = parsed.tree.as_ref() {
@@ -142,6 +152,7 @@ fn extract_java(
             entities,
             edges,
             &mut signals,
+            &mut injected_fields,
         );
         visit_methods(
             tree.root_node(),
@@ -157,15 +168,16 @@ fn extract_java(
         );
     }
     // 同文件 method 调用 → Calls 边(低保真:按方法名匹配,跨类同名混淆、跨文件留后续)。
-    for (caller, callee, line) in &invocations {
-        if let (Some(caller_id), Some(callee_id)) = (methods.get(caller), methods.get(callee))
+    for inv in &invocations {
+        if let (Some(caller_id), Some(callee_id)) =
+            (methods.get(&inv.caller), methods.get(&inv.callee))
             && caller_id != callee_id
         {
             edges.push(
                 Edge::new(caller_id.clone(), callee_id.clone(), EdgeKind::Calls).with_evidence(
                     path,
-                    *line,
-                    *line,
+                    inv.line,
+                    inv.line,
                     EvidenceClass::Inferred,
                     0.7,
                     "same-file method call",
@@ -177,11 +189,13 @@ fn extract_java(
     // (Controller→Service 这类跨文件调用 = 注入依赖类型 + 方法名匹配)。按 caller short
     // name 分组回填;文件内方法名通常唯一,重名时后者覆盖前者。
     let mut invokes_by_caller: HashMap<&str, Vec<serde_json::Value>> = HashMap::new();
-    for (caller, callee, line) in &invocations {
-        invokes_by_caller
-            .entry(caller.as_str())
-            .or_default()
-            .push(json!({"name": callee, "line": line}));
+    for inv in &invocations {
+        invokes_by_caller.entry(inv.caller.as_str()).or_default().push(json!({
+            "name": inv.callee,
+            "line": inv.line,
+            "receiver_kind": inv.receiver_kind,
+            "receiver": inv.receiver,
+        }));
     }
     for entity in entities.iter_mut() {
         if entity.kind != EntityKind::Method {
@@ -211,17 +225,26 @@ fn extract_java(
             name.as_str(),
             name.as_str(),
         );
+        let mut meta = serde_json::Map::new();
         if let Some(sig) = signals.get(name.as_str()) {
-            let mut meta = serde_json::Map::new();
             if sig.transactional {
                 meta.insert("transactional".into(), json!(true));
             }
             if sig.scheduled {
                 meta.insert("scheduled".into(), json!(true));
             }
-            if !meta.is_empty() {
-                entity = entity.with_metadata(serde_json::Value::Object(meta));
-            }
+        }
+        if let Some(fields) = injected_fields.get(name.as_str())
+            && !fields.is_empty()
+        {
+            let arr: Vec<serde_json::Value> = fields
+                .iter()
+                .map(|(f, t)| json!({ "name": f, "type": t }))
+                .collect();
+            meta.insert("injected_fields".into(), serde_json::Value::Array(arr));
+        }
+        if !meta.is_empty() {
+            entity = entity.with_metadata(serde_json::Value::Object(meta));
         }
         let entity = entity.with_evidence(
             path,
@@ -338,6 +361,7 @@ fn extract_java(
     extract_custom_endpoints(file, path, entities, edges, config);
     extract_mybatis_plus(file, path, entities, edges);
     extract_implements(file, entities);
+    extract_extends(file, entities);
     extract_interface_endpoints(file, path, entities, edges, config);
     extract_annotations(file, path, &method_spans, entities, edges, config);
     extract_tests(file, path, &method_spans, entities, edges);
@@ -756,6 +780,42 @@ fn extract_implements(file: &SourceFile, entities: &mut [Entity]) {
     }
 }
 
+/// extends 关系 + abstract 标记提取:存 class.metadata.superclass(超类简单名,单继承)与
+/// class.metadata.abstract(true)。跨文件继承边(SuperclassOf)由 resolve_cross_stack 按
+/// superclass 名解析,与 implements 同模式(Extract 层 EntityId path-scoped,建不了跨文件边)。
+fn extract_extends(file: &SourceFile, entities: &mut [Entity]) {
+    let content = &file.content;
+    // superclass:class Sub extends Super(单继承,去泛型)。
+    for cap in JAVA_EXTENDS.captures_iter(content) {
+        let class_name = cap[1].to_string();
+        let superclass = cap[2].to_string();
+        for entity in entities.iter_mut() {
+            if entity.kind == EntityKind::Class && entity.name == class_name {
+                let mut meta = match entity.metadata.clone() {
+                    serde_json::Value::Object(map) => map,
+                    _ => serde_json::Map::new(),
+                };
+                meta.insert("superclass".into(), serde_json::Value::String(superclass.clone()));
+                entity.metadata = serde_json::Value::Object(meta);
+            }
+        }
+    }
+    // abstract:abstract class Foo(不论有无 extends)。
+    for cap in JAVA_ABSTRACT.captures_iter(content) {
+        let class_name = cap[1].to_string();
+        for entity in entities.iter_mut() {
+            if entity.kind == EntityKind::Class && entity.name == class_name {
+                let mut meta = match entity.metadata.clone() {
+                    serde_json::Value::Object(map) => map,
+                    _ => serde_json::Map::new(),
+                };
+                meta.insert("abstract".into(), serde_json::Value::Bool(true));
+                entity.metadata = serde_json::Value::Object(meta);
+            }
+        }
+    }
+}
+
 /// implements 约定接口(ApiHandler/IBizProcess 等)的类视为自研 RPC 入口,补一个 HttpEndpoint
 /// 实体(name=类名,即交易码/业务码),让 find_endpoint 能命中——mes/mos 的 RMB 入口普遍用
 /// `@MosApi + implements ApiHandler` 这套自定义框架,纯注解识别覆盖不到。metadata.implements
@@ -859,6 +919,8 @@ fn extract_annotations(
     if whitelist.is_empty() {
         return;
     }
+    // 黑名单兜底：即便白名单（含用户自填全集替换）误命中 @Override 等噪音也跳过。
+    let blacklist: HashSet<&str> = config.annotation_blacklist.iter().map(|s| s.as_str()).collect();
     let content = &file.content;
     // owner 候选:(声明 name offset, EntityId)。class/interface、method、field 合并取最近。
     let mut owners: Vec<(usize, EntityId)> = Vec::new();
@@ -887,7 +949,7 @@ fn extract_annotations(
     owners.sort_by_key(|(offset, _)| *offset);
     for capture in AT_ANNOTATION.captures_iter(content) {
         let ann_name = capture.get(1).unwrap();
-        if !whitelist.contains(ann_name.as_str()) {
+        if !whitelist.contains(ann_name.as_str()) || blacklist.contains(ann_name.as_str()) {
             continue;
         }
         let ann_offset = capture.get(0).unwrap().start();
@@ -1121,6 +1183,9 @@ fn visit_spring(
     entities: &mut Vec<Entity>,
     edges: &mut Vec<Edge>,
     signals: &mut HashMap<String, SpringSignals>,
+    // owner class/interface 名 → [(字段名, 注入类型名)]。供 analysis 把
+    // `this.service.foo()` 的 receiver=service 精确解析到注入类型(Step B 字段消歧)。
+    injected_fields: &mut HashMap<String, Vec<(String, String)>>,
 ) {
     match node.kind() {
         "class_declaration" | "interface_declaration" | "record_declaration"
@@ -1171,6 +1236,12 @@ fn visit_spring(
                             };
                             let type_name = node_text(source, type_node);
                             if !type_name.is_empty() {
+                                if let Some(field_name) = field_declarator_name(source, member) {
+                                    injected_fields
+                                        .entry(name.clone())
+                                        .or_default()
+                                        .push((field_name, type_name.clone()));
+                                }
                                 link_bean(
                                     file,
                                     path,
@@ -1195,8 +1266,12 @@ fn visit_spring(
                     .get(&owner_name)
                     .is_some_and(|sig| sig.constructor_count == 1);
                 if has_annotation(source, node, &["Autowired"]) || single {
-                    for param_type in constructor_param_types(source, node) {
+                    for (param_name, param_type) in constructor_param_name_types(source, node) {
                         if !param_type.is_empty() {
+                            injected_fields
+                                .entry(owner_name.clone())
+                                .or_default()
+                                .push((param_name, param_type.clone()));
                             link_bean(
                                 file,
                                 path,
@@ -1244,6 +1319,12 @@ fn visit_spring(
             if let Some(type_name) = injected_field_type(source, node)
                 && let Some((owner_name, owner_kind)) = enclosing_type(source, node)
             {
+                if let Some(field_name) = field_declarator_name(source, node) {
+                    injected_fields
+                        .entry(owner_name.clone())
+                        .or_default()
+                        .push((field_name, type_name.clone()));
+                }
                 link_bean(
                     file,
                     path,
@@ -1261,12 +1342,51 @@ fn visit_spring(
     }
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
-            visit_spring(child, source, file, path, entities, edges, signals);
+            visit_spring(child, source, file, path, entities, edges, signals, injected_fields);
         }
     }
 }
 
 /// 方法级提取:method_declaration → Method 实体;method_invocation → 调用信号。
+/// 一次方法调用(caller 在方法体内调用 callee),含接收者分类以便跨文件解析。
+struct Invocation {
+    caller: String,
+    callee: String,
+    line: u32,
+    /// bare(裸名)/this/field(this.x)/name(x 或 XxxUtil)/qualified(com.x.Y)/
+    /// chain(a().b())/new(new X().b())/super。bare 与 name 走 analysis 名匹配,
+    /// field 走注入字段精确解析(后续 Step),其余跳过(控噪)。
+    receiver_kind: &'static str,
+    receiver: Option<String>,
+}
+
+/// 解析 method_invocation 的接收者(object 字段)分类。tree-sitter Java:object 可缺省
+/// (裸名)或为 this/super/identifier/field_access/method_invocation/object_creation_expression。
+/// 仅 field(this.x)/name(x) 能可靠用于跨文件解析;链式/new/FQCN 成本高且噪音大,跳过。
+fn classify_receiver(source: &[u8], inv_node: Node<'_>) -> (&'static str, Option<String>) {
+    let Some(obj) = inv_node.child_by_field_name("object") else {
+        return ("bare", None);
+    };
+    match obj.kind() {
+        "this" => ("this", None),
+        "super" => ("super", None),
+        "identifier" => ("name", Some(node_text(source, obj))),
+        "field_access" => {
+            let inner = obj.child_by_field_name("object");
+            let field = obj.child_by_field_name("field");
+            match (inner, field) {
+                (Some(i), Some(f)) if i.kind() == "this" && f.kind() == "identifier" => {
+                    ("field", Some(node_text(source, f)))
+                }
+                _ => ("qualified", Some(node_text(source, obj))),
+            }
+        }
+        "method_invocation" => ("chain", None),
+        "object_creation_expression" => ("new", None),
+        _ => ("bare", None),
+    }
+}
+
 /// caller/callee 按方法名同文件匹配(低保真:跨类同名混淆、跨文件调用留后续)。
 #[allow(clippy::too_many_arguments)]
 fn visit_methods(
@@ -1277,7 +1397,7 @@ fn visit_methods(
     entities: &mut Vec<Entity>,
     edges: &mut Vec<Edge>,
     methods: &mut HashMap<String, EntityId>,
-    invocations: &mut Vec<(String, String, u32)>,
+    invocations: &mut Vec<Invocation>,
     method_spans: &mut Vec<(usize, EntityId)>,
     current_method: Option<&str>,
 ) {
@@ -1286,13 +1406,17 @@ fn visit_methods(
     {
         let name = node_text(source, name_node);
         let line = line_of(&file.content, name_node.start_byte());
+        // 方法体结束行（闭合 `}` 所在行）；abstract/interface 无方法体时 == 声明行。
+        // 走 metadata 而非改 end_line：后者下游（analysis 跨文件边）当声明行号用。
+        let body_end_line = line_of(&file.content, node.end_byte());
         let entity = Entity::new(
             EntityId::stable("workspace", path, EntityKind::Method, &name, ""),
             EntityKind::Method,
             &name,
             format!("{path}#{name}"),
         )
-        .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "Java method declaration");
+        .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "Java method declaration")
+        .with_metadata(json!({ "body_end_line": body_end_line }));
         let id = entity.id.clone();
         add_contained(file, path, entity, line, entities, edges);
         methods.insert(name.clone(), id.clone());
@@ -1336,11 +1460,14 @@ fn visit_methods(
     {
         let callee = node_text(source, name_node);
         if !callee.is_empty() {
-            invocations.push((
-                caller.to_string(),
+            let (receiver_kind, receiver) = classify_receiver(source, node);
+            invocations.push(Invocation {
+                caller: caller.to_string(),
                 callee,
-                line_of(&file.content, node.start_byte()),
-            ));
+                line: line_of(&file.content, node.start_byte()),
+                receiver_kind,
+                receiver,
+            });
         }
     }
     for i in 0..node.named_child_count() {
@@ -1451,9 +1578,9 @@ fn field_is_final(source: &[u8], field_node: Node<'_>) -> bool {
     false
 }
 
-/// 构造器的参数类型列表(formal_parameters → formal_parameter.type)。
-fn constructor_param_types(source: &[u8], node: Node<'_>) -> Vec<String> {
-    let mut types = Vec::new();
+/// 构造器参数的 (名, 类型) 列表(formal_parameter.name + .type)。供 Step B 采注入字段名。
+fn constructor_param_name_types(source: &[u8], node: Node<'_>) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i)
             && child.kind() == "formal_parameters"
@@ -1462,13 +1589,27 @@ fn constructor_param_types(source: &[u8], node: Node<'_>) -> Vec<String> {
                 if let Some(param) = child.named_child(j)
                     && param.kind() == "formal_parameter"
                     && let Some(type_node) = param.child_by_field_name("type")
+                    && let Some(name_node) = param.child_by_field_name("name")
                 {
-                    types.push(node_text(source, type_node));
+                    pairs.push((node_text(source, name_node), node_text(source, type_node)));
                 }
             }
         }
     }
-    types
+    pairs
+}
+
+/// field_declaration 的声明名(variable_declarator.name)。供 Step B 采注入字段名。
+fn field_declarator_name(source: &[u8], field_node: Node<'_>) -> Option<String> {
+    for i in 0..field_node.named_child_count() {
+        if let Some(child) = field_node.named_child(i)
+            && child.kind() == "variable_declarator"
+            && let Some(name_node) = child.child_by_field_name("name")
+        {
+            return Some(node_text(source, name_node));
+        }
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]

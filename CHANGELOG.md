@@ -7,6 +7,47 @@
 
 ## [Unreleased]
 
+## [0.1.25] - 2026-07-30
+
+### Added
+
+- **类继承建模(SuperclassOf 边)**:补全从未建模的类继承(extends),治"从 abstract/基类
+  `trace to_kind=table` 返回 0"——业务逻辑在具体子类,基类自身不调 Dao。新增 `EdgeKind::SuperclassOf`
+  (超类→子类,outbound 让 trace 从基类自动下钻);`JAVA_EXTENDS`/`JAVA_ABSTRACT` 正则提取
+  `metadata.superclass`/`metadata.abstract`;`resolve_cross_stack` 仿 implements 建边(同名超类歧义跳过);
+  trace_graph 默认 edge_kinds + edge_schema 同步加 superclass_of。ruoyi:74 条继承边,BaseController
+  (30 子类)→ 13 table(vs 0)。
+- **跨文件 calls 扩覆盖(v0.1.23 内容,此前跳过发布)**:接收者捕获(`classify_receiver`)+
+  静态调用(0.7)+ 注入字段精确消歧(`injected_fields` metadata,消除多 type 同名方法一票否决);
+  修复 name receiver(省略 this 的 `service.foo()`)先当字段再当静态。ruoyi:静态 1193/字段 503/裸名 25。
+- **注解白名单扩展 + blacklist 修复**:补 CachePut/Entity/Table/Mapper/Repository/
+  ConditionalOnProperty/Profile;修复死配置 `annotation_blacklist`(原 extract_annotations 未读取)。
+- **method body_end_line**:visit_methods 用 `node.end_byte()` 写 `metadata.body_end_line`
+  (不动 end_line,保护下游声明行号语义)。
+- **行号顶层列**:graph entity/edge 加 `start_line`/`end_line` 冗余列 + 幂等迁移,裸 SQL 直连免 json_extract。
+
+### Changed
+
+- ruoyi-vue-plus 纳入仓库作为强制验证基准(`验证项目/`,已 gitignore);CLAUDE.md 约定
+  每次能力增强必须 rescan + 直连库对比指标,单元测试不算验证。
+
+## [0.1.24] - 2026-07-30
+
+### Added
+
+- **原生 MyBatis 追表链路打通(method→BindsToStatement→xml_statement→table)**:补全一个
+  从未被实现的断点,治 mes/mos 等纯原生 MyBatis(Dao 接口 + Mapper.xml,无 `@TableName`/
+  `BaseMapper`)项目"trace 到表必 0 命中"。根因不是 trace 方向问题,而是 `BindsToStatement`
+  边从未被任何地方建立(EdgeKind 已定义、mcp 消费端已归类,唯独生产端缺失)。本次三处联动:
+  - `xml.rs` 提取 `<mapper namespace>` 存入 `XmlStatement.metadata.namespace`(接口绑定权威键);
+  - `analysis::resolve_cross_stack` 按 MyBatis 官方绑定规则(namespace + id)配对——namespace
+    后缀匹配 interface 物理 path(不依赖 Maven source-root 约定)+ 方法名 == statement_id,建
+    `method→BindsToStatement→xml_statement`(Resolved 0.9);
+  - `mcp` 三处遍历集(`trace_full_path` 默认、`trace_table_access`、`relay_kinds`)补
+    `BindsToStatement`,否则建了边也遍历不到。
+  - MyBatis Plus(`@TableName`)路径不受影响,两条追表路并存。ruoyi-vue-plus 验证:`GenTableMapper`
+    接口端到端抵达 `gen_table` 表。
+
 ## [0.1.21] - 2026-07-30
 
 ### Added

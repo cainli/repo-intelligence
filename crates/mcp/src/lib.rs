@@ -108,7 +108,7 @@ fn edge_schema() -> Value {
                     "matches_endpoint", "has_response_field", "serialized_from", "mapped_from",
                     "binds_to_statement", "executes_sql", "reads_table", "writes_table",
                     "reads_column", "writes_column", "depends_on", "injects", "submodule_of",
-                    "annotated", "intercepts", "tests", "implements", "schedules"
+                    "annotated", "intercepts", "tests", "implements", "schedules", "superclass_of"
                 ]
             },
             "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
@@ -200,7 +200,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                         "matches_endpoint", "has_response_field", "serialized_from", "mapped_from",
                         "binds_to_statement", "executes_sql", "reads_table", "writes_table",
                         "reads_column", "writes_column", "depends_on", "injects", "submodule_of",
-                        "annotated", "intercepts", "tests", "implements", "schedules"
+                        "annotated", "intercepts", "tests", "implements", "schedules", "superclass_of"
                     ]
                 },
                 "default": ["calls", "injects"],
@@ -369,7 +369,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "trace_full_path",
-            description: "One-shot generic end-to-end BFS: resolve an entity by exact name, walk `edge_kinds` in `direction`, optionally filter results to a target `to_kind`. Defaults to a broad edge set (calls/injects/reads_table/writes_table/exposes/matches_endpoint) so one call spans front-end → HTTP → back-end → DB as far as a single direction reaches. Mixed-direction paths (e.g. endpoint → its controller via inbound exposes, then → table via outbound) need two calls — single-direction by design.",
+            description: "One-shot generic end-to-end BFS: resolve an entity by exact name, walk `edge_kinds` in `direction`, optionally filter results to a target `to_kind`. Defaults to a broad edge set (calls/injects/declares/superclass_of/binds_to_statement/reads_table/writes_table/exposes/matches_endpoint) — `declares` lets a class start reach its methods, `superclass_of` lets an abstract base class reach its concrete subclasses, so a Service class → injected Mapper method → table chain resolves in one call. One call spans front-end → HTTP → back-end → DB as far as a single direction reaches. Mixed-direction paths (e.g. endpoint → its controller via inbound exposes, then → table via outbound) need two calls — single-direction by design.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -749,7 +749,13 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
                 .as_f64()
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0) as f32;
-            let mut kinds = vec![EdgeKind::Calls, EdgeKind::Injects];
+            let mut kinds = vec![
+                EdgeKind::Calls,
+                EdgeKind::Injects,
+                // binds_to_statement:从 table inbound 追到 method 时需穿过
+                // table←ReadsTable←xml_statement←BindsToStatement←method,否则断在 statement。
+                EdgeKind::BindsToStatement,
+            ];
             match direction {
                 "read" => kinds.push(EdgeKind::ReadsTable),
                 "write" => kinds.push(EdgeKind::WritesTable),
@@ -774,6 +780,15 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
                 Value::Null => vec![
                     EdgeKind::Calls,
                     EdgeKind::Injects,
+                    // declares(owner class/interface → method):让从「类」出发的 trace 能下钻到
+                    // 方法。否则类→表/端点链路在第一跳就断(类自身无 calls 边,只有 declares 到方法)。
+                    EdgeKind::Declares,
+                    // superclass_of:让 trace 从超类(含 abstract 抽象基类)下钻到具体子类
+                    // ——业务逻辑常在子类,abstract 类自身不直接调 Dao,需经此边追到子类的表。
+                    EdgeKind::SuperclassOf,
+                    // binds_to_statement:接通原生 MyBatis 的 method→xml_statement→table
+                    // (MyBatis Plus 走 @TableName 的 reads_table,原生 MyBatis 走 statement 桥)。
+                    EdgeKind::BindsToStatement,
                     EdgeKind::ReadsTable,
                     EdgeKind::WritesTable,
                     EdgeKind::Exposes,
@@ -1047,7 +1062,7 @@ fn parse_depth(arguments: &Value, default: usize) -> usize {
 /// containment or table-read edges; an explicit array overrides it.
 fn parse_edge_kinds(arguments: &Value) -> Result<Vec<EdgeKind>> {
     match &arguments["edge_kinds"] {
-        Value::Null => Ok(vec![EdgeKind::Calls, EdgeKind::Injects]),
+        Value::Null => Ok(vec![EdgeKind::Calls, EdgeKind::Injects, EdgeKind::Declares, EdgeKind::SuperclassOf]),
         value => Ok(serde_json::from_value(value.clone())?),
     }
 }
@@ -1336,6 +1351,7 @@ pub fn build_relay(
         EdgeKind::Exposes,
         EdgeKind::MatchesEndpoint,
         EdgeKind::SendsHttpRequest,
+        EdgeKind::BindsToStatement,
         EdgeKind::ReadsTable,
         EdgeKind::WritesTable,
         EdgeKind::ReadsColumn,
@@ -1561,6 +1577,158 @@ mod tests {
         assert!(hit["match_count"].as_u64().unwrap() >= 1);
         let miss = verify_edge(&store, "Svc", "nonexistentXYZ", root).unwrap();
         assert_eq!(miss["verified"], false, "不存在的 target 未命中");
+    }
+
+    #[test]
+    fn trace_from_class_reaches_table_via_declares() {
+        // 从「类」trace 到 table 需 declares(类→method)+ calls(method→mapper)+ reads_table。
+        // 默认 edge_kinds 含 declares 后,Service 类 → 自己的 method → Mapper method → table 通。
+        // MOS 端真实盲点:此前从类 trace to_kind=table 返回 0(类无 calls 边,declares 缺失)。
+        let mut store = SqliteGraphStore::open_in_memory().unwrap();
+        let svc = Entity::new(id("svc"), EntityKind::Class, "Svc", "Svc")
+            .with_evidence("Svc.java", 1, 1, EvidenceClass::Fact, 1.0, "declared");
+        let svc_m = Entity::new(id("svc.m"), EntityKind::Method, "doWork", "Svc#doWork")
+            .with_evidence("Svc.java", 2, 2, EvidenceClass::Fact, 1.0, "declared");
+        let mapper_m = Entity::new(
+            id("mapper.m"),
+            EntityKind::Method,
+            "selectList",
+            "UserMapper#selectList",
+        )
+        .with_evidence("UserMapper.java", 3, 3, EvidenceClass::Fact, 1.0, "declared");
+        let table = Entity::new(id("t"), EntityKind::Table, "sys_user", "sys_user")
+            .with_evidence("UserMapper.xml", 4, 4, EvidenceClass::Fact, 1.0, "table");
+        let edges = vec![
+            Edge::new(id("svc"), id("svc.m"), EdgeKind::Declares)
+                .with_evidence("Svc.java", 1, 1, EvidenceClass::Fact, 1.0, "declares"),
+            Edge::new(id("svc.m"), id("mapper.m"), EdgeKind::Calls)
+                .with_evidence("Svc.java", 2, 2, EvidenceClass::Inferred, 0.7, "call"),
+            Edge::new(id("mapper.m"), id("t"), EdgeKind::ReadsTable)
+                .with_evidence("UserMapper.xml", 3, 3, EvidenceClass::Fact, 1.0, "reads"),
+        ];
+        store
+            .apply_patch(GraphPatch::add(vec![svc, svc_m, mapper_m, table], edges))
+            .unwrap();
+
+        let kinds_with = vec![
+            EdgeKind::Calls,
+            EdgeKind::Injects,
+            EdgeKind::Declares,
+            EdgeKind::ReadsTable,
+            EdgeKind::WritesTable,
+            EdgeKind::Exposes,
+            EdgeKind::MatchesEndpoint,
+        ];
+        let r1 = trace_graph(&store, "Svc", 5, kinds_with, true, 0.0).unwrap();
+        let qns1: Vec<&str> = r1["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["qualified_name"].as_str())
+            .collect();
+        assert!(
+            qns1.contains(&"sys_user"),
+            "含 declares:从 Svc 类应经 declares→calls→reads_table 到 sys_user, got {qns1:?}"
+        );
+
+        // 回归对照:不含 declares 时,从类走不到 method,到不了 table。
+        let kinds_without = vec![
+            EdgeKind::Calls,
+            EdgeKind::Injects,
+            EdgeKind::ReadsTable,
+            EdgeKind::WritesTable,
+            EdgeKind::Exposes,
+            EdgeKind::MatchesEndpoint,
+        ];
+        let r2 = trace_graph(&store, "Svc", 5, kinds_without, true, 0.0).unwrap();
+        let qns2: Vec<&str> = r2["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["qualified_name"].as_str())
+            .collect();
+        assert!(
+            !qns2.contains(&"sys_user"),
+            "不含 declares:从类应到不了 table, got {qns2:?}"
+        );
+    }
+
+    #[test]
+    fn trace_from_abstract_class_reaches_subclass_table_via_superclass_of() {
+        // 从 abstract 类 outbound:SuperclassOf(基类→子类)+ Declares(子类→method)
+        // + Calls(method→mapper)+ ReadsTable(mapper→table)。缺 superclass_of 则断在第一跳。
+        let mut store = SqliteGraphStore::open_in_memory().unwrap();
+        let base = Entity::new(id("base"), EntityKind::Class, "AbstractBase", "AbstractBase")
+            .with_evidence("Base.java", 1, 1, EvidenceClass::Fact, 1.0, "declared");
+        let sub = Entity::new(id("sub"), EntityKind::Class, "Concrete", "Concrete")
+            .with_evidence("Concrete.java", 1, 1, EvidenceClass::Fact, 1.0, "declared");
+        let sub_m = Entity::new(id("sub.m"), EntityKind::Method, "doWork", "Concrete#doWork")
+            .with_evidence("Concrete.java", 2, 2, EvidenceClass::Fact, 1.0, "declared");
+        let mapper_m = Entity::new(
+            id("mapper.m"),
+            EntityKind::Method,
+            "selectList",
+            "M#selectList",
+        )
+        .with_evidence("M.java", 3, 3, EvidenceClass::Fact, 1.0, "declared");
+        let table = Entity::new(id("t"), EntityKind::Table, "orders", "orders")
+            .with_evidence("M.xml", 4, 4, EvidenceClass::Fact, 1.0, "table");
+        let edges = vec![
+            Edge::new(id("base"), id("sub"), EdgeKind::SuperclassOf)
+                .with_evidence("Concrete.java", 1, 1, EvidenceClass::Fact, 1.0, "extends"),
+            Edge::new(id("sub"), id("sub.m"), EdgeKind::Declares)
+                .with_evidence("Concrete.java", 1, 1, EvidenceClass::Fact, 1.0, "declares"),
+            Edge::new(id("sub.m"), id("mapper.m"), EdgeKind::Calls)
+                .with_evidence("Concrete.java", 2, 2, EvidenceClass::Inferred, 0.7, "call"),
+            Edge::new(id("mapper.m"), id("t"), EdgeKind::ReadsTable)
+                .with_evidence("M.xml", 3, 3, EvidenceClass::Fact, 1.0, "reads"),
+        ];
+        store
+            .apply_patch(GraphPatch::add(vec![base, sub, sub_m, mapper_m, table], edges))
+            .unwrap();
+
+        let kinds_with = vec![
+            EdgeKind::Calls,
+            EdgeKind::Injects,
+            EdgeKind::Declares,
+            EdgeKind::SuperclassOf,
+            EdgeKind::ReadsTable,
+            EdgeKind::WritesTable,
+            EdgeKind::Exposes,
+            EdgeKind::MatchesEndpoint,
+        ];
+        let r1 = trace_graph(&store, "AbstractBase", 5, kinds_with, true, 0.0).unwrap();
+        let qns1: Vec<&str> = r1["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["qualified_name"].as_str())
+            .collect();
+        assert!(
+            qns1.contains(&"orders"),
+            "含 superclass_of:从 AbstractBase 应经子类→method→table 到 orders, got {qns1:?}"
+        );
+
+        let kinds_without = vec![
+            EdgeKind::Calls,
+            EdgeKind::Injects,
+            EdgeKind::Declares,
+            EdgeKind::ReadsTable,
+            EdgeKind::WritesTable,
+            EdgeKind::Exposes,
+            EdgeKind::MatchesEndpoint,
+        ];
+        let r2 = trace_graph(&store, "AbstractBase", 5, kinds_without, true, 0.0).unwrap();
+        let qns2: Vec<&str> = r2["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["qualified_name"].as_str())
+            .collect();
+        assert!(
+            !qns2.contains(&"orders"),
+            "不含 superclass_of:从 abstract 类应到不了子类→table, got {qns2:?}"
+        );
     }
 
     #[test]

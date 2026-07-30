@@ -26,6 +26,12 @@ static SQL_INSERT_COLS: LazyLock<Regex> = LazyLock::new(|| {
 static SQL_UPDATE_SET: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\bSET\s+(.*?)(?:\bWHERE\b|;|$)").unwrap()
 });
+// <mapper namespace="com.x.UserDao">:MyBatis 接口绑定的权威键(=接口 Java 全限定名)。
+// 配对 method↔statement 走 namespace + statement_id,见 analysis::resolve_cross_stack。
+// 原生 MyBatis(无 @TableName/BaseMapper)的 method→table 链全靠这条 namespace 接上。
+static XML_NAMESPACE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)<mapper\b[^>]*\bnamespace\s*=\s*"([^"]+)""#).unwrap()
+});
 
 pub struct XmlExtractor;
 
@@ -48,11 +54,21 @@ impl SemanticExtractor for XmlExtractor {
 }
 
 fn extract_xml(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges: &mut Vec<Edge>) {
+    // 每个 mapper.xml 一个 namespace(=接口 Java 全限定名)。存入其下每个 statement 的
+    // metadata,供 analysis 按 namespace+id 把 Mapper 接口方法绑定到 statement。
+    let namespace = XML_NAMESPACE
+        .captures(&file.content)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string());
     for capture in XML_STATEMENT.captures_iter(&file.content) {
         let operation = capture[1].to_lowercase();
         let statement_id = capture.get(2).unwrap();
         let sql = capture.get(3).unwrap();
         let line = line_of(&file.content, statement_id.start());
+        let metadata = match &namespace {
+            Some(ns) => json!({"operation": operation, "namespace": ns}),
+            None => json!({"operation": operation}),
+        };
         let statement = Entity::new(
             EntityId::stable(
                 "workspace",
@@ -65,7 +81,7 @@ fn extract_xml(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges:
             statement_id.as_str(),
             format!("{path}#{}", statement_id.as_str()),
         )
-        .with_metadata(json!({"operation": operation}))
+        .with_metadata(metadata)
         .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "MyBatis statement");
         let statement_id_value = statement.id.clone();
         add_contained(file, path, statement, line, entities, edges);

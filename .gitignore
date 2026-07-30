@@ -1,7 +1,9 @@
 /target/
 /.repo-intelligence/
 /packages/npm/node_modules/
+/验证项目/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+.DS_Store
 

@@ -9,10 +9,10 @@ mod registry;
 mod xml;
 
 pub use registry::{ExtractContext, Registry, SemanticExtractor};
+pub use repo_intelligence_config::SemanticsConfig;
 
 use anyhow::Result;
 use regex::Regex;
-use repo_intelligence_config::SemanticsConfig;
 use repo_intelligence_model::{
     Edge, EdgeKind, Entity, EntityKind, Evidence, EvidenceClass, GraphPatch,
 };

@@ -100,7 +100,9 @@ impl SqliteGraphStore {
                 kind TEXT NOT NULL,
                 name TEXT NOT NULL,
                 qualified_name TEXT NOT NULL,
-                json TEXT NOT NULL
+                json TEXT NOT NULL,
+                start_line INTEGER NOT NULL DEFAULT 0,
+                end_line INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS edge (
                 source_id TEXT NOT NULL,
@@ -108,6 +110,8 @@ impl SqliteGraphStore {
                 kind TEXT NOT NULL,
                 json TEXT NOT NULL,
                 resolved INTEGER NOT NULL DEFAULT 0,
+                start_line INTEGER NOT NULL DEFAULT 0,
+                end_line INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(source_id, target_id, kind)
             );
             CREATE INDEX IF NOT EXISTS edge_source ON edge(source_id, kind);
@@ -128,6 +132,37 @@ impl SqliteGraphStore {
         )?;
         // 旧库迁移:为已存在的 edge 表补 `resolved` 列(新库已在 CREATE 中带)。
         self.ensure_edge_resolved_column()?;
+        // 旧库迁移:为 entity/edge 表补 `start_line`/`end_line` 顶层冗余列
+        // (裸 SQL 直连查询友好,免 json_extract;新库已在 CREATE 中带)。
+        self.ensure_line_columns()?;
+        Ok(())
+    }
+
+    /// 幂等迁移:若 entity/edge 表缺少 `start_line` 列则补 start_line + end_line。
+    /// 行号冗余列从 json.evidence 派生,仅利好裸 SQL 直连查询;工具层走 trait API 读
+    /// json,不依赖本列(故读反序列化路径 row_entity/row_edge 无需改动)。
+    fn ensure_line_columns(&self) -> Result<()> {
+        for table in ["entity", "edge"] {
+            let missing = {
+                let mut statement =
+                    self.connection.prepare(&format!("PRAGMA table_info({table})"))?;
+                let columns: Vec<String> = statement
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(|result| result.ok())
+                    .collect();
+                !columns.iter().any(|name| name == "start_line")
+            };
+            if missing {
+                self.connection.execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN start_line INTEGER NOT NULL DEFAULT 0"),
+                    [],
+                )?;
+                self.connection.execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN end_line INTEGER NOT NULL DEFAULT 0"),
+                    [],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -218,11 +253,12 @@ impl SqliteGraphStore {
 
         {
             let mut upsert_entity = transaction.prepare_cached(
-                "INSERT INTO entity(id, kind, name, qualified_name, json)
-                 VALUES(?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO entity(id, kind, name, qualified_name, json, start_line, end_line)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(id) DO UPDATE SET
                    kind=excluded.kind, name=excluded.name,
-                   qualified_name=excluded.qualified_name, json=excluded.json",
+                   qualified_name=excluded.qualified_name, json=excluded.json,
+                   start_line=excluded.start_line, end_line=excluded.end_line",
             )?;
             // entity_fts(FTS5 全文索引)是死索引:grep 全仓库无任何 SELECT FROM entity_fts /
             // MATCH 读取——search 走 entity 表 LIKE,search_exact_name 走 entity.name =。但每实体
@@ -233,12 +269,19 @@ impl SqliteGraphStore {
             let t = std::time::Instant::now();
             for entity in patch.add_entities {
                 let json = serde_json::to_string(&entity)?;
+                let (start_line, end_line) = entity
+                    .evidence
+                    .first()
+                    .map(|e| (e.start_line, e.end_line))
+                    .unwrap_or((0, 0));
                 upsert_entity.execute(params![
                     entity.id.0,
                     entity.kind.as_str(),
                     entity.name,
                     entity.qualified_name,
-                    json
+                    json,
+                    start_line,
+                    end_line
                 ])?;
             }
             eprintln!(
@@ -249,20 +292,28 @@ impl SqliteGraphStore {
 
         {
             let mut upsert_edge = transaction.prepare_cached(
-                "INSERT INTO edge(source_id, target_id, kind, json, resolved)
-                 VALUES(?1, ?2, ?3, ?4, 0)
+                "INSERT INTO edge(source_id, target_id, kind, json, resolved, start_line, end_line)
+                 VALUES(?1, ?2, ?3, ?4, 0, ?5, ?6)
                  ON CONFLICT(source_id, target_id, kind) DO UPDATE SET
-                   json=excluded.json, resolved=0",
+                   json=excluded.json, resolved=0,
+                   start_line=excluded.start_line, end_line=excluded.end_line",
             )?;
             let n_edg = patch.add_edges.len();
             let t = std::time::Instant::now();
             for edge in patch.add_edges {
                 let json = serde_json::to_string(&edge)?;
+                let (start_line, end_line) = edge
+                    .evidence
+                    .first()
+                    .map(|e| (e.start_line, e.end_line))
+                    .unwrap_or((0, 0));
                 upsert_edge.execute(params![
                     edge.source.0,
                     edge.target.0,
                     edge.kind.as_str(),
-                    json
+                    json,
+                    start_line,
+                    end_line
                 ])?;
             }
             eprintln!(
@@ -314,18 +365,26 @@ impl GraphStore for SqliteGraphStore {
         transaction.execute("DELETE FROM edge WHERE resolved = 1", [])?;
         {
             let mut upsert = transaction.prepare_cached(
-                "INSERT INTO edge(source_id, target_id, kind, json, resolved)
-                 VALUES(?1, ?2, ?3, ?4, 1)
+                "INSERT INTO edge(source_id, target_id, kind, json, resolved, start_line, end_line)
+                 VALUES(?1, ?2, ?3, ?4, 1, ?5, ?6)
                  ON CONFLICT(source_id, target_id, kind) DO UPDATE SET
-                   json=excluded.json, resolved=1",
+                   json=excluded.json, resolved=1,
+                   start_line=excluded.start_line, end_line=excluded.end_line",
             )?;
             for edge in edges {
                 let json = serde_json::to_string(&edge)?;
+                let (start_line, end_line) = edge
+                    .evidence
+                    .first()
+                    .map(|e| (e.start_line, e.end_line))
+                    .unwrap_or((0, 0));
                 upsert.execute(params![
                     edge.source.0,
                     edge.target.0,
                     edge.kind.as_str(),
-                    json
+                    json,
+                    start_line,
+                    end_line
                 ])?;
             }
         }
@@ -572,6 +631,27 @@ mod tests {
             })
             .unwrap();
         assert!(traversal.edges.iter().any(|edge| edge.target == id("b")));
+    }
+
+    #[test]
+    fn line_columns_populated_for_bare_sql() {
+        // 行号冗余列写入 entity/edge 顶层,裸 SQL 直连可查(免 json_extract)。
+        // 工具层走 trait API 读 json 不依赖本列;此测试钉住"直连查询体验"这一收益。
+        use repo_intelligence_model::{Entity, EntityKind, EvidenceClass};
+        let mut store = SqliteGraphStore::open_in_memory().unwrap();
+        let entity = Entity::new(id("C"), EntityKind::Class, "C", "C")
+            .with_evidence("F.java", 42, 48, EvidenceClass::Fact, 1.0, "decl");
+        store
+            .apply_patch(GraphPatch::add(vec![entity], Vec::new()))
+            .unwrap();
+        let (start, end): (i64, i64) = store
+            .connection
+            .query_row("SELECT start_line, end_line FROM entity WHERE id = 'C'", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(start, 42, "start_line 应写入顶层列");
+        assert_eq!(end, 48, "end_line 应写入顶层列");
     }
 
     #[test]

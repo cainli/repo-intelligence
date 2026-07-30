@@ -332,6 +332,83 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
         }
     }
 
+    // 跨文件 MyBatis 绑定:Mapper 接口方法 ↔ XmlStatement。原生 MyBatis 不走
+    // @TableName/BaseMapper,Dao 方法→表的链路断在 method↔xml_statement。按 MyBatis 官方
+    // 绑定规则(namespace + id)配对:namespace(=接口 Java FQN)后缀匹配 interface 的 path
+    // (不依赖 Maven source-root 约定),再要求方法名 == statement_id,建 method→BindsToStatement。
+    // namespace 权威、id 精确 → Resolved 0.9。
+    let xml_by_ns_suffix: HashMap<String, Vec<&Entity>> = entities
+        .iter()
+        .filter(|e| e.kind == EntityKind::XmlStatement)
+        .filter_map(|xs| {
+            xs.metadata
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .map(|ns| (format!("{}.java", ns.replace('.', "/")), xs))
+        })
+        .fold(HashMap::new(), |mut acc, (suffix, xs)| {
+            acc.entry(suffix).or_default().push(xs);
+            acc
+        });
+    // interface path → 其 namespace 命中的 XmlStatement 列表。
+    let mut iface_to_xmls: HashMap<&EntityId, Vec<&Entity>> = HashMap::new();
+    for edge in input_edges {
+        if edge.kind != EdgeKind::Declares {
+            continue;
+        }
+        let (Some(iface), Some(_)) =
+            (entity_by_id.get(&edge.source), entity_by_id.get(&edge.target))
+        else {
+            continue;
+        };
+        if iface.kind != EntityKind::Interface || iface_to_xmls.contains_key(&iface.id) {
+            continue;
+        }
+        let Some(ev) = iface.evidence.first() else {
+            continue;
+        };
+        let matched: Vec<&Entity> = xml_by_ns_suffix
+            .iter()
+            .filter(|(suffix, _)| ev.file.ends_with(suffix.as_str()))
+            .flat_map(|(_, xs)| xs.iter().copied())
+            .collect();
+        iface_to_xmls.insert(&iface.id, matched);
+    }
+    // declares(interface→method):method 名命中某 statement_id → 建绑定边。
+    for edge in input_edges {
+        if edge.kind != EdgeKind::Declares {
+            continue;
+        }
+        let (Some(iface), Some(method)) =
+            (entity_by_id.get(&edge.source), entity_by_id.get(&edge.target))
+        else {
+            continue;
+        };
+        if iface.kind != EntityKind::Interface || method.kind != EntityKind::Method {
+            continue;
+        }
+        let Some(xmls) = iface_to_xmls.get(&iface.id) else {
+            continue;
+        };
+        for xs in xmls {
+            if xs.name != method.name {
+                continue;
+            }
+            let mut b = Edge::new(method.id.clone(), xs.id.clone(), EdgeKind::BindsToStatement);
+            if let Some(mev) = method.evidence.first() {
+                b = b.with_evidence(
+                    &mev.file,
+                    mev.start_line,
+                    mev.end_line,
+                    EvidenceClass::Resolved,
+                    0.9,
+                    "MyBatis mapper method binds to statement (namespace + id)",
+                );
+            }
+            edges.push(b);
+        }
+    }
+
     // 跨文件 method 调用:method.metadata.invokes 的 callee 名 + 所属类型的注入依赖
     // (DependsOn→SpringBean type)→ 在注入 type 声明的 method 里按名匹配,补
     // Controller→Service→Mapper 跨文件调用链(同文件 calls 由 extract_java 产)。
@@ -368,6 +445,31 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
                 .push(bean.name.as_str());
         }
     }
+    // 类型名出现次数:静态调用(receiver=类型名)解析时,同名跨包歧义则跳过避免乱连。
+    let mut type_name_owners: HashMap<&str, usize> = HashMap::new();
+    for e in entities {
+        if matches!(e.kind, EntityKind::Class | EntityKind::Interface) {
+            *type_name_owners.entry(e.name.as_str()).or_insert(0) += 1;
+        }
+    }
+    // owner → {字段名 → 注入类型名}:Step B 把 `this.service.foo()` 的 receiver=service
+    // 精确解析到注入类型,消除"多个注入 type 都有同名方法"的歧义(字段名直接锁定单一 type)。
+    let mut owner_fields: HashMap<&str, HashMap<&str, &str>> = HashMap::new();
+    for e in entities {
+        if matches!(e.kind, EntityKind::Class | EntityKind::Interface)
+            && let Some(arr) = e.metadata.get("injected_fields").and_then(|v| v.as_array())
+        {
+            let map = owner_fields.entry(e.name.as_str()).or_default();
+            for f in arr {
+                if let (Some(fname), Some(ftype)) = (
+                    f.get("name").and_then(|v| v.as_str()),
+                    f.get("type").and_then(|v| v.as_str()),
+                ) {
+                    map.insert(fname, ftype);
+                }
+            }
+        }
+    }
     for entity in entities {
         if entity.kind != EntityKind::Method {
             continue;
@@ -378,37 +480,83 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
         let Some(&owner) = method_owner.get(&entity.id) else {
             continue;
         };
-        let Some(injected) = owner_injected.get(owner) else {
-            continue;
-        };
+        // owner 可能无注入依赖(如纯静态工具调用 JsonUtil.stringify);injected 缺省为空,
+        // 静态调用路径(receiver=类型名)不依赖它,不应被此处 continue 卡掉。
+        let injected: &[&str] = owner_injected.get(owner).map(Vec::as_slice).unwrap_or(&[]);
         for invoke in invokes {
             let Some(callee_name) = invoke.get("name").and_then(|v| v.as_str()) else {
                 continue;
             };
             let line = invoke.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let mut hits: Vec<&EntityId> = Vec::new();
-            for type_name in injected {
-                if let Some(ms) = type_methods.get(*type_name)
-                    && let Some(callee_id) = ms.get(callee_name).copied()
-                {
-                    hits.push(callee_id);
+            // receiver_kind/receiver 由提取层 classify_receiver 产出(旧库缺省为 bare,向后兼容)。
+            let receiver_kind =
+                invoke.get("receiver_kind").and_then(|v| v.as_str()).unwrap_or("bare");
+            let receiver = invoke.get("receiver").and_then(|v| v.as_str());
+
+            let mut resolved: Option<&EntityId> = None;
+            let mut confidence: f32 = 0.0;
+            let mut reason: &str = "";
+            // 优先级 0:注入字段调用。receiver=字段名 → 用字段名查 owner 的注入类型,
+            // 再定位该 type 的方法,精确解析 0.7(消除多 type 同名方法歧义)。
+            // 覆盖两种写法:field=this.service.foo(显式 this)与 name=service.foo
+            // (Java 主流省略 this——identifier receiver 先当注入字段试,再当静态类型)。
+            let mut via_field = false;
+            if let Some(rv) = receiver
+                && matches!(receiver_kind, "field" | "name")
+                && let Some(field_map) = owner_fields.get(owner)
+                && let Some(&target_type) = field_map.get(rv)
+                && let Some(ms) = type_methods.get(target_type)
+                && let Some(&callee_id) = ms.get(callee_name)
+                && callee_id != &entity.id
+            {
+                resolved = Some(callee_id);
+                confidence = 0.7;
+                reason = "cross-file call via injected field receiver";
+                via_field = true;
+            }
+            // 优先级 1:静态调用(receiver 是全局类型名且非歧义,如 JsonUtil.foo)→ 精确 0.7。
+            if !via_field
+                && receiver_kind == "name"
+                && let Some(rv) = receiver
+                && type_name_owners.get(rv).copied().unwrap_or(0) <= 1
+                && let Some(ms) = type_methods.get(rv)
+                && let Some(&callee_id) = ms.get(callee_name)
+                && callee_id != &entity.id
+            {
+                resolved = Some(callee_id);
+                confidence = 0.7;
+                reason = "cross-file static call on named type";
+            }
+            // 优先级 2:裸名 / 未精确解析的 name → 注入依赖类型名匹配(低保真),唯一命中 0.5。
+            if resolved.is_none() {
+                let mut hits: Vec<&EntityId> = Vec::new();
+                for type_name in injected {
+                    if let Some(ms) = type_methods.get(*type_name)
+                        && let Some(callee_id) = ms.get(callee_name).copied()
+                    {
+                        hits.push(callee_id);
+                    }
+                }
+                // 无 receiver 信息时多命中=歧义跳过避免连错;唯一命中且非自调用才建边。
+                if hits.len() == 1 && hits[0] != &entity.id {
+                    resolved = Some(hits[0]);
+                    confidence = 0.5;
+                    reason = "cross-file call via injected dependency (matched by name)";
                 }
             }
-            // 仅在唯一命中且非自调用时建边;多命中=歧义跳过,避免连错。
-            if hits.len() == 1 && hits[0] != &entity.id {
-                let evidence = entity.evidence.first();
-                let mut edge = Edge::new(entity.id.clone(), hits[0].clone(), EdgeKind::Calls);
-                if let Some(ev) = evidence {
-                    edge = edge.with_evidence(
+            if let Some(callee_id) = resolved
+                && let Some(ev) = entity.evidence.first()
+            {
+                edges.push(
+                    Edge::new(entity.id.clone(), callee_id.clone(), EdgeKind::Calls).with_evidence(
                         &ev.file,
                         line,
                         line,
                         EvidenceClass::Inferred,
-                        0.6,
-                        "cross-file call via injected dependency (matched by name)",
-                    );
-                }
-                edges.push(edge);
+                        confidence,
+                        reason,
+                    ),
+                );
             }
         }
     }
@@ -463,6 +611,46 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
                 .or_default()
                 .push(entity.name.as_str());
         }
+    }
+
+    // 类继承:跨文件 class.metadata.superclass → 全局超类实体,建 SuperclassOf(超类→子类,
+    // outbound)。让 trace 从超类(含 abstract 抽象基类)下钻到具体子类——业务逻辑常在子类,
+    // abstract 类自身方法不直接调 Dao,需经此边追到子类的表依赖。与 implements 同模式。
+    let classes_by_name: HashMap<&str, &EntityId> = entities
+        .iter()
+        .filter(|e| e.kind == EntityKind::Class)
+        .map(|e| (e.name.as_str(), &e.id))
+        .collect();
+    let mut class_name_count: HashMap<&str, usize> = HashMap::new();
+    for e in entities {
+        if e.kind == EntityKind::Class {
+            *class_name_count.entry(e.name.as_str()).or_insert(0) += 1;
+        }
+    }
+    for entity in entities {
+        if entity.kind != EntityKind::Class {
+            continue;
+        }
+        let Some(superclass) = entity.metadata.get("superclass").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // 同名超类跨包歧义 → 跳过(保守,避免乱连)。
+        if class_name_count.get(superclass).copied().unwrap_or(0) > 1 {
+            continue;
+        }
+        let Some(&super_id) = classes_by_name.get(superclass) else { continue };
+        let mut edge = Edge::new(super_id.clone(), entity.id.clone(), EdgeKind::SuperclassOf);
+        if let Some(ev) = entity.evidence.first() {
+            edge = edge.with_evidence(
+                &ev.file,
+                ev.start_line,
+                ev.end_line,
+                EvidenceClass::Fact,
+                1.0,
+                "class extends superclass",
+            );
+        }
+        edges.push(edge);
     }
     for edge in input_edges {
         if edge.kind == EdgeKind::Declares
