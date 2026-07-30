@@ -274,6 +274,12 @@ fn tool_specs() -> Vec<ToolSpec> {
             output_schema: search_output.clone(),
         },
         ToolSpec {
+            name: "semantic_search",
+            description: "Semantic search over entities by meaning (not substring). Uses a bundled local ONNX model to embed the query and ranks entities by cosine similarity — e.g. find login-related entities when you search 'authenticate'. Requires embedding enabled (default on) and a prior scan_workspace.",
+            input_schema: search_input.clone(),
+            output_schema: search_output.clone(),
+        },
+        ToolSpec {
             name: "analyze_change",
             description: "Analyze the impact of a structured change. Returns a paginated window of findings (use limit/offset) with bounded traversal depth; total + has_more indicate whether more findings exist.",
             input_schema: json!({
@@ -690,6 +696,12 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
             }
             result
         }
+        "semantic_search" => {
+            let store = SqliteGraphStore::open(path)?;
+            let query = arguments["query"].as_str().unwrap_or_default();
+            let limit = parse_limit(arguments);
+            semantic_search(&store, query, limit)?
+        }
         "analyze_requirement" => {
             let store = SqliteGraphStore::open(path)?;
             let mut result = run_search(&store, arguments, None)?;
@@ -819,7 +831,7 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
             // 配置跟 workspace 走:从 workspace 根目录发现 .repo-intelligence.toml,
             // 无文件则 builtin default(scan 行为与历史一致)。
             let config = IndexerConfig::load(workspace_path)?;
-            let mut store = SqliteGraphStore::open(path)?;
+            let mut store = SqliteGraphStore::open_with_fts(path, config.index.fts5_fulltext)?;
             let summary =
                 WorkspaceIndexer.scan_with_config(workspace_path, &mut store, &config, |_| {})?;
             // Echo the resulting kind distribution and the effective exclusion
@@ -974,6 +986,52 @@ fn search_with_filter(
     }
     let count = entities.len();
     Ok((entities, count, has_more))
+}
+
+/// 语义检索:用本地 ONNX 给 query 生成 embedding,与全部 entity embedding 算余弦相似度,
+/// 返回 top-k(对标 codebase-memory 的 semantic_query)。无 embedding 时返回空 + hint。
+fn semantic_search(store: &SqliteGraphStore, query: &str, limit: usize) -> Result<Value> {
+    if query.trim().is_empty() {
+        return Ok(json!({ "items": [], "count": 0, "hint": "empty query" }));
+    }
+    let all = store.get_all_embeddings()?;
+    if all.is_empty() {
+        return Ok(json!({
+            "items": [],
+            "count": 0,
+            "hint": "无 embedding:未 scan 或 [index] embedding=false。scan 后再查。"
+        }));
+    }
+    let mut embedder = repo_intelligence_embedding::Embedder::new()?;
+    let qvec = embedder
+        .embed(vec![query.to_string()])?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("query embedding 为空"))?;
+    let mut scored = all
+        .into_iter()
+        .map(|(id, v)| (id, cosine(&qvec, &v)))
+        .collect::<Vec<_>>();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut items = Vec::new();
+    for (id, score) in scored.into_iter().take(limit) {
+        if let Some(entity) = store.get_entity(&id)? {
+            items.push(json!({ "entity": entity_to_json(&entity, false), "score": score }));
+        }
+    }
+    Ok(json!({ "items": items, "count": items.len(), "query": query }))
+}
+
+/// 余弦相似度。
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
 }
 
 /// Shared body of the three substring-search tools (search_entities,
@@ -1524,6 +1582,61 @@ mod tests {
 
     fn id(value: &str) -> EntityId {
         EntityId(value.to_string())
+    }
+
+    #[test]
+    #[ignore] // 加载 ONNX 重;手动跑验证语义召回质量(`--ignored --nocapture`)。
+    fn semantic_search_ranks_semantically_relevant_first() {
+        use repo_intelligence_embedding::Embedder;
+        use repo_intelligence_graph::{GraphStore, SqliteGraphStore};
+        use repo_intelligence_model::{Entity, EntityKind};
+        let mut store = SqliteGraphStore::open_in_memory().unwrap();
+        let mk = |name: &str| {
+            Entity::new(
+                EntityId::stable("repo", name, EntityKind::Method, name, ""),
+                EntityKind::Method,
+                name,
+                name,
+            )
+        };
+        let entities = vec![
+            mk("userLogin"),
+            mk("processPayment"),
+            mk("exportReport"),
+            mk("authenticateUser"),
+        ];
+        store
+            .apply_patch(GraphPatch::add(entities.clone(), vec![]))
+            .unwrap();
+        // 用真 Embedder 生成 embedding(向量化文本与 scan 一致)。
+        let mut emb = Embedder::new().unwrap();
+        let texts: Vec<String> = entities
+            .iter()
+            .map(|e| format!("{} {} {}", e.kind.as_str(), e.qualified_name, e.name))
+            .collect();
+        let vecs = emb.embed(texts).unwrap();
+        let rows: Vec<(EntityId, Vec<f32>, String)> = entities
+            .iter()
+            .zip(vecs)
+            .map(|(e, v)| (e.id.clone(), v, "h".to_string()))
+            .collect();
+        store.set_embeddings(&rows).unwrap();
+        // 语义查询:user login/authentication。userLogin/authenticateUser 应排前两名之一。
+        let result = semantic_search(&store, "user login authentication", 10).unwrap();
+        let names: Vec<String> = result["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|it| it["entity"]["name"].as_str().unwrap().to_string())
+            .collect();
+        eprintln!("[semantic_test] ranking: {:?}", names);
+        assert!(result["count"].as_u64().unwrap() >= 2);
+        let top2: Vec<&str> = names.iter().take(2).map(|s| s.as_str()).collect();
+        assert!(
+            top2.contains(&"userLogin") || top2.contains(&"authenticateUser"),
+            "top2 应含 login/auth 实体,实际 {:?}",
+            top2
+        );
     }
 
     #[test]

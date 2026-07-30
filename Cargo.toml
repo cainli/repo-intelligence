@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/config",
+  "crates/embedding",
   "crates/model",
   "crates/source",
   "crates/parsing",
@@ -14,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.25"
+version = "0.1.26"
 edition = "2024"
 license = "Apache-2.0"
 

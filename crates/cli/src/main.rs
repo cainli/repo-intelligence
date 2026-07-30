@@ -120,10 +120,11 @@ fn run() -> Result<()> {
             )
         }
         Command::Scan { workspace, format } => {
-            let mut store = SqliteGraphStore::open(&cli.database)?;
             // 配置跟 workspace 走:从 workspace 根目录发现 .repo-intelligence.toml,
             // 无文件则 builtin default(scan 行为与历史一致)。
             let config = IndexerConfig::load(&workspace)?;
+            let mut store =
+                SqliteGraphStore::open_with_fts(&cli.database, config.index.fts5_fulltext)?;
             let summary = WorkspaceIndexer.scan_with_config(
                 &workspace,
                 &mut store,

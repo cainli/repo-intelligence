@@ -7,3 +7,8 @@
 *.sqlite-wal
 .DS_Store
 
+# 向量层 ONNX 模型(23MB,不进 git;新 clone 由 crates/embedding/build.rs 自动 fetch,
+# 或手动 bash crates/embedding/scripts/fetch-model.sh)
+/crates/embedding/models/
+/crates/embedding/.fastembed_cache/
+

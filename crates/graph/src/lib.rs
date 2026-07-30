@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use repo_intelligence_model::{Edge, Entity, EntityId, GraphPatch, SearchQuery, TraverseQuery};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 #[derive(Clone, Debug)]
 pub struct EntityMatch {
@@ -38,25 +38,81 @@ pub trait GraphStore {
     fn delete_file_subtree(&mut self, file_id: &EntityId) -> Result<()>;
     /// 增量更新:读取全部事实提取边(resolved=0),供跨文件 resolve 全量重算作输入。
     fn extract_edges(&self) -> Result<Vec<Edge>>;
+
+    /// 向量层(v0.1.26):写入 entity embedding(批量 upsert)。Vec<f32> 为模型维度向量,
+    /// text_hash 记录生成时的文本摘要(增量:文本变才重新 embed)。默认 no-op。
+    fn set_embeddings(&mut self, _embeddings: &[(EntityId, Vec<f32>, String)]) -> Result<()> {
+        Ok(())
+    }
+    /// 向量层:读取已索引实体 → text_hash(增量判断:谁已有 embedding + 文本摘要)。
+    fn get_embedding_state(&self) -> Result<HashMap<EntityId, String>> {
+        Ok(HashMap::new())
+    }
+    /// 向量层:读取全部 entity_id → embedding(语义检索查询用,应用层算余弦)。
+    fn get_all_embeddings(&self) -> Result<Vec<(EntityId, Vec<f32>)>> {
+        Ok(Vec::new())
+    }
 }
 
 pub struct SqliteGraphStore {
     connection: Connection,
+    /// 是否维护 `entity_fts`(trigram 全文索引)并启用 MATCH 查询。
+    /// false 时表 schema 仍建(兼容旧库),但不写不读,`search` 走 LIKE 兜底。
+    fts_enabled: bool,
+    /// entity_fts 当前是否有数据(open 时探测)。决定 search 走 MATCH 还是 LIKE 兜底,
+    /// 避免空 FTS 库(未 scan / fts 关闭 / 旧库未迁移)的查询因 MATCH 返回空而失效。
+    fts_populated: bool,
 }
 
 impl SqliteGraphStore {
+    /// 默认开启 FTS(对标 codebase-memory 的全文检索能力)。
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_fts(path, true)
+    }
+
+    /// 显式控制 FTS 开关。CLI/MCP 先 `IndexerConfig::load` 再据此 open。
+    pub fn open_with_fts(path: impl AsRef<Path>, fts_enabled: bool) -> Result<Self> {
         let connection = Connection::open(path)?;
-        let store = Self { connection };
+        let mut store = Self {
+            connection,
+            fts_enabled,
+            fts_populated: false,
+        };
         store.initialize()?;
+        store.refresh_fts_populated();
         Ok(store)
     }
 
     pub fn open_in_memory() -> Result<Self> {
+        Self::open_in_memory_with_fts(true)
+    }
+
+    pub fn open_in_memory_with_fts(fts_enabled: bool) -> Result<Self> {
         let connection = Connection::open_in_memory()?;
-        let store = Self { connection };
+        let mut store = Self {
+            connection,
+            fts_enabled,
+            fts_populated: false,
+        };
         store.initialize()?;
+        store.refresh_fts_populated();
         Ok(store)
+    }
+
+    pub fn fts_enabled(&self) -> bool {
+        self.fts_enabled
+    }
+
+    /// 探测 entity_fts 是否有数据,缓存到 fts_populated。open 与 scan 后调用。
+    fn refresh_fts_populated(&mut self) {
+        self.fts_populated = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM entity_fts LIMIT 1)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
     }
 
     pub fn counts(&self) -> Result<(u64, u64)> {
@@ -117,16 +173,18 @@ impl SqliteGraphStore {
             CREATE INDEX IF NOT EXISTS edge_source ON edge(source_id, kind);
             CREATE INDEX IF NOT EXISTS edge_target ON edge(target_id, kind);
             CREATE INDEX IF NOT EXISTS entity_name ON entity(name);
-            CREATE VIRTUAL TABLE IF NOT EXISTS entity_fts USING fts5(
-                entity_id UNINDEXED,
-                name,
-                qualified_name,
-                tokenize = 'unicode61'
-            );
+            -- entity_fts(trigram)由 ensure_fts_trigram 统一建/迁移:execute_batch 的
+            -- IF NOT EXISTS 救不了 tokenizer 升级,旧库(unicode61)需 DROP+CREATE。
             CREATE TABLE IF NOT EXISTS file_state (
                 path TEXT PRIMARY KEY,
                 hash TEXT NOT NULL,
                 indexed_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS entity_embedding (
+                entity_id TEXT PRIMARY KEY,
+                embedding BLOB NOT NULL,
+                dim INTEGER NOT NULL,
+                text_hash TEXT NOT NULL
             );
             ",
         )?;
@@ -135,6 +193,58 @@ impl SqliteGraphStore {
         // 旧库迁移:为 entity/edge 表补 `start_line`/`end_line` 顶层冗余列
         // (裸 SQL 直连查询友好,免 json_extract;新库已在 CREATE 中带)。
         self.ensure_line_columns()?;
+        // entity_fts tokenizer 迁移:旧库 unicode61 → trigram(对 camelCase 标识符召回
+        // 追平 LIKE);不存在则按 trigram 建;开启 FTS 时旧库数据一次性全量回填。
+        self.ensure_fts_trigram()?;
+        Ok(())
+    }
+
+    /// 幂等建/迁移 entity_fts 到 trigram tokenizer。
+    ///
+    /// 历史:早期 entity_fts 用 unicode61,对 camelCase 标识符(getUserId 等)召回近全空;
+    /// v0.1.19 又因逐实体 INSERT 慢(2054s)整体删除了写入。v0.1.26 恢复写入并改用 trigram
+    /// (索引化子串匹配,≥3 字符召回追平 LIKE、大小写不敏感),写入改为批量 INSERT...SELECT
+    /// 绕开逐行往返。本函数:
+    /// - 表不存在 → 按 trigram 建(新库);
+    /// - 已是 trigram → 跳过;
+    /// - 旧 unicode61 → DROP+CREATE,并在 `fts_enabled` 时从 entity 全量回填(批量,一次性)。
+    fn ensure_fts_trigram(&self) -> Result<()> {
+        let existing_sql: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='entity_fts'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        let needs_rebuild = match &existing_sql {
+            Some(sql) => !sql.to_lowercase().contains("trigram"),
+            None => true, // 表不存在(新库)
+        };
+        if needs_rebuild {
+            if existing_sql.is_some() {
+                self.connection.execute("DROP TABLE entity_fts", [])?;
+            }
+            self.connection.execute(
+                "CREATE VIRTUAL TABLE entity_fts USING fts5(\
+                 entity_id UNINDEXED, name, qualified_name, tokenize='trigram')",
+                [],
+            )?;
+            // 旧库迁移且开启 FTS:把已有 entity 一次性批量回填(单语句,远快于逐行)。
+            // 新库此处 entity 为空,回填为 no-op。
+            if self.fts_enabled {
+                let t = std::time::Instant::now();
+                let n = self.connection.execute(
+                    "INSERT INTO entity_fts(entity_id, name, qualified_name) \
+                     SELECT id, name, qualified_name FROM entity",
+                    [],
+                )?;
+                eprintln!(
+                    "[ri-diag] fts migrate backfill: {n} entities in {:.2}s",
+                    t.elapsed().as_secs_f64()
+                );
+            }
+        }
         Ok(())
     }
 
@@ -233,6 +343,7 @@ impl SqliteGraphStore {
         transaction: &rusqlite::Transaction<'_>,
         patch: GraphPatch,
         replacing_snapshot: bool,
+        fts_enabled: bool,
     ) -> Result<()> {
         if replacing_snapshot {
             transaction.execute_batch(
@@ -260,12 +371,14 @@ impl SqliteGraphStore {
                    qualified_name=excluded.qualified_name, json=excluded.json,
                    start_line=excluded.start_line, end_line=excluded.end_line",
             )?;
-            // entity_fts(FTS5 全文索引)是死索引:grep 全仓库无任何 SELECT FROM entity_fts /
-            // MATCH 读取——search 走 entity 表 LIKE,search_exact_name 走 entity.name =。但每实体
-            // 都 INSERT 一次 FTS5(分词+建索引),mes/mos 22 万实体花了 2054s(apply_patch 的
-            // 99.7%、整个 scan 的 99.5%)。移除写入后 write_patch 从 ~2060s 降到 ~5s。表保留
-            // (CREATE 不动)以兼容旧 db,只是不再写入、永远为空。
+            // v0.1.26:恢复 entity_fts 写入,但改 trigram tokenizer + 批量 INSERT...SELECT。
+            // 历史:早期逐实体 DELETE+INSERT 到 unicode61 FTS,mes/mos 22 万实体花 2054s
+            // (apply_patch 99.7%),v0.1.19 整体删除写入降回 ~5s。现批量后绕开逐行往返,
+            // trigram 对 camelCase 召回追平 LIKE(unicode61 近全空)。详见 ensure_fts_trigram。
             let n_ent = patch.add_entities.len();
+            // 先快照本次新增/更新实体 id(循环将 move add_entities),供 FTS 批量回填。
+            let add_entity_ids: Vec<String> =
+                patch.add_entities.iter().map(|e| e.id.0.clone()).collect();
             let t = std::time::Instant::now();
             for entity in patch.add_entities {
                 let json = serde_json::to_string(&entity)?;
@@ -288,6 +401,32 @@ impl SqliteGraphStore {
                 "[ri-diag] write_patch entities: {n_ent} in {:.2}s",
                 t.elapsed().as_secs_f64()
             );
+
+            // FTS 批量回填(仅 fts_enabled)。replacing_snapshot 先清空;增量先删旧避免重复行。
+            // INSERT...SELECT 必须在 entity upsert 之后(entity 表需已有这些行)。
+            if fts_enabled && !add_entity_ids.is_empty() {
+                let t_fts = std::time::Instant::now();
+                if replacing_snapshot {
+                    transaction.execute("DELETE FROM entity_fts", [])?;
+                } else {
+                    Self::fts_bulk_in(
+                        transaction,
+                        "DELETE FROM entity_fts WHERE entity_id IN",
+                        &add_entity_ids,
+                    )?;
+                }
+                Self::fts_bulk_in(
+                    transaction,
+                    "INSERT INTO entity_fts(entity_id, name, qualified_name) \
+                     SELECT id, name, qualified_name FROM entity WHERE id IN",
+                    &add_entity_ids,
+                )?;
+                eprintln!(
+                    "[ri-diag] write_patch fts: {} entities in {:.2}s",
+                    add_entity_ids.len(),
+                    t_fts.elapsed().as_secs_f64()
+                );
+            }
         }
 
         {
@@ -320,6 +459,24 @@ impl SqliteGraphStore {
                 "[ri-diag] write_patch edges: {n_edg} in {:.2}s",
                 t.elapsed().as_secs_f64()
             );
+        }
+        Ok(())
+    }
+
+    /// 对 `ids` 分批执行 `"<prefix> (?, ?, ...)"`,绕开 SQLite 单语句 999 绑定上限
+    /// (SQLITE_MAX_VARIABLE)。FTS 写入/删除复用,把 N 次逐行往返压成 N/900 批。
+    fn fts_bulk_in(
+        transaction: &rusqlite::Transaction<'_>,
+        prefix: &str,
+        ids: &[String],
+    ) -> Result<()> {
+        for chunk in ids.chunks(900) {
+            let placeholders: String = (0..chunk.len())
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!("{prefix} ({placeholders})");
+            transaction.execute(&sql, params_from_iter(chunk.iter()))?;
         }
         Ok(())
     }
@@ -411,9 +568,19 @@ impl GraphStore for SqliteGraphStore {
                 ids.push(row?);
             }
         }
-        // 逐实体删除:先清牵连边(source/target 命中,含指向该实体的跨文件 resolved 边),
-        // 再清 fts,最后删实体本身。单文件子树通常几十实体,逐条 prepare_cached 足够快,
-        // 且避开 SQLite 单语句 999 绑定参数上限。
+        // 删除顺序:先批量清 FTS(fts_enabled 时,单语句),再逐实体清牵连边 + 实体本身。
+        // 单文件子树通常几十实体;edge/entity 用 prepare_cached 逐条(避开 999 绑定上限)。
+        if self.fts_enabled && !ids.is_empty() {
+            Self::fts_bulk_in(&transaction, "DELETE FROM entity_fts WHERE entity_id IN", &ids)?;
+        }
+        // 清理向量层(无开关依赖:有数据则删,no-op 否则)。fts_bulk_in 是通用批量删除 helper。
+        if !ids.is_empty() {
+            Self::fts_bulk_in(
+                &transaction,
+                "DELETE FROM entity_embedding WHERE entity_id IN",
+                &ids,
+            )?;
+        }
         {
             let mut delete_edges = transaction
                 .prepare_cached("DELETE FROM edge WHERE source_id = ?1 OR target_id = ?1")?;
@@ -437,46 +604,132 @@ impl GraphStore for SqliteGraphStore {
             .map_err(Into::into)
     }
 
+    fn set_embeddings(&mut self, embeddings: &[(EntityId, Vec<f32>, String)]) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        {
+            let mut stmt = transaction.prepare_cached(
+                "INSERT INTO entity_embedding(entity_id, embedding, dim, text_hash)
+                 VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(entity_id) DO UPDATE SET
+                   embedding=excluded.embedding, dim=excluded.dim, text_hash=excluded.text_hash",
+            )?;
+            for (id, vec, hash) in embeddings {
+                let dim = vec.len() as i64;
+                // f32 数组 → native-endian 字节流(同机读写一致)。
+                let bytes: Vec<u8> = vec.iter().flat_map(|f| f.to_ne_bytes()).collect();
+                stmt.execute(params![&id.0, bytes, dim, hash])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn get_embedding_state(&self) -> Result<HashMap<EntityId, String>> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT entity_id, text_hash FROM entity_embedding")?;
+        let rows =
+            stmt.query_map([], |row| {
+                Ok((EntityId(row.get::<_, String>(0)?), row.get::<_, String>(1)?))
+            })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (id, hash) = row?;
+            map.insert(id, hash);
+        }
+        Ok(map)
+    }
+
+    fn get_all_embeddings(&self) -> Result<Vec<(EntityId, Vec<f32>)>> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT entity_id, embedding, dim FROM entity_embedding")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, blob, dim) = row?;
+            let vec: Vec<f32> = blob
+                .chunks_exact(4)
+                .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            debug_assert_eq!(vec.len(), dim as usize);
+            out.push((EntityId(id), vec));
+        }
+        Ok(out)
+    }
+
     fn apply_patch(&mut self, patch: GraphPatch) -> Result<()> {
         let transaction = self.connection.transaction()?;
-        Self::write_patch(&transaction, patch, false)?;
+        Self::write_patch(&transaction, patch, false, self.fts_enabled)?;
         transaction.commit()?;
+        // scan 填充了 FTS,刷新缓存让同 store 后续 search 走 MATCH。
+        self.refresh_fts_populated();
         Ok(())
     }
 
     fn replace_snapshot(&mut self, patch: GraphPatch) -> Result<()> {
         let transaction = self.connection.transaction()?;
-        Self::write_patch(&transaction, patch, true)?;
+        Self::write_patch(&transaction, patch, true, self.fts_enabled)?;
         transaction.commit()?;
+        self.refresh_fts_populated();
         Ok(())
     }
 
     fn search(&self, query: SearchQuery) -> Result<Vec<EntityMatch>> {
-        // 拆词 OR:多词查询(如 "user login")任一词命中即召回,避免整串子串匹配
-        // (lower(name) LIKE "%user login%")对无空格标识符返回空。单词保持原整串行为。
-        // 每个词一个 LIKE pattern,同时匹配 name 与 qualified_name;动态 ?N 占位参数化。
-        let words: Vec<String> = {
+        // 拆词 OR:多词查询(如 "user login")任一词命中即召回,与历史行为一致。
+        let raw_words: Vec<String> = {
             let split: Vec<&str> = query.text.split_whitespace().collect();
             if split.len() <= 1 {
-                vec![format!("%{}%", query.text)]
+                vec![query.text.clone()]
             } else {
-                split.into_iter().map(|w| format!("%{}%", w)).collect()
+                split.into_iter().map(String::from).collect()
             }
         };
-        let or_clauses: Vec<String> = words
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let idx = i + 1;
-                format!(
-                    "(lower(e.name) LIKE lower(?{idx}) OR lower(e.qualified_name) LIKE lower(?{idx}))"
-                )
-            })
-            .collect();
-        let where_clause = or_clauses.join(" OR ");
-        let name_idx = words.len() + 1;
-        let limit_idx = words.len() + 2;
-        let offset_idx = words.len() + 3;
+        // 决策:fts_enabled 且所有词 ≥3 字符 → trigram MATCH(索引化,告别 leading-wildcard
+        // 全表扫描);否则 LIKE 兜底。trigram 对 <3 字符查询无法产生 3-gram,实测召回失败
+        // (如查 "eq" 找不到 eqUser),故含 <3 字符词时必须回退 LIKE。
+        let use_fts = self.fts_enabled
+            && self.fts_populated
+            && raw_words.iter().all(|w| w.chars().count() >= 3);
+        let (clauses, terms): (Vec<String>, Vec<String>) = if use_fts {
+            let clauses = raw_words
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    let idx = i + 1;
+                    format!(
+                        "e.id IN (SELECT entity_id FROM entity_fts WHERE entity_fts MATCH ?{idx})"
+                    )
+                })
+                .collect();
+            // 短语包裹('"word"')避免 FTS5 特殊字符(* : " 等)被当操作符解析;
+            // trigram 短语仍做 3-gram 子串匹配,召回与子串 LIKE 等价。
+            let terms = raw_words.iter().map(|w| format!("\"{w}\"")).collect();
+            (clauses, terms)
+        } else {
+            let terms: Vec<String> = raw_words.iter().map(|w| format!("%{w}%")).collect();
+            let clauses = terms
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    let idx = i + 1;
+                    format!(
+                        "(lower(e.name) LIKE lower(?{idx}) OR lower(e.qualified_name) LIKE lower(?{idx}))"
+                    )
+                })
+                .collect();
+            (clauses, terms)
+        };
+        let where_clause = clauses.join(" OR ");
+        let name_idx = terms.len() + 1;
+        let limit_idx = terms.len() + 2;
+        let offset_idx = terms.len() + 3;
         let sql = format!(
             "SELECT e.json FROM entity e WHERE {where_clause} \
              ORDER BY CASE WHEN lower(e.name) = lower(?{name_idx}) THEN 0 ELSE 1 END, e.name \
@@ -485,8 +738,8 @@ impl GraphStore for SqliteGraphStore {
         let mut statement = self.connection.prepare(&sql)?;
         let limit = query.limit as i64;
         let offset = query.offset as i64;
-        let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(words.len() + 3);
-        for w in &words {
+        let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(terms.len() + 3);
+        for w in &terms {
             params_vec.push(w);
         }
         params_vec.push(&query.text);

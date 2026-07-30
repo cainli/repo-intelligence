@@ -83,6 +83,50 @@ fn applies_patch_searches_and_traverses() {
 }
 
 #[test]
+fn search_trigram_recalls_camelcase_substrings_and_falls_back_for_short_queries() {
+    // trigram(≥3 字符)对 camelCase 子串召回:unicode61 会全 miss,这是回归守卫。
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    store
+        .apply_patch(GraphPatch::add(
+            vec![
+                entity(EntityKind::Method, "getUserId"),
+                entity(EntityKind::Class, "UserServiceImpl"),
+                entity(EntityKind::Field, "eqUser"),
+            ],
+            vec![],
+        ))
+        .unwrap();
+    let names = |ms: Vec<EntityMatch>| {
+        ms.into_iter()
+            .map(|m| m.entity.name)
+            .collect::<Vec<_>>()
+    };
+    // camelCase 子串:查 userId 命中 getUserId(trigram 索引化子串匹配)。
+    assert!(names(store.search(SearchQuery::new("userId").with_limit(10)).unwrap())
+        .contains(&"getUserId".to_string()));
+    // 大小写不敏感子串:查 user 命中全部三个(跨大小写 camelCase)。
+    let user_hits = names(store.search(SearchQuery::new("user").with_limit(10)).unwrap());
+    assert!(user_hits.contains(&"getUserId".to_string()));
+    assert!(user_hits.contains(&"UserServiceImpl".to_string()));
+    assert!(user_hits.contains(&"eqUser".to_string()));
+    // 短查询(<3 字符)走 LIKE fallback:trigram 盲区,查 eq 仍命中 eqUser。
+    assert!(names(store.search(SearchQuery::new("eq").with_limit(10)).unwrap())
+        .contains(&"eqUser".to_string()));
+}
+
+#[test]
+fn search_uses_like_when_fts_disabled() {
+    // fts 关闭时 search 走 LIKE 兜底(fts_populated 保护 + fts_enabled=false)。
+    let mut store = SqliteGraphStore::open_in_memory_with_fts(false).unwrap();
+    store
+        .apply_patch(GraphPatch::add(vec![entity(EntityKind::Method, "getUserId")], vec![]))
+        .unwrap();
+    let hits = store.search(SearchQuery::new("userId").with_limit(10)).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].entity.name, "getUserId");
+}
+
+#[test]
 fn traverse_filters_by_edge_kind() {
     let mut store = SqliteGraphStore::open_in_memory().unwrap();
     let alpha = entity(EntityKind::Method, "Alpha");

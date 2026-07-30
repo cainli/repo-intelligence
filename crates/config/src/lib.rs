@@ -149,6 +149,8 @@ pub struct IndexerConfig {
     pub semantics: SemanticsConfig,
     #[serde(default)]
     pub analysis: AnalysisConfig,
+    #[serde(default)]
+    pub index: IndexingConfig,
 }
 
 impl IndexerConfig {
@@ -296,6 +298,41 @@ impl Default for AnalysisConfig {
             default_impact_limit: DEFAULT_IMPACT_LIMIT,
             max_impact_limit: DEFAULT_MAX_IMPACT_LIMIT,
             max_search_limit: DEFAULT_MAX_SEARCH_LIMIT,
+        }
+    }
+}
+
+/// 图存储/索引层开关。与 discovery/semantics/analysis 分节:那些是提取/分析的数据型
+/// 常量,这里是存储行为。默认开启 FTS5(trigram 全文检索,对标 codebase-memory 的
+/// 文本召回能力)。注意:此默认改变了 v0.1.19 起的"FTS 死索引"行为——零配置现在会
+/// 维护并使用 FTS;要回到旧行为需显式 `fts5_fulltext = false`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IndexingConfig {
+    /// 是否维护 `entity_fts`(trigram)并启用 MATCH 查询。默认 true。
+    /// false 时表 schema 仍建(兼容旧库),但 scan 不写、search 走 LIKE 兜底。
+    #[serde(default = "default_fts5_fulltext")]
+    pub fts5_fulltext: bool,
+    /// 是否生成 entity embedding(本地 ONNX AllMiniLML6V2)并启用语义检索。默认 true。
+    /// false 时 scan 不生成 embedding、semantic_search 无结果。模型随 crate 打包(零联网),
+    /// 6854 实体生成约 4.5s(增量:仅文本变化的实体重新生成)。
+    #[serde(default = "default_embedding")]
+    pub embedding: bool,
+}
+
+fn default_fts5_fulltext() -> bool {
+    true
+}
+
+fn default_embedding() -> bool {
+    true
+}
+
+impl Default for IndexingConfig {
+    fn default() -> Self {
+        Self {
+            fts5_fulltext: default_fts5_fulltext(),
+            embedding: default_embedding(),
         }
     }
 }

@@ -197,6 +197,18 @@ impl WorkspaceIndexer {
             combined.add_entities.extend(patch.add_entities);
             combined.add_edges.extend(patch.add_edges);
         }
+        // 快照本次变更实体(id + 向量化文本),供 resolve 后增量生成 embedding
+        // (apply_patch 将 move combined,故在此先 clone)。
+        let embed_inputs: Vec<(EntityId, String)> = combined
+            .add_entities
+            .iter()
+            .map(|e| {
+                (
+                    e.id.clone(),
+                    format!("{} {} {}", e.kind.as_str(), e.qualified_name, e.name),
+                )
+            })
+            .collect();
         if !combined.add_entities.is_empty() || !combined.add_edges.is_empty() {
             let n_ent = combined.add_entities.len();
             let n_edg = combined.add_edges.len();
@@ -232,6 +244,42 @@ impl WorkspaceIndexer {
             t_resolve.as_secs_f64(),
             t.elapsed().as_secs_f64()
         );
+
+        // 向量层:对本次变更实体生成 embedding(增量——仅 text_hash 变化才重新生成)。
+        if config.index.embedding && !embed_inputs.is_empty() {
+            let t = Instant::now();
+            let state = store.get_embedding_state()?;
+            // 筛 text_hash 变化(或新实体)。
+            let to_embed: Vec<(EntityId, String)> = embed_inputs
+                .into_iter()
+                .filter(|(id, text)| {
+                    let h = blake3::hash(text.as_bytes()).to_hex().to_string();
+                    state.get(id).is_none_or(|old| *old != h)
+                })
+                .collect();
+            let n = to_embed.len();
+            if n > 0 {
+                let mut embedder = repo_intelligence_embedding::Embedder::new()?;
+                let texts: Vec<String> = to_embed.iter().map(|(_, t)| t.clone()).collect();
+                let vecs = embedder.embed(texts)?;
+                let rows: Vec<(EntityId, Vec<f32>, String)> = to_embed
+                    .iter()
+                    .zip(vecs)
+                    .map(|((id, text), vec)| {
+                        (
+                            id.clone(),
+                            vec,
+                            blake3::hash(text.as_bytes()).to_hex().to_string(),
+                        )
+                    })
+                    .collect();
+                store.set_embeddings(&rows)?;
+            }
+            eprintln!(
+                "[ri-diag] embedding: {n} entities in {:.2}s",
+                t.elapsed().as_secs_f64()
+            );
+        }
 
         // 写新 file_state 快照。
         report(ScanProgress {
