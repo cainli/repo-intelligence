@@ -28,9 +28,33 @@ static REQUEST_MAPPING: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"@RequestMapping\(\s*(?:value\s*=\s*)?"([^"]+)""#).unwrap()
 });
 static METHOD_MAPPING: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"@(Get|Post|Put|Delete|Patch)Mapping\(\s*"([^"]*)"\s*\)"#).unwrap()
+    // 方法级 HTTP 映射注解,两类写法:
+    //  (a) @(Get|Post|Put|Delete|Patch)Mapping("/x"…) → group1 = 动词;
+    //  (b) @RequestMapping("/x"…)                     → group1 缺失(method 通配)。
+    // 认裸 "..." 与 value="...";path 取首个字符串字面量。放宽旧正则的强制 ("…") 形式 ——
+    // 修复 REST controller 普遍用方法级 @RequestMapping 却完全不产 endpoint 的根因
+    // (下游 matches_endpoint 因此几乎为 0)。类级 @RequestMapping 虽也被该正则命中,
+    // 但由配对阶段的 class_offset 检查排除(见 extract_java),仅作 base。
+    Regex::new(
+        r#"@(?:(Get|Post|Put|Delete|Patch)Mapping|RequestMapping)\s*\(\s*(?:value\s*=\s*)?"([^"]*)""#,
+    )
+    .unwrap()
 });
 static STRING_LITERAL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""([^"]*)""#).unwrap());
+// 通用注解简单名:@Foo(…) / @Foo → group1=Foo。用于白名单注解索引(P1-1)。
+static AT_ANNOTATION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"@([A-Za-z_]\w*)").unwrap());
+// @Test 方法定位(P1-4)。
+static AT_TEST: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@Test\b").unwrap());
+// AOP advice 注解 + 其 pointcut 字面量(P1-2)。
+static ADVICE_ANN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"@(Around|Before|After|AfterReturning|AfterThrowing)\s*\(\s*(?:value\s*=\s*)?"([^"]*)""#)
+        .unwrap()
+});
+// execution(返回类型 包.类.方法(..)) → 全限定方法签名(组1)。简单版,不处理通配 */||/within。
+static EXECUTION_SIG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"execution\s*\(\s*\S+\s+([\w.$]+)\s*\(").unwrap()
+});
 // class Name(可选泛型/extends)implements Iface1<Gen>, Iface2 { ... —— 组1=类名,
 // 组2=接口列表(含泛型,到 class body 的 {)。跨行靠 [^{] 匹配换行(否定字符类含 \n)。
 // 用 regex 而非 tree-sitter:implements 子句节点结构随 grammar 版本不稳,正则最可靠。
@@ -228,36 +252,77 @@ fn extract_java(
         );
         add_contained(file, path, entity, line, entities, edges);
     }
-    let base = REQUEST_MAPPING
-        .captures(&file.content)
-        .map(|capture| capture[1].to_string())
-        .unwrap_or_default();
-    // method_spans 按 offset 排序,供 endpoint 注解 offset 配对到所在 method。
+    // class/interface 与 method 的 name offset,供 base 与 endpoint 注解的级别判定。
     method_spans.sort_by_key(|(offset, _)| *offset);
+    let class_offsets: Vec<usize> = JAVA_CLASS
+        .captures_iter(&file.content)
+        .filter_map(|capture| capture.get(2).map(|name| name.start()))
+        .collect();
+    // 类级 base:取其后最近声明是 class/interface(且中间无更近的 method)的
+    // @RequestMapping 的 path —— 排除方法级 @RequestMapping 被误当 base(否则
+    // base=path 再拼方法 path 会翻倍成 /foo/foo)。
+    let base = REQUEST_MAPPING
+        .captures_iter(&file.content)
+        .find_map(|capture| {
+            let ann_end = capture.get(0)?.end();
+            let nearest_class = class_offsets.iter().filter(|off| **off >= ann_end).min().copied();
+            let nearest_method = method_spans
+                .iter()
+                .map(|(off, _)| *off)
+                .filter(|off| *off >= ann_end)
+                .min();
+            match (nearest_class, nearest_method) {
+                (Some(coff), Some(moff)) if moff < coff => None, // 方法更近 → 方法级,跳过
+                (Some(_), _) => Some(capture[1].to_string()),
+                _ => None,
+            }
+        })
+        .unwrap_or_default();
     for capture in METHOD_MAPPING.captures_iter(&file.content) {
         let matched = capture.get(0).unwrap();
-        let method = capture[1].to_uppercase();
+        let ann_offset = matched.start();
+        // 配对 ann 之后最近的 method;若 ann 与该 method 之间隔着 class/interface 声明,
+        // 说明这是类级 @RequestMapping(应仅作 base,不产方法 endpoint)→ 跳过。
+        let pair = method_spans
+            .iter()
+            .filter(|(offset, _)| *offset > ann_offset)
+            .min_by_key(|(offset, _)| *offset);
+        let is_class_level = match pair {
+            Some((method_offset, _)) => class_offsets
+                .iter()
+                .any(|&coff| coff > ann_offset && coff < *method_offset),
+            None => true,
+        };
+        if is_class_level {
+            continue;
+        }
+        // group1 缺失 = @RequestMapping(无动词)→ method 通配,metadata 不含 method,
+        // 让 analysis 端 endpoint_method=None → 与任意前端 call_method 低置信匹配。
+        let method = capture.get(1).map(|m| m.as_str().to_uppercase());
         let endpoint_path = normalize_path(&format!("{base}{}", &capture[2]));
-        let name = format!("{method} {endpoint_path}");
+        let name = match &method {
+            Some(verb) => format!("{verb} {endpoint_path}"),
+            None => format!("ANY {endpoint_path}"),
+        };
         let line = line_of(&file.content, matched.start());
+        let mut meta = serde_json::Map::new();
+        if let Some(verb) = &method {
+            meta.insert("method".into(), json!(verb));
+        }
+        meta.insert("path".into(), json!(endpoint_path));
         let entity = Entity::new(
             EntityId::stable("workspace", path, EntityKind::HttpEndpoint, &name, ""),
             EntityKind::HttpEndpoint,
             &name,
             &name,
         )
-        .with_metadata(json!({"method": method, "path": endpoint_path}))
+        .with_metadata(serde_json::Value::Object(meta))
         .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "Spring mapping annotation");
         let endpoint_id = entity.id.clone();
         add_contained(file, path, entity, line, entities, edges);
         // method→endpoint(Exposes):mapping 注解贴在方法声明前,配对"注解 offset 之后
         // 最近的 method",让 find_endpoint/relay 能从 URL 追到处理方法。
-        let ann_offset = matched.start();
-        if let Some((_, method_id)) = method_spans
-            .iter()
-            .filter(|(offset, _)| *offset > ann_offset)
-            .min_by_key(|(offset, _)| *offset)
-        {
+        if let Some((_, method_id)) = pair {
             edges.push(
                 Edge::new(method_id.clone(), endpoint_id, EdgeKind::Exposes).with_evidence(
                     path,
@@ -274,6 +339,10 @@ fn extract_java(
     extract_mybatis_plus(file, path, entities, edges);
     extract_implements(file, entities);
     extract_interface_endpoints(file, path, entities, edges, config);
+    extract_annotations(file, path, &method_spans, entities, edges, config);
+    extract_tests(file, path, &method_spans, entities, edges);
+    extract_jobs(file, path, &method_spans, entities, edges, config);
+    extract_aspects(file, path, &method_spans, entities, edges);
     Ok(())
 }
 
@@ -772,6 +841,257 @@ fn extract_interface_endpoints(
             })
             .collect();
         edges.extend(entry_edges);
+    }
+}
+
+/// 通用注解索引(P1-1):白名单注解(@Transactional 等业务/框架注解)→ Annotation 实体 +
+/// owner-[Annotated]->annotation 边(Fact)。owner 按 offset 配对到 ann 之后最近的
+/// class/interface/method/field 声明。默认白名单(非全扫)避免 @Override 等噪音爆炸。
+fn extract_annotations(
+    file: &SourceFile,
+    path: &str,
+    method_spans: &[(usize, EntityId)],
+    entities: &mut Vec<Entity>,
+    edges: &mut Vec<Edge>,
+    config: &SemanticsConfig,
+) {
+    let whitelist: HashSet<&str> = config.annotation_whitelist.iter().map(|s| s.as_str()).collect();
+    if whitelist.is_empty() {
+        return;
+    }
+    let content = &file.content;
+    // owner 候选:(声明 name offset, EntityId)。class/interface、method、field 合并取最近。
+    let mut owners: Vec<(usize, EntityId)> = Vec::new();
+    for capture in JAVA_CLASS.captures_iter(content) {
+        let name = capture.get(2).unwrap();
+        let kind = if &capture[1] == "interface" {
+            EntityKind::Interface
+        } else {
+            EntityKind::Class
+        };
+        owners.push((
+            name.start(),
+            EntityId::stable("workspace", path, kind, name.as_str(), ""),
+        ));
+    }
+    for (offset, id) in method_spans {
+        owners.push((*offset, id.clone()));
+    }
+    for capture in JAVA_FIELD.captures_iter(content) {
+        let name = capture.get(1).unwrap();
+        owners.push((
+            name.start(),
+            EntityId::stable("workspace", path, EntityKind::Field, name.as_str(), ""),
+        ));
+    }
+    owners.sort_by_key(|(offset, _)| *offset);
+    for capture in AT_ANNOTATION.captures_iter(content) {
+        let ann_name = capture.get(1).unwrap();
+        if !whitelist.contains(ann_name.as_str()) {
+            continue;
+        }
+        let ann_offset = capture.get(0).unwrap().start();
+        let Some((_, owner_id)) = owners
+            .iter()
+            .filter(|(offset, _)| *offset > ann_offset)
+            .min_by_key(|(offset, _)| *offset)
+        else {
+            continue;
+        };
+        let line = line_of(content, ann_offset);
+        let annotation = Entity::new(
+            EntityId::stable(
+                "workspace",
+                path,
+                EntityKind::Annotation,
+                ann_name.as_str(),
+                &format!("{line}"),
+            ),
+            EntityKind::Annotation,
+            ann_name.as_str(),
+            format!("{path}#{}@{line}", ann_name.as_str()),
+        )
+        .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "annotation usage");
+        let ann_id = annotation.id.clone();
+        entities.push(annotation);
+        edges.push(
+            Edge::new(owner_id.clone(), ann_id, EdgeKind::Annotated).with_evidence(
+                path,
+                line,
+                line,
+                EvidenceClass::Fact,
+                1.0,
+                "entity annotated with @…",
+            ),
+        );
+    }
+}
+
+/// 测试用例(P1-4):@Test 方法 → TestCase 实体(Fact)。Tests 边(test_class→被测类)
+/// 由 resolve_cross_stack 按命名约定解析(见 analysis)。
+fn extract_tests(
+    file: &SourceFile,
+    path: &str,
+    method_spans: &[(usize, EntityId)],
+    entities: &mut Vec<Entity>,
+    _edges: &mut Vec<Edge>,
+) {
+    let content = &file.content;
+    // 先借 entities 收集 name 映射、提取 (method_name, line) 后释放借用,再 push TestCase
+    // (push 需要 mutable borrow,与不可变 name_by_id 冲突)。
+    let hits: Vec<(String, u32)> = {
+        let name_by_id: HashMap<&EntityId, &str> = entities
+            .iter()
+            .filter(|entity| entity.kind == EntityKind::Method)
+            .filter_map(|entity| Some((&entity.id, entity.name.as_str())))
+            .collect();
+        AT_TEST
+            .captures_iter(content)
+            .filter_map(|capture| {
+                let ann_offset = capture.get(0)?.start();
+                let (_, method_id) = method_spans
+                    .iter()
+                    .filter(|(offset, _)| *offset > ann_offset)
+                    .min_by_key(|(offset, _)| *offset)?;
+                let line = line_of(content, ann_offset);
+                let method_name = name_by_id.get(method_id).copied().unwrap_or("test").to_string();
+                Some((method_name, line))
+            })
+            .collect()
+    };
+    for (method_name, line) in hits {
+        let test_case = Entity::new(
+            EntityId::stable(
+                "workspace",
+                path,
+                EntityKind::TestCase,
+                &method_name,
+                &format!("test:{line}"),
+            ),
+            EntityKind::TestCase,
+            &method_name,
+            format!("{path}#test:{method_name}:{line}"),
+        )
+        .with_metadata(json!({"tested_method": method_name}))
+        .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "JUnit @Test method");
+        entities.push(test_case);
+    }
+}
+
+/// 调度入口(P1-6):@Scheduled/@XxlJob/@JobHandler 方法 → Job 实体 + Job-[Schedules]->handler。
+/// Job 作为端到端链路的定时起点(batch→调用链→表)。
+fn extract_jobs(
+    file: &SourceFile,
+    path: &str,
+    method_spans: &[(usize, EntityId)],
+    entities: &mut Vec<Entity>,
+    edges: &mut Vec<Edge>,
+    config: &SemanticsConfig,
+) {
+    let sched = &config.scheduler_annotations;
+    if sched.is_empty() {
+        return;
+    }
+    let alternation = sched
+        .iter()
+        .map(|annotation| regex::escape(annotation))
+        .collect::<Vec<_>>()
+        .join("|");
+    let re = Regex::new(&format!(r"@({alternation})\b")).unwrap();
+    let content = &file.content;
+    // 先借 entities 收集 name 映射,提取 (method_name, method_id, line, trigger) 后释放,
+    // 再 push Job + Schedules 边(mutable borrow 冲突)。
+    let hits: Vec<(String, EntityId, u32, String)> = {
+        let name_by_id: HashMap<&EntityId, &str> = entities
+            .iter()
+            .filter(|entity| entity.kind == EntityKind::Method)
+            .filter_map(|entity| Some((&entity.id, entity.name.as_str())))
+            .collect();
+        re.captures_iter(content)
+            .filter_map(|capture| {
+                let trigger = capture.get(1)?.as_str().to_string();
+                let ann_offset = capture.get(0)?.start();
+                let (_, method_id) = method_spans
+                    .iter()
+                    .filter(|(offset, _)| *offset > ann_offset)
+                    .min_by_key(|(offset, _)| *offset)?;
+                let line = line_of(content, ann_offset);
+                let method_name = name_by_id.get(method_id).copied().unwrap_or("job").to_string();
+                Some((method_name, method_id.clone(), line, trigger))
+            })
+            .collect()
+    };
+    for (method_name, method_id, line, trigger) in hits {
+        let job = Entity::new(
+            EntityId::stable(
+                "workspace",
+                path,
+                EntityKind::Job,
+                &method_name,
+                &format!("sched:{line}"),
+            ),
+            EntityKind::Job,
+            &method_name,
+            format!("{path}#job:{method_name}:{line}"),
+        )
+        .with_metadata(json!({"trigger": trigger}))
+        .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "scheduled job entry");
+        let job_id = job.id.clone();
+        entities.push(job);
+        edges.push(
+            Edge::new(job_id, method_id, EdgeKind::Schedules).with_evidence(
+                path,
+                line,
+                line,
+                EvidenceClass::Fact,
+                1.0,
+                "job schedules handler method",
+            ),
+        );
+    }
+}
+
+/// AOP 切面(P1-2):@Around/@Before/@After 的 execution(pointcut) → 解析出全限定方法签名,
+/// 存到 advice method 的 metadata.pointcut,由 resolve_cross_stack 全局匹配目标方法建
+/// Intercepts 边(Inferred)。仅处理 `execution(返回类型 包.类.方法(..))` 完全签名形式,
+/// 通配 *、组合 ||、within/bean 切点不处理(分阶段)。
+fn extract_aspects(
+    file: &SourceFile,
+    _path: &str,
+    method_spans: &[(usize, EntityId)],
+    entities: &mut Vec<Entity>,
+    _edges: &mut Vec<Edge>,
+) {
+    let content = &file.content;
+    for capture in ADVICE_ANN.captures_iter(content) {
+        let ann_offset = capture.get(0).unwrap().start();
+        let pointcut_expr = capture.get(2).unwrap().as_str();
+        let Some(signature) = EXECUTION_SIG
+            .captures(pointcut_expr)
+            .and_then(|inner| inner.get(1))
+            .map(|m| m.as_str().to_string())
+        else {
+            continue;
+        };
+        let Some((_, method_id)) = method_spans
+            .iter()
+            .filter(|(offset, _)| *offset > ann_offset)
+            .min_by_key(|(offset, _)| *offset)
+        else {
+            continue;
+        };
+        for entity in entities.iter_mut() {
+            if entity.id == *method_id {
+                let mut meta = match entity.metadata.clone() {
+                    serde_json::Value::Object(map) => map,
+                    _ => serde_json::Map::new(),
+                };
+                meta.insert("pointcut".into(), json!(signature));
+                meta.insert("aspect_advice".into(), json!(true));
+                entity.metadata = serde_json::Value::Object(meta);
+                break;
+            }
+        }
     }
 }
 

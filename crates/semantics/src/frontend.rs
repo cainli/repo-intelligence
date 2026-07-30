@@ -1,7 +1,7 @@
 //! 前端提取:Vue 单文件组件页、`a.b` 属性引用(FrontendField)、HTTP 调用。
 //! 噪声词(JS 内建方法)从 `SemanticsConfig` 读,默认 builtin ~70 个。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use anyhow::Result;
@@ -23,6 +23,19 @@ static HTTP_CALL: LazyLock<Regex> = LazyLock::new(|| {
     // 端点就不产生边,下游无影响,作为可接受的召回换精度权衡。
     Regex::new(
         r#"(?i)\b(?:[\w$]*(?:\.[\w$]+|\[[^\]]+\])*\.)?(get|post|put|delete|patch)\(\s*["'`]([^"'`]+)["'`]"#,
+    )
+    .unwrap()
+});
+// 常量 URL 定义:const/let/var NAME = '/x' → 建 name→url 映射(P0-1c)。仅取"像 URL"
+// 的值(以 / 或 http 开头),避免把 const name="hello" 当 URL。
+static CONST_URL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)(?:const|let|var)\s+([A-Za-z_$]\w*)\s*=\s*["'`]([^"'`]+)["'`]"#).unwrap()
+});
+// 变量形式的 HTTP 调用:get(VAR) —— VAR 须命中 CONST_URL 映射才认,过滤 map.get(key)
+// 这类同名非 HTTP 调用。
+static HTTP_CALL_VAR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)\b(?:[\w$]*(?:\.[\w$]+|\[[^\]]+\])*\.)?(get|post|put|delete|patch)\(\s*([A-Za-z_$]\w*)\s*\)"#,
     )
     .unwrap()
 });
@@ -137,6 +150,43 @@ fn extract_frontend(
             EvidenceClass::Fact,
             1.0,
             "frontend HTTP call",
+        );
+        add_contained(file, path, call, line, entities, edges);
+    }
+    // 同文件内常量 URL 引用(P0-1c):先建 name→url 映射,再认 get(VAR) 形式的调用,
+    // 召回封装在常量里的 URL(字面量正则捕获不到变量)。
+    let const_urls: HashMap<String, String> = CONST_URL
+        .captures_iter(&file.content)
+        .filter_map(|capture| {
+            let name = capture.get(1)?.as_str().to_string();
+            let value = capture.get(2)?.as_str();
+            let looks_url = value.starts_with('/') || value.to_lowercase().starts_with("http");
+            looks_url.then(|| (name, normalize_path(value)))
+        })
+        .collect();
+    for capture in HTTP_CALL_VAR.captures_iter(&file.content) {
+        let matched = capture.get(0).unwrap();
+        let method = capture[1].to_uppercase();
+        let var = capture.get(2).unwrap().as_str();
+        let Some(url) = const_urls.get(var) else {
+            continue;
+        };
+        let name = format!("{method} {url}");
+        let line = line_of(&file.content, matched.start());
+        let call = Entity::new(
+            EntityId::stable("workspace", path, EntityKind::HttpClientCall, &name, ""),
+            EntityKind::HttpClientCall,
+            &name,
+            format!("{path}#{name}"),
+        )
+        .with_metadata(json!({"method": method, "path": url}))
+        .with_evidence(
+            path,
+            line,
+            line,
+            EvidenceClass::Inferred,
+            0.7,
+            "frontend HTTP call via constant URL",
         );
         add_contained(file, path, call, line, entities, edges);
     }

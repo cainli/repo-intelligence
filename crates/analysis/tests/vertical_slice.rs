@@ -1075,3 +1075,269 @@ fn implements_custom_interface_becomes_endpoint() {
         "handle() 应经 Exposes 连到 S27204 endpoint: {exposed:?}"
     );
 }
+
+#[test]
+fn method_level_request_mapping_wildcard_match() {
+    // P0-1a:方法级 @RequestMapping("/foo")(无动词)→ 产 endpoint(ANY /foo,method 通配);
+    // 前端 POST /foo 经 method 通配 + path 精确匹配产生 matches_endpoint 边(Inferred 低置信)。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("Ctl.java"),
+        r#"
+        @RestController
+        class Ctl {
+          @RequestMapping("/foo")
+          String handle() { return ""; }
+        }
+        "#,
+    )
+    .unwrap();
+    fs::write(dir.path().join("p.vue"), r#"<script>axios.post("/foo")</script>"#).unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    let call = store
+        .search(SearchQuery::new("POST /foo").with_limit(10))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::HttpClientCall)
+        .expect("http_client_call POST /foo")
+        .entity;
+    let t = store
+        .traverse(
+            TraverseQuery::outbound(call.id)
+                .with_depth(1)
+                .with_kinds(vec![EdgeKind::MatchesEndpoint]),
+        )
+        .unwrap();
+    let edge = t
+        .edges
+        .iter()
+        .find(|e| e.kind == EdgeKind::MatchesEndpoint)
+        .expect("matches_endpoint via method wildcard");
+    let ev = edge.evidence.first().expect("evidence");
+    assert_eq!(ev.classification, EvidenceClass::Inferred);
+    assert!(
+        ev.confidence < 0.6,
+        "通配匹配应低置信, got {}",
+        ev.confidence
+    );
+}
+
+#[test]
+fn segment_suffix_align_rejects_long_tail() {
+    // P0-1b:段数差 >3 的长尾不连(/foo 不应误连 /a/b/c/d/foo)。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("Ctl.java"),
+        r#"
+        @RestController
+        class Ctl {
+          @GetMapping("/a/b/c/d/foo")
+          String handle() { return ""; }
+        }
+        "#,
+    )
+    .unwrap();
+    fs::write(dir.path().join("p.vue"), r#"<script>axios.get("/foo")</script>"#).unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    let call = store
+        .search(SearchQuery::new("GET /foo").with_limit(10))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::HttpClientCall)
+        .expect("http_client_call")
+        .entity;
+    let t = store
+        .traverse(
+            TraverseQuery::outbound(call.id)
+                .with_depth(1)
+                .with_kinds(vec![EdgeKind::MatchesEndpoint]),
+        )
+        .unwrap();
+    assert!(t.edges.is_empty(), "段数差>3 的长尾不应连, got {:?}", t.edges);
+}
+
+#[test]
+fn test_case_and_tests_edge() {
+    // P1-4:@Test → TestCase 实体;FooTest → Foo Tests 边(命名约定)。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("Foo.java"), "class Foo { void bar() {} }").unwrap();
+    fs::write(
+        dir.path().join("FooTest.java"),
+        r#"
+        class FooTest {
+          @Test
+          void testBar() {}
+        }
+        "#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    store
+        .search(SearchQuery::new("testBar").with_limit(20))
+        .unwrap()
+        .iter()
+        .find(|m| m.entity.kind == EntityKind::TestCase)
+        .expect("TestCase from @Test");
+    let test_class = store
+        .search(SearchQuery::new("FooTest").with_limit(20))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::Class && m.entity.name == "FooTest")
+        .expect("FooTest class")
+        .entity;
+    let t = store
+        .traverse(
+            TraverseQuery::outbound(test_class.id)
+                .with_depth(1)
+                .with_kinds(vec![EdgeKind::Tests]),
+        )
+        .unwrap();
+    assert!(
+        t.entities
+            .iter()
+            .any(|e| e.kind == EntityKind::Class && e.name == "Foo"),
+        "FooTest 应经 Tests 连到 Foo: {:?}",
+        t.entities
+    );
+}
+
+#[test]
+fn scheduled_job_with_schedules_edge() {
+    // P1-6:@Scheduled 方法 → Job 实体 + Job-[Schedules]->handler。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("Batch.java"),
+        r#"
+        class Batch {
+          @Scheduled(cron = "0 * * * * *")
+          public void runJob() {}
+        }
+        "#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    let job = store
+        .search(SearchQuery::new("runJob").with_limit(20))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::Job)
+        .expect("Job from @Scheduled")
+        .entity;
+    let t = store
+        .traverse(
+            TraverseQuery::outbound(job.id)
+                .with_depth(1)
+                .with_kinds(vec![EdgeKind::Schedules]),
+        )
+        .unwrap();
+    assert!(
+        t.entities
+            .iter()
+            .any(|e| e.kind == EntityKind::Method && e.name == "runJob"),
+        "Job 应经 Schedules 连到 handler: {:?}",
+        t.entities
+    );
+}
+
+#[test]
+fn transactional_annotation_entity_and_edge() {
+    // P1-1:@Transactional(白名单)→ Annotation 实体 + class-[Annotated]->annotation。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("Svc.java"),
+        r#"
+        @Transactional
+        class Svc { void op() {} }
+        "#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    let svc = store
+        .search(SearchQuery::new("Svc").with_limit(20))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::Class && m.entity.name == "Svc")
+        .expect("Svc class")
+        .entity;
+    let t = store
+        .traverse(
+            TraverseQuery::outbound(svc.id)
+                .with_depth(1)
+                .with_kinds(vec![EdgeKind::Annotated]),
+        )
+        .unwrap();
+    assert!(
+        t.entities
+            .iter()
+            .any(|e| e.kind == EntityKind::Annotation && e.name == "Transactional"),
+        "Svc 应经 Annotated 连到 Transactional: {:?}",
+        t.entities
+    );
+}
+
+#[test]
+fn xml_insert_produces_writes_column_edge() {
+    // P1-3:insert 列 → writes_column 边(statement-[WritesColumn]->column)。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("M.xml"),
+        r#"<mapper namespace="M">
+          <insert id="addRow">
+            INSERT INTO t (col_a, col_b) VALUES (#{a}, #{b})
+          </insert>
+        </mapper>"#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    let stmt = store
+        .search(SearchQuery::new("addRow").with_limit(20))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::XmlStatement)
+        .expect("XmlStatement addRow")
+        .entity;
+    let t = store
+        .traverse(
+            TraverseQuery::outbound(stmt.id)
+                .with_depth(1)
+                .with_kinds(vec![EdgeKind::WritesColumn]),
+        )
+        .unwrap();
+    assert!(
+        t.entities
+            .iter()
+            .any(|e| e.kind == EntityKind::Column && e.name == "col_a"),
+        "insert 应经 WritesColumn 连到 col_a: {:?}",
+        t.entities
+    );
+}
+
+#[test]
+fn frontend_constant_url_call() {
+    // P0-1c:const URL='/x' 后 get(URL) → http_client_call(PATH /x)。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("p.vue"),
+        r#"<script>
+        const FETCH_URL = "/api/x";
+        axios.get(FETCH_URL);
+        </script>"#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    let call = store
+        .search(SearchQuery::new("GET /api/x").with_limit(20))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::HttpClientCall)
+        .expect("http_client_call from constant URL")
+        .entity;
+    assert!(call.name.contains("/api/x"), "name={}", call.name);
+}

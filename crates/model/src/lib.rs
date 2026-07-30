@@ -57,6 +57,12 @@ pub enum EntityKind {
     Column,
     TestCase,
     ConfigFile,
+    /// 自定义/框架注解(`@Transactional`、项目自研 `@CncXxx` 等)。被注解的实体
+    /// 通过 `Annotated` 边指向它,让"哪些类用了某注解"可查、可做注解变更影响分析。
+    Annotation,
+    /// 定时/批处理调度入口(`@Scheduled`/`@XxlJob`/`@JobHandler` 等)。作为端到端
+    /// 链路的起点语义,通过 `Schedules` 边指向它调度的 handler 方法。
+    Job,
 }
 
 impl EntityKind {
@@ -89,6 +95,8 @@ impl EntityKind {
             Self::Column => "column",
             Self::TestCase => "test_case",
             Self::ConfigFile => "config_file",
+            Self::Annotation => "annotation",
+            Self::Job => "job",
         }
     }
 }
@@ -211,6 +219,16 @@ pub enum EdgeKind {
     DependsOn,
     Injects,
     SubmoduleOf,
+    /// 实体 -[Annotated]-> Annotation:`@Xxx` 注解使用(Fact,同文件可见)。
+    Annotated,
+    /// aspect_method -[Intercepts]-> target_method:AOP 切面拦截(Inferred,pointcut 解析置信有限)。
+    Intercepts,
+    /// test_class/method -[Tests]-> 被测类:`XxxTest` 测试覆盖(Inferred,命名约定 + 引用推断)。
+    Tests,
+    /// interface -[Implements]-> class:接口的实现关系(Fact,编译时生成代码如 MapStruct Impl 补全)。
+    Implements,
+    /// job -[Schedules]-> handler:调度入口触发的方法(Fact,注解贴在方法前)。
+    Schedules,
 }
 
 impl EdgeKind {
@@ -234,6 +252,11 @@ impl EdgeKind {
             Self::DependsOn => "depends_on",
             Self::Injects => "injects",
             Self::SubmoduleOf => "submodule_of",
+            Self::Annotated => "annotated",
+            Self::Intercepts => "intercepts",
+            Self::Tests => "tests",
+            Self::Implements => "implements",
+            Self::Schedules => "schedules",
         }
     }
 }

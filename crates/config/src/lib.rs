@@ -59,6 +59,27 @@ pub const DEFAULT_FRONTEND_NOISE: &[&str] = &[
     "addEventListener", "removeEventListener", "preventDefault", "stopPropagation",
 ];
 
+/// 放行的生成源码目录前缀（命中 builtin exclude 但相对路径匹配这些前缀 → 仍索引）。
+/// 默认放行 Gradle/Maven 注解处理器产物（MapStruct Impl 等），不放行整个 build/
+/// （避免扫进 build/classes、build/libs 编译产物）。
+pub const DEFAULT_GENERATED_SOURCE_WHITELIST: &[&str] = &["build/generated/sources"];
+
+/// 调度入口注解（@Scheduled/@XxlJob/@JobHandler 等）。命中 → Job 实体 + Schedules 边。
+/// 短列表替换语义：默认注入 builtin，用户填写则完全替换（自控全集）。
+pub const DEFAULT_SCHEDULER_ANNOTATIONS: &[&str] = &["Scheduled", "XxlJob", "JobHandler"];
+
+/// 值得索引的注解白名单（@Transactional 等业务/框架注解）。命中 → Annotation 实体 +
+/// Annotated 边。默认白名单而非全扫：全扫会让 @Override/@Autowired 等噪音边爆炸，
+/// 在 250k 实体的企业项目里不可接受。
+pub const DEFAULT_ANNOTATION_WHITELIST: &[&str] = &[
+    "Transactional", "Async", "Cacheable", "CacheEvict", "EventListener",
+    "PostConstruct", "PreDestroy", "TransactionalEventListener", "Aspect",
+];
+
+/// 注解黑名单（即便被白名单规则意外命中也绝不索引的噪音）。
+pub const DEFAULT_ANNOTATION_BLACKLIST: &[&str] =
+    &["Override", "SuppressWarnings", "Deprecated", "Generated"];
+
 const DEFAULT_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const DEFAULT_IMPACT_LIMIT: usize = 100;
 const DEFAULT_MAX_IMPACT_LIMIT: usize = 500;
@@ -84,6 +105,30 @@ fn default_custom_endpoint_annotations() -> Vec<String> {
 }
 fn default_custom_endpoint_interfaces() -> Vec<String> {
     DEFAULT_CUSTOM_ENDPOINT_INTERFACES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+fn default_generated_source_whitelist() -> Vec<String> {
+    DEFAULT_GENERATED_SOURCE_WHITELIST
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+fn default_scheduler_annotations() -> Vec<String> {
+    DEFAULT_SCHEDULER_ANNOTATIONS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+fn default_annotation_whitelist() -> Vec<String> {
+    DEFAULT_ANNOTATION_WHITELIST
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+fn default_annotation_blacklist() -> Vec<String> {
+    DEFAULT_ANNOTATION_BLACKLIST
         .iter()
         .map(|s| (*s).to_string())
         .collect()
@@ -130,6 +175,10 @@ pub struct DiscoveryConfig {
     /// 单文件大小上限，超过则跳过。替换 builtin（2 MiB）。
     #[serde(default = "default_max_file_bytes")]
     pub max_file_bytes: u64,
+    /// 放行的生成源码目录前缀。命中 builtin exclude（如 `build`）但相对路径匹配这些
+    /// 前缀 → 仍索引（放行 `build/generated/sources` 注解处理器产物）。替换 builtin。
+    #[serde(default = "default_generated_source_whitelist")]
+    pub generated_source_whitelist: Vec<String>,
 }
 
 impl Default for DiscoveryConfig {
@@ -138,6 +187,7 @@ impl Default for DiscoveryConfig {
             excluded_dirs_extra: Vec::new(),
             excluded_patterns: Vec::new(),
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
+            generated_source_whitelist: default_generated_source_whitelist(),
         }
     }
 }
@@ -156,6 +206,15 @@ impl DiscoveryConfig {
         }
         out
     }
+
+    /// 相对路径是否命中生成源码白名单前缀（用于在排除 `build/` 后放行其 generated
+    /// 子树）。路径分隔符归一为 `/` 后做前缀匹配。
+    pub fn is_generated_whitelisted(&self, relative_path: &str) -> bool {
+        let normalized = relative_path.replace('\\', "/");
+        self.generated_source_whitelist
+            .iter()
+            .any(|prefix| normalized.starts_with(prefix))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +231,16 @@ pub struct SemanticsConfig {
     /// 默认注入 builtin 2 个（ApiHandler/IBizProcess），用户填写则完全替换。
     #[serde(default = "default_custom_endpoint_interfaces")]
     pub custom_endpoint_interfaces: Vec<String>,
+    /// 调度入口注解（@Scheduled/@XxlJob/@JobHandler）。短列表替换：命中 → Job 实体 +
+    /// Job-[Schedules]->handler 边，作为端到端链路的调度起点。
+    #[serde(default = "default_scheduler_annotations")]
+    pub scheduler_annotations: Vec<String>,
+    /// 值得索引的注解白名单。短列表替换：命中 → Annotation 实体 + Annotated 边。
+    #[serde(default = "default_annotation_whitelist")]
+    pub annotation_whitelist: Vec<String>,
+    /// 注解黑名单（噪音）。短列表替换。
+    #[serde(default = "default_annotation_blacklist")]
+    pub annotation_blacklist: Vec<String>,
 }
 
 impl Default for SemanticsConfig {
@@ -180,6 +249,9 @@ impl Default for SemanticsConfig {
             frontend_noise_extra: Vec::new(),
             custom_endpoint_annotations: default_custom_endpoint_annotations(),
             custom_endpoint_interfaces: default_custom_endpoint_interfaces(),
+            scheduler_annotations: default_scheduler_annotations(),
+            annotation_whitelist: default_annotation_whitelist(),
+            annotation_blacklist: default_annotation_blacklist(),
         }
     }
 }

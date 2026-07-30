@@ -18,6 +18,14 @@ static SQL_ALIAS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b([A-Za-z_]\w*)\s+AS\s+([A-Za-z_]\w*)").unwrap());
 static SQL_FROM: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(?:FROM|JOIN|UPDATE|INTO)\s+([A-Za-z_][\w.]*)").unwrap());
+// insert 的列列表:INSERT INTO t (col1, col2, …) → group1 = 列清单(P1-3 写入列)。
+static SQL_INSERT_COLS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)INSERT\s+INTO\s+[\w.]+\s*\(([^)]+)\)").unwrap()
+});
+// update 的 SET 段:SET col1=…, col2=… → group1 = SET 子句(再按 word= 取列名)。
+static SQL_UPDATE_SET: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bSET\s+(.*?)(?:\bWHERE\b|;|$)").unwrap()
+});
 
 pub struct XmlExtractor;
 
@@ -118,6 +126,73 @@ fn extract_xml(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges:
                 ),
             );
             entities.push(table);
+        }
+        // insert/update 的写入列 → Column + statement-[WritesColumn]->column(P1-3)。
+        // 历史只提取 select 的读列(ReadsColumn),写入列缺失,导致"哪个列被写"不可查。
+        if operation == "insert" || operation == "update" {
+            let write_cols: Vec<String> = if operation == "insert" {
+                SQL_INSERT_COLS
+                    .captures(sql.as_str())
+                    .and_then(|capture| capture.get(1))
+                    .map(|list| list.as_str())
+                    .map(|list| {
+                        list.split(',')
+                            .map(|token| {
+                                token
+                                    .trim()
+                                    .trim_matches('`')
+                                    .trim_matches('"')
+                                    .to_string()
+                            })
+                            .filter(|token| {
+                                !token.is_empty()
+                                    && token
+                                        .chars()
+                                        .next()
+                                        .is_some_and(|ch| ch.is_ascii_alphabetic())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                SQL_UPDATE_SET
+                    .captures(sql.as_str())
+                    .and_then(|capture| capture.get(1))
+                    .map(|set_clause| set_clause.as_str())
+                    .map(|set_clause| {
+                        let assign_re =
+                            Regex::new(r"([A-Za-z_]\w*)\s*=").unwrap();
+                        assign_re
+                            .captures_iter(set_clause)
+                            .filter_map(|capture| {
+                                capture.get(1).map(|m| m.as_str().to_string())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            for col_name in write_cols {
+                let column = Entity::new(
+                    EntityId::stable("workspace", path, EntityKind::Column, &col_name, ""),
+                    EntityKind::Column,
+                    &col_name,
+                    format!("{path}#{col_name}"),
+                )
+                .with_metadata(json!({"source": "xml_write"}))
+                .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "SQL write column");
+                edges.push(
+                    Edge::new(statement_id_value.clone(), column.id.clone(), EdgeKind::WritesColumn)
+                        .with_evidence(
+                            path,
+                            line,
+                            line,
+                            EvidenceClass::Fact,
+                            1.0,
+                            "insert/update writes column",
+                        ),
+                );
+                entities.push(column);
+            }
         }
     }
 }

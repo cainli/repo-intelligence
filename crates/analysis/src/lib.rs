@@ -444,6 +444,20 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
                 );
             }
             edges.push(edge);
+            // 反向 Implements 边(interface→class):让"接口有哪些实现"可查(P1-5 MapStruct
+            // Impl 等编译时生成代码补全后,接口到实现的显式语义)。
+            let mut impl_edge = Edge::new(iface_id.clone(), entity.id.clone(), EdgeKind::Implements);
+            if let Some(ev) = entity.evidence.first() {
+                impl_edge = impl_edge.with_evidence(
+                    &ev.file,
+                    ev.start_line,
+                    ev.end_line,
+                    EvidenceClass::Fact,
+                    1.0,
+                    "interface implemented by class",
+                );
+            }
+            edges.push(impl_edge);
             interface_to_impls
                 .entry(iface_name)
                 .or_default()
@@ -562,8 +576,10 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
                 .metadata
                 .get("method")
                 .and_then(|value| value.as_str());
-            // custom RPC endpoints(@RmbMap 等)无 method,不与前端 HTTP 调用匹配。
-            if call_method != endpoint_method {
+            // endpoint 无显式 HTTP 动词(@RequestMapping 无 method)→ 视为通配,与任意
+            // 前端 call_method 匹配(下游 match_kind 降置信);否则要求 method 相等。
+            let endpoint_unspecified = endpoint_method.map(|m| m.is_empty()).unwrap_or(true);
+            if !endpoint_unspecified && call_method != endpoint_method {
                 continue;
             }
             let endpoint_path = endpoint
@@ -586,6 +602,16 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
                 _ => None,
             };
             if let Some((classification, confidence, reason)) = match_kind {
+                // endpoint 动词通配(@RequestMapping)时降置信并标 Inferred/tentative。
+                let (classification, confidence, reason) = if endpoint_unspecified {
+                    (
+                        EvidenceClass::Inferred,
+                        confidence * 0.6,
+                        "path matches; endpoint verb unspecified (wildcard)",
+                    )
+                } else {
+                    (classification, confidence, reason)
+                };
                 let evidence = call.evidence.first();
                 let mut edge = Edge::new(
                     call.id.clone(),
@@ -606,6 +632,77 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
             }
         }
     }
+
+    // Tests 边(P1-4):命名约定 XxxTest → Xxx(被测类)。仅对以 Test 结尾的 class 建,
+    // 让"这个类被哪些测试覆盖"可查(Inferred,命名约定)。
+    let class_by_name: HashMap<&str, &EntityId> = entities
+        .iter()
+        .filter(|entity| entity.kind == EntityKind::Class)
+        .map(|entity| (entity.name.as_str(), &entity.id))
+        .collect();
+    for entity in entities {
+        if entity.kind != EntityKind::Class {
+            continue;
+        }
+        let Some(stripped) = entity.name.strip_suffix("Test").filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if let Some(&tested_id) = class_by_name.get(stripped) {
+            let mut edge = Edge::new(entity.id.clone(), tested_id.clone(), EdgeKind::Tests);
+            if let Some(ev) = entity.evidence.first() {
+                edge = edge.with_evidence(
+                    &ev.file,
+                    ev.start_line,
+                    ev.end_line,
+                    EvidenceClass::Inferred,
+                    0.7,
+                    "test class covers target (naming convention)",
+                );
+            }
+            edges.push(edge);
+        }
+    }
+
+    // Intercepts 边(P1-2):aspect advice method.metadata.pointcut(全限定方法签名)→
+    // 目标方法。取签名末段作方法名全局匹配,唯一命中才建边(Inferred,pointcut 解析有限)。
+    let method_by_name: HashMap<&str, Vec<&EntityId>> = {
+        let mut map: HashMap<&str, Vec<&EntityId>> = HashMap::new();
+        for entity in entities {
+            if entity.kind == EntityKind::Method {
+                map.entry(entity.name.as_str()).or_default().push(&entity.id);
+            }
+        }
+        map
+    };
+    for entity in entities {
+        if entity.kind != EntityKind::Method {
+            continue;
+        }
+        let Some(pointcut) = entity.metadata.get("pointcut").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(target_name) = pointcut.rsplit('.').next() else {
+            continue;
+        };
+        if let Some(targets) = method_by_name.get(target_name)
+            && targets.len() == 1
+            && targets[0] != &entity.id
+        {
+            let mut edge = Edge::new(entity.id.clone(), targets[0].clone(), EdgeKind::Intercepts);
+            if let Some(ev) = entity.evidence.first() {
+                edge = edge.with_evidence(
+                    &ev.file,
+                    ev.start_line,
+                    ev.end_line,
+                    EvidenceClass::Inferred,
+                    0.5,
+                    "AOP advice intercepts target (pointcut signature match)",
+                );
+            }
+            edges.push(edge);
+        }
+    }
+
     GraphPatch::add(Vec::new(), edges)
 }
 
@@ -641,8 +738,12 @@ fn segment_suffix_align(call_path: &str, endpoint_path: &str) -> bool {
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect();
-    if endpoint_segments.is_empty() || endpoint_segments.len() >= call_segments.len() {
-        // endpoint 为空,或段数 ≥ call(含相等)→ 不算后缀对齐(相等归精确分支)。
+    if endpoint_segments.is_empty() {
+        return false;
+    }
+    let diff = call_segments.len().saturating_sub(endpoint_segments.len());
+    // 段数差 0 = 精确全等(归精确分支);>3 = 长尾误连(如 /a 误连 /x/y/z/w/a),不连。
+    if diff == 0 || diff > 3 {
         return false;
     }
     let offset = call_segments.len() - endpoint_segments.len();

@@ -73,6 +73,7 @@ pub fn discover(root: &Path) -> Result<Vec<SourceFile>> {
 /// 跳过超过 `max_file_bytes` 的文件，忽略不支持的扩展名。
 pub fn discover_with_config(root: &Path, config: &DiscoveryConfig) -> Result<Vec<SourceFile>> {
     let excluded: HashSet<String> = config.effective_excluded_dirs().into_iter().collect();
+    let whitelist: Vec<String> = config.generated_source_whitelist.clone();
     let max_bytes = config.max_file_bytes;
     let patterns: Vec<glob::Pattern> = config
         .excluded_patterns
@@ -80,13 +81,45 @@ pub fn discover_with_config(root: &Path, config: &DiscoveryConfig) -> Result<Vec
         .map(|p| glob::Pattern::new(p).with_context(|| format!("invalid excluded pattern: {p}")))
         .collect::<Result<_>>()?;
     let mut files = Vec::new();
+    // root 转 owned move 进 filter_entry 闭包(闭包要求 'static,不能借用函数参数 root)。
+    let root_owned = root.to_path_buf();
+    // filter_entry 返回 false 会剪枝整棵子树(不 descend)。`build/` 被 builtin exclude
+    // 剪枝后,`build/generated/sources` 永远到不了。故对 generated 白名单做三层放行:
+    //   (1) 相对路径命中白名单前缀 → 放行(注解处理器产物源码);
+    //   (2) 目录名在 builtin exclude(如 build)→ 剪枝;但若是某白名单前缀的祖先目录
+    //       (build 是 build/generated/sources 的祖先)则放行让其 descend;
+    //   (3) 路径落在某 excluded 顶层目录下(如 build/classes)且非白名单祖先 → 排除
+    //       编译产物(.class/.jar 所在),避免扫进 build/classes、build/libs。
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .git_ignore(true)
         .require_git(false)
         .filter_entry(move |entry| {
+            let rel = entry
+                .path()
+                .strip_prefix(&root_owned)
+                .ok()
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            if !rel.is_empty() && whitelist.iter().any(|p| rel.starts_with(p.as_str())) {
+                return true;
+            }
+            let is_whitelist_ancestor = |r: &str| -> bool {
+                whitelist
+                    .iter()
+                    .any(|p| p == r || p.starts_with(&format!("{r}/")))
+            };
             let name = entry.file_name().to_str();
-            !name.is_some_and(|value| excluded.contains(value))
+            if name.is_some_and(|value| excluded.contains(value)) {
+                return is_whitelist_ancestor(&rel);
+            }
+            if let Some(first_seg) = rel.split('/').next()
+                && !first_seg.is_empty()
+                && excluded.contains(first_seg)
+            {
+                return is_whitelist_ancestor(&rel);
+            }
+            true
         })
         .build();
     for entry in walker {
@@ -225,6 +258,36 @@ mod tests {
             FileKind::from_path(Path::new(&n)),
             FileKind::JavaScript,
             "admin.js 不含 .min.,不应误判"
+        );
+    }
+
+    #[test]
+    fn generated_sources_under_build_are_whitelisted() {
+        // build/ 被 builtin exclude 剪枝,但 build/generated/sources/** 是注解处理器产物
+        // (MapStruct Impl 等),默认白名单放行;build/classes 编译产物(含 .java 也不收)排除。
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(base.join("build/generated/sources/com/acme")).unwrap();
+        std::fs::create_dir_all(base.join("build/classes/com/acme")).unwrap();
+        std::fs::write(
+            base.join("build/generated/sources/com/acme/FooMapperImpl.java"),
+            "class FooMapperImpl {}",
+        )
+        .unwrap();
+        // 即便是 .java,落在 build/classes 编译产物目录下也不应收集(剪枝)。
+        std::fs::write(base.join("build/classes/com/acme/Bar.java"), "class Bar {}").unwrap();
+        let files = discover(base).unwrap();
+        let paths: Vec<String> = files
+            .iter()
+            .map(|f| f.relative_path.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            paths.iter().any(|p| p.ends_with("FooMapperImpl.java")),
+            "build/generated/sources 下的 .java 应被白名单放行,得到 {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains("build/classes")),
+            "build/classes 编译产物不应被收集,得到 {paths:?}"
         );
     }
 }

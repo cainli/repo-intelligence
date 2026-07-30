@@ -107,7 +107,8 @@ fn edge_schema() -> Value {
                     "contains", "declares", "calls", "exposes", "sends_http_request",
                     "matches_endpoint", "has_response_field", "serialized_from", "mapped_from",
                     "binds_to_statement", "executes_sql", "reads_table", "writes_table",
-                    "reads_column", "writes_column", "depends_on", "injects", "submodule_of"
+                    "reads_column", "writes_column", "depends_on", "injects", "submodule_of",
+                    "annotated", "intercepts", "tests", "implements", "schedules"
                 ]
             },
             "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
@@ -198,7 +199,8 @@ fn tool_specs() -> Vec<ToolSpec> {
                         "contains", "declares", "calls", "exposes", "sends_http_request",
                         "matches_endpoint", "has_response_field", "serialized_from", "mapped_from",
                         "binds_to_statement", "executes_sql", "reads_table", "writes_table",
-                        "reads_column", "writes_column", "depends_on", "injects", "submodule_of"
+                        "reads_column", "writes_column", "depends_on", "injects", "submodule_of",
+                        "annotated", "intercepts", "tests", "implements", "schedules"
                     ]
                 },
                 "default": ["calls", "injects"],
@@ -347,6 +349,44 @@ fn tool_specs() -> Vec<ToolSpec> {
             name: "trace_callees",
             description: "Trace what an entity calls (outbound edges). Defaults to `calls` + `injects` so the chain covers both method calls and Spring bean injection (@Autowired) — the dominant cross-file link in Java business code. Resolves the start point by exact entity name, then BFS outward up to `depth`. Cross-file calls/injections are low-confidence inferences; use verify_edge to ground a `tentative` edge in source before trusting it. Set edge_kinds to follow other dependencies (depends_on, reads_table, ...).",
             input_schema: trace_input,
+            output_schema: trace_output.clone(),
+        },
+        ToolSpec {
+            name: "trace_table_access",
+            description: "One-shot: who reads/writes a table and the upstream call chain. Resolves a table (or mapper method) by exact name, then BFS inward (inbound) along reads_table/writes_table + calls + injects, so a single call pulls mapper_method → service → … for that table. `direction` selects read/write/both. Equivalent to trace_callers with the data-flow edge kinds preset.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "name": {"type": "string", "description": "Exact table or mapper-method name to trace access to."},
+                    "direction": {"type": "string", "enum": ["read", "write", "both"], "default": "both", "description": "read = reads_table only; write = writes_table only; both = either."},
+                    "depth": {"type": "integer", "minimum": 0, "default": 4},
+                    "min_confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.0}
+                },
+                "required": ["name"]
+            }),
+            output_schema: trace_output.clone(),
+        },
+        ToolSpec {
+            name: "trace_full_path",
+            description: "One-shot generic end-to-end BFS: resolve an entity by exact name, walk `edge_kinds` in `direction`, optionally filter results to a target `to_kind`. Defaults to a broad edge set (calls/injects/reads_table/writes_table/exposes/matches_endpoint) so one call spans front-end → HTTP → back-end → DB as far as a single direction reaches. Mixed-direction paths (e.g. endpoint → its controller via inbound exposes, then → table via outbound) need two calls — single-direction by design.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "name": {"type": "string", "description": "Exact entity name to start from."},
+                    "to_kind": {"type": "string", "description": "Optional: keep only reached entities of this kind (e.g. \"table\", \"http_endpoint\"). Default keeps all."},
+                    "edge_kinds": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Edge kinds to follow. Default spans calls/injects/reads_table/writes_table/exposes/matches_endpoint for cross-stack reach."
+                    },
+                    "direction": {"type": "string", "enum": ["outbound", "inbound"], "default": "outbound"},
+                    "depth": {"type": "integer", "minimum": 0, "default": 4},
+                    "min_confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.0}
+                },
+                "required": ["name"]
+            }),
             output_schema: trace_output,
         },
         ToolSpec {
@@ -700,6 +740,56 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
                 .clamp(0.0, 1.0) as f32;
             let store = SqliteGraphStore::open(path)?;
             trace_graph(&store, name, depth, kinds, true, min_confidence)?
+        }
+        "trace_table_access" => {
+            let name = arguments["name"].as_str().unwrap_or_default();
+            let direction = arguments["direction"].as_str().unwrap_or("both");
+            let depth = parse_depth(arguments, DEFAULT_TRACE_DEPTH);
+            let min_confidence = arguments["min_confidence"]
+                .as_f64()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0) as f32;
+            let mut kinds = vec![EdgeKind::Calls, EdgeKind::Injects];
+            match direction {
+                "read" => kinds.push(EdgeKind::ReadsTable),
+                "write" => kinds.push(EdgeKind::WritesTable),
+                _ => {
+                    kinds.push(EdgeKind::ReadsTable);
+                    kinds.push(EdgeKind::WritesTable);
+                }
+            }
+            let store = SqliteGraphStore::open(path)?;
+            trace_graph(&store, name, depth, kinds, false, min_confidence)?
+        }
+        "trace_full_path" => {
+            let name = arguments["name"].as_str().unwrap_or_default();
+            let to_kind = arguments["to_kind"].as_str();
+            let outbound = arguments["direction"].as_str().unwrap_or("outbound") != "inbound";
+            let depth = parse_depth(arguments, DEFAULT_TRACE_DEPTH);
+            let min_confidence = arguments["min_confidence"]
+                .as_f64()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0) as f32;
+            let kinds = match &arguments["edge_kinds"] {
+                Value::Null => vec![
+                    EdgeKind::Calls,
+                    EdgeKind::Injects,
+                    EdgeKind::ReadsTable,
+                    EdgeKind::WritesTable,
+                    EdgeKind::Exposes,
+                    EdgeKind::MatchesEndpoint,
+                ],
+                value => serde_json::from_value(value.clone())?,
+            };
+            let store = SqliteGraphStore::open(path)?;
+            let mut result = trace_graph(&store, name, depth, kinds, outbound, min_confidence)?;
+            if let Some(to_kind) = to_kind
+                && let Some(items) = result["items"].as_array_mut()
+            {
+                items.retain(|item| item["kind"].as_str() == Some(to_kind));
+                result["count"] = json!(items.len());
+            }
+            result
         }
         "verify_edge" => {
             let source = arguments["source"].as_str().unwrap_or_default();
