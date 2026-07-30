@@ -9,7 +9,6 @@ use anyhow::{Context, Result};
 use fastembed::{
     InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
 };
-use std::path::PathBuf;
 
 /// 本地 ONNX 文本 embedder。包装 fastembed 单例模型,scan 时批量生成 embedding。
 pub struct Embedder {
@@ -17,19 +16,20 @@ pub struct Embedder {
 }
 
 impl Embedder {
-    /// 从打包的本地模型文件加载 ONNX(无网络)。
+    /// 从 binary 内嵌的模型字节加载 ONNX(自包含——模型 `include_bytes!` 编译进 binary,
+    /// 运行时零文件依赖,故发布的 npm binary 无需额外分发模型文件;修复 v0.1.26 发布包
+    /// 运行时读 CARGO_MANIFEST_DIR 找不到 tokenizer.json 的致命 bug)。
     pub fn new() -> Result<Self> {
-        let dir = model_dir();
-        let read = |name: &str| {
-            std::fs::read(dir.join(name)).with_context(|| format!("读模型文件 {name}"))
-        };
         let tokenizer_files = TokenizerFiles {
-            tokenizer_file: read("tokenizer.json")?,
-            config_file: read("config.json")?,
-            special_tokens_map_file: read("special_tokens_map.json")?,
-            tokenizer_config_file: read("tokenizer_config.json")?,
+            tokenizer_file: include_bytes!("../models/all-MiniLM-L6-v2/tokenizer.json").to_vec(),
+            config_file: include_bytes!("../models/all-MiniLM-L6-v2/config.json").to_vec(),
+            special_tokens_map_file: include_bytes!("../models/all-MiniLM-L6-v2/special_tokens_map.json").to_vec(),
+            tokenizer_config_file: include_bytes!("../models/all-MiniLM-L6-v2/tokenizer_config.json").to_vec(),
         };
-        let mut model = UserDefinedEmbeddingModel::new(read("model.onnx")?, tokenizer_files);
+        let mut model = UserDefinedEmbeddingModel::new(
+            include_bytes!("../models/all-MiniLM-L6-v2/model.onnx").to_vec(),
+            tokenizer_files,
+        );
         // AllMiniLML6V2 用 mean pooling(对短文本/entity 名效果好)。
         model.pooling = Some(Pooling::Mean);
         let model = TextEmbedding::try_new_from_user_defined(
@@ -52,11 +52,6 @@ impl Embedder {
 
     /// 模型维度(AllMiniLML6V2 = 384)。建表/存储用。
     pub const DIM: usize = 384;
-}
-
-/// 打包模型目录(编译时 CARGO_MANIFEST_DIR = crates/embedding)。
-fn model_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/all-MiniLM-L6-v2")
 }
 
 #[cfg(test)]

@@ -199,9 +199,12 @@ impl WorkspaceIndexer {
         }
         // 快照本次变更实体(id + 向量化文本),供 resolve 后增量生成 embedding
         // (apply_patch 将 move combined,故在此先 clone)。
+        // 去重 by id:add_entities 可能含重复 id(同实体多 patch),去重避免重复推理。
+        let mut embed_seen = std::collections::HashSet::new();
         let embed_inputs: Vec<(EntityId, String)> = combined
             .add_entities
             .iter()
+            .filter(|e| embed_seen.insert(e.id.0.clone()))
             .map(|e| {
                 (
                     e.id.clone(),
@@ -259,21 +262,32 @@ impl WorkspaceIndexer {
                 .collect();
             let n = to_embed.len();
             if n > 0 {
-                let mut embedder = repo_intelligence_embedding::Embedder::new()?;
-                let texts: Vec<String> = to_embed.iter().map(|(_, t)| t.clone()).collect();
-                let vecs = embedder.embed(texts)?;
-                let rows: Vec<(EntityId, Vec<f32>, String)> = to_embed
-                    .iter()
-                    .zip(vecs)
-                    .map(|((id, text), vec)| {
-                        (
-                            id.clone(),
-                            vec,
-                            blake3::hash(text.as_bytes()).to_hex().to_string(),
-                        )
-                    })
-                    .collect();
-                store.set_embeddings(&rows)?;
+                // 降级:模型加载/推理/存储任一失败 → warning 跳过,绝不阻塞 scan。
+                // (模型缺失/损坏/OOM 不应让整个 scan 崩;FTS 等其他产物仍保留。)
+                match repo_intelligence_embedding::Embedder::new().and_then(|mut embedder| {
+                    let texts: Vec<String> = to_embed.iter().map(|(_, t)| t.clone()).collect();
+                    embedder.embed(texts)
+                }) {
+                    Ok(vecs) => {
+                        let rows: Vec<(EntityId, Vec<f32>, String)> = to_embed
+                            .iter()
+                            .zip(vecs)
+                            .map(|((id, text), vec)| {
+                                (
+                                    id.clone(),
+                                    vec,
+                                    blake3::hash(text.as_bytes()).to_hex().to_string(),
+                                )
+                            })
+                            .collect();
+                        if let Err(e) = store.set_embeddings(&rows) {
+                            eprintln!("[ri-diag] embedding 存储失败(不阻塞 scan): {e}");
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "[ri-diag] embedding 跳过(模型加载/推理失败,不阻塞 scan): {e}"
+                    ),
+                }
             }
             eprintln!(
                 "[ri-diag] embedding: {n} entities in {:.2}s",

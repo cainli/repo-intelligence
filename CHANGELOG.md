@@ -7,6 +7,18 @@
 
 ## [Unreleased]
 
+## [0.1.27] - 2026-07-30
+
+### Fixed
+
+- **致命 bug**:v0.1.26 发布的 npm binary 运行时找不到模型文件(`tokenizer.json: No such file`),
+  导致 scan 在 embedding 阶段崩溃(大项目 resolve 完成后栽在模型加载)。根因:`Embedder` 用
+  `env!("CARGO_MANIFEST_DIR")/models/` 运行时读文件——该路径是**编译机**路径,用户机器不存在;
+  且 `models/` gitignore、未随 npm 包分发。修复:模型 `include_bytes!` 编译进 binary(自包含,
+  binary +23MB,npm 用户**零配置**)。
+- **embedding 降级**:模型加载/推理/存储任一失败时 warning 跳过,绝不阻塞 scan(FTS 等其他产物仍保留)。
+- **embedding 去重**:scan 的 `embed_inputs` 按 id 去重,避免重复推理(ruoyi 7456→6854 实体)。
+
 ## [0.1.26] - 2026-07-30
 
 ### Added
