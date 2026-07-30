@@ -7,6 +7,16 @@
 
 ## [Unreleased]
 
+## [0.1.21] - 2026-07-30
+
+### Added
+
+- **P1-4 补全:RMB 入口追到处理方法**：implements ApiHandler/IBizProcess 的类，其入口方法
+  （handle/handleRequest/bizProcess/process/apiProcess）经 Exposes 边连到 endpoint，让
+  relay/find_endpoint 能从入口端点追到处理逻辑（反馈 P1-4 完整诉求；此前只建 endpoint）。
+  复用 Declares（class→method）+ Exposes（method→endpoint）既有机制。入口方法名为约定
+  （mes/mos 自研框架无注解标入口），后续可配置化扩展。
+
 ## [0.1.20] - 2026-07-29
 
 ### Added

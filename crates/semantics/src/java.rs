@@ -727,28 +727,51 @@ fn extract_interface_endpoints(
         })
         .collect();
     for (class_name, line, iface) in hits {
-        let entity = Entity::new(
-            EntityId::stable(
-                "workspace",
-                path,
-                EntityKind::HttpEndpoint,
-                &class_name,
-                &format!("iface:{iface}"),
-            ),
+        let class_id = EntityId::stable("workspace", path, EntityKind::Class, &class_name, "");
+        let endpoint_id = EntityId::stable(
+            "workspace",
+            path,
             EntityKind::HttpEndpoint,
             &class_name,
-            &class_name,
-        )
-        .with_metadata(json!({"path": class_name, "framework": format!("implements {iface}")}))
-        .with_evidence(
-            path,
-            line,
-            line,
-            EvidenceClass::Inferred,
-            0.8,
-            "custom RPC entry (implements framework interface)",
+            &format!("iface:{iface}"),
         );
+        let entity = Entity::new(endpoint_id.clone(), EntityKind::HttpEndpoint, &class_name, &class_name)
+            .with_metadata(json!({"path": class_name, "framework": format!("implements {iface}")}))
+            .with_evidence(
+                path,
+                line,
+                line,
+                EvidenceClass::Inferred,
+                0.8,
+                "custom RPC entry (implements framework interface)",
+            );
         add_contained(file, path, entity, line, entities, edges);
+        // 关联入口方法:该类(Declares 边)里名为 handle/bizProcess 等约定入口方法的,建
+        // method→endpoint Exposes 边,让 relay/find_endpoint 能从 RMB 入口追到处理逻辑。
+        // 入口方法名是约定(mes/mos 自研框架无注解标入口),后续可配置化扩展。
+        const ENTRY_METHODS: &[&str] =
+            &["handle", "handleRequest", "bizProcess", "process", "apiProcess"];
+        let entry_edges: Vec<Edge> = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::Declares && edge.source == class_id)
+            .filter_map(|edge| {
+                let is_entry = entities
+                    .iter()
+                    .any(|entity| entity.id == edge.target
+                        && ENTRY_METHODS.contains(&entity.name.as_str()));
+                is_entry.then(|| {
+                    Edge::new(edge.target.clone(), endpoint_id.clone(), EdgeKind::Exposes).with_evidence(
+                        path,
+                        line,
+                        line,
+                        EvidenceClass::Inferred,
+                        0.8,
+                        "entry method of custom RPC handler (implements framework interface)",
+                    )
+                })
+            })
+            .collect();
+        edges.extend(entry_edges);
     }
 }
 

@@ -1051,4 +1051,27 @@ fn implements_custom_interface_becomes_endpoint() {
         .find(|m| m.entity.kind == EntityKind::HttpEndpoint)
         .expect("implements ApiHandler 应产出 HttpEndpoint");
     assert_eq!(endpoint.entity.name, "S27204");
+
+    // P1-4 补全:入口方法 handle() 经 Exposes 连到 endpoint,让 relay 从入口追到处理逻辑。
+    let handle = store
+        .search(SearchQuery::new("handle").with_limit(20))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::Method && m.entity.name == "handle")
+        .expect("handle() method")
+        .entity;
+    let exposed = store
+        .traverse(
+            TraverseQuery::outbound(handle.id)
+                .with_depth(1)
+                .with_kinds(vec![EdgeKind::Exposes]),
+        )
+        .unwrap();
+    assert!(
+        exposed
+            .entities
+            .iter()
+            .any(|e| e.kind == EntityKind::HttpEndpoint && e.name == "S27204"),
+        "handle() 应经 Exposes 连到 S27204 endpoint: {exposed:?}"
+    );
 }
