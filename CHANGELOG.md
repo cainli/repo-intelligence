@@ -7,6 +7,32 @@
 
 ## [Unreleased]
 
+## [0.1.26] - 2026-07-30
+
+### Added
+
+- **三合一对标 codebase-memory**:补齐"全文检索 + 语义检索"两层(结构图原有,共三合一)。
+  - **全文(trigram FTS)**:`entity_fts` 从 `unicode61`(对 camelCase 标识符召回近空)换
+    `trigram`(≥3 字符召回追平 LIKE、大小写不敏感);批量 `INSERT...SELECT` 绕开 v0.1.19
+    逐行写入的 2054s 瓶颈(ruoyi 6854 实体 0.11s);`search` 走 MATCH,短查询(<3 字符,trigram
+    盲区)LIKE fallback;`fts_populated` 保护空库查询不失效;旧库 `ensure_fts_trigram` 迁移。
+  - **语义(本地 embedding)**:新 `crates/embedding`(fastembed 本地 ONNX,用
+    `UserDefinedEmbeddingModel` 绕 hf-hub 的 Content-Range 下载 bug,打包 AllMiniLML6V2 384 维);
+    scan 增量生成(blake3 text_hash 去重);新增 `semantic_search` MCP 工具(余弦 top-k)。
+  - config `[index]` section:`fts5_fulltext` + `embedding`,均默认开。
+  - 模型分发:`scripts/fetch-model.sh`(curl hf-mirror)+ `build.rs` 自动 fetch;`models/` gitignore。
+
+### Changed
+
+- **默认行为变更(破坏性)**:零配置 scan 现在维护 FTS + 生成 embedding。首次全量 scan 多付
+  embedding 推理成本(ruoyi 6854 实体 ~25s debug;增量 scan 只处理变更实体,快)。要回到旧行为:
+  `[index] fts5_fulltext = false` + `embedding = false`。
+- 新增 fastembed/ort/tokenizers 重依赖,binary 体积显著增大。
+
+### Fixed
+
+- `delete_file_subtree` 注释"再清 fts"与代码不符(代码未清)——补上 FTS + embedding 删除。
+
 ## [0.1.25] - 2026-07-30
 
 ### Added
