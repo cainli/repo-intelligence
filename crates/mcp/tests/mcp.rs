@@ -873,7 +873,7 @@ fn trace_tools_declare_typed_schemas() {
         assert_eq!(input_props["depth"]["default"], 2);
         assert_eq!(
             input_props["edge_kinds"]["default"],
-            serde_json::json!(["calls", "injects"])
+            serde_json::json!(["calls", "injects", "declares", "superclass_of"])
         );
         assert_eq!(tool["inputSchema"]["additionalProperties"], false);
         assert_eq!(tool["outputSchema"]["type"], "object");

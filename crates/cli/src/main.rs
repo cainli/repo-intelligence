@@ -8,7 +8,7 @@ use repo_intelligence_config::IndexerConfig;
 use repo_intelligence_analysis::{ImpactAnalyzer, ScanPhase, ScanProgress, WorkspaceIndexer};
 use repo_intelligence_graph::{GraphStore, SqliteGraphStore};
 use repo_intelligence_mcp::build_relay;
-use repo_intelligence_model::{ChangeRequest, SearchQuery};
+use repo_intelligence_model::{ChangeRequest, EntityId, SearchQuery};
 use repo_intelligence_protocol::Envelope;
 
 #[derive(Parser)]
@@ -81,6 +81,15 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         depth: usize,
         #[arg(long, value_enum, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// 语义检索:本地 embedding 模型找语义相近的实体(对标 MCP semantic_search)。
+    /// 对"按意思找"的查询(如搜 authenticate 命中 login 方法)比子串 search 更准。
+    SemanticSearch {
+        query: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long, value_enum, default_value = "text")]
         format: OutputFormat,
     },
     Mcp,
@@ -225,6 +234,15 @@ fn run() -> Result<()> {
             let doc = build_relay(&store, &qn, depth, true)?;
             emit(format, doc)
         }
+        Command::SemanticSearch {
+            query,
+            limit,
+            format,
+        } => {
+            let store = SqliteGraphStore::open(&cli.database)?;
+            let items = semantic_search_items(&store, &query, limit)?;
+            emit(format, items)
+        }
     }
 }
 
@@ -261,4 +279,47 @@ fn emit<T: serde::Serialize>(format: OutputFormat, data: T) -> Result<()> {
         OutputFormat::Yaml => println!("{}", serde_yaml::to_string(&data)?),
     }
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct SemanticHit {
+    entity: repo_intelligence_model::Entity,
+    score: f32,
+}
+
+/// 语义检索编排:embed query → 遍历全库 embedding → 余弦打分 → 取 topN 实体。
+/// 复刻 mcp semantic_search 的核心,但 cli 是一次性进程,Embedder 直接 new(无需单例)。
+fn semantic_search_items(
+    store: &SqliteGraphStore,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SemanticHit>> {
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let all = store.get_all_embeddings()?;
+    if all.is_empty() {
+        anyhow::bail!(
+            "无 embedding:未 scan 或配置 [index] embedding=false。scan 后再查。"
+        );
+    }
+    let mut embedder = repo_intelligence_embedding::Embedder::new()
+        .context("加载 embedding 模型失败")?;
+    let qvec = embedder
+        .embed(vec![query.to_string()])?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("query embedding 为空"))?;
+    let mut scored: Vec<(EntityId, f32)> = all
+        .into_iter()
+        .map(|(id, v)| (id, repo_intelligence_embedding::cosine(&qvec, &v)))
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut hits = Vec::new();
+    for (id, score) in scored.into_iter().take(limit) {
+        if let Some(entity) = store.get_entity(&id)? {
+            hits.push(SemanticHit { entity, score });
+        }
+    }
+    Ok(hits)
 }

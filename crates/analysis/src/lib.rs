@@ -200,16 +200,43 @@ impl WorkspaceIndexer {
         // 快照本次变更实体(id + 向量化文本),供 resolve 后增量生成 embedding
         // (apply_patch 将 move combined,故在此先 clone)。
         // 去重 by id:add_entities 可能含重复 id(同实体多 patch),去重避免重复推理。
+        // 注解画像:给被注解实体拼上注解名,提升 semantic_search 召回质量
+        // (用户搜 "@Transactional" / "事务" 时,注解比 qualified_name 更对齐查询意图)。
+        // 注解在 RI 里建模为 owner -[Annotated]-> Annotation 实体,不在 metadata,
+        // 故需经边回查:先建 annotation_id→name,再按 owner 聚合注解名列表。
+        let ann_name_by_id: HashMap<&EntityId, &str> = combined
+            .add_entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Annotation)
+            .filter_map(|e| Some((&e.id, e.name.as_str())))
+            .collect();
+        let mut anns_by_owner: HashMap<&EntityId, Vec<&str>> = HashMap::new();
+        for edge in &combined.add_edges {
+            if edge.kind == EdgeKind::Annotated {
+                if let Some(name) = ann_name_by_id.get(&edge.target) {
+                    anns_by_owner.entry(&edge.source).or_default().push(*name);
+                }
+            }
+        }
+
         let mut embed_seen = std::collections::HashSet::new();
         let embed_inputs: Vec<(EntityId, String)> = combined
             .add_entities
             .iter()
             .filter(|e| embed_seen.insert(e.id.0.clone()))
             .map(|e| {
-                (
-                    e.id.clone(),
-                    format!("{} {} {}", e.kind.as_str(), e.qualified_name, e.name),
-                )
+                let mut text =
+                    format!("{} {} {}", e.kind.as_str(), e.qualified_name, e.name);
+                if let Some(anns) = anns_by_owner.get(&e.id) {
+                    if !anns.is_empty() {
+                        // 带 @ 前缀,贴近 Java 源码与用户查询习惯。
+                        text.push(' ');
+                        text.push_str(
+                            &anns.iter().map(|a| format!("@{a}")).collect::<Vec<_>>().join(" "),
+                        );
+                    }
+                }
+                (e.id.clone(), text)
             })
             .collect();
         if !combined.add_entities.is_empty() || !combined.add_edges.is_empty() {

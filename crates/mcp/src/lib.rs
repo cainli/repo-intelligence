@@ -5,6 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 use repo_intelligence_config::IndexerConfig;
 use repo_intelligence_analysis::{ImpactAnalyzer, WorkspaceIndexer};
+use repo_intelligence_embedding::cosine;
 use repo_intelligence_graph::{GraphStore, SqliteGraphStore};
 use repo_intelligence_model::{
     ChangeRequest, Edge, EdgeKind, Entity, EntityId, EntityKind, Evidence, EvidenceClass,
@@ -382,13 +383,13 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "trace_callers",
-            description: "Trace who calls an entity (inbound edges). Defaults to `calls` + `injects` so the chain covers both method calls and Spring bean injection (@Autowired) — the dominant cross-file link in Java business code. Resolves the start point by exact entity name, then BFS inward up to `depth`. Cross-file calls/injections are low-confidence inferences; use verify_edge to ground a `tentative` edge in source before trusting it. Set edge_kinds to follow other dependencies (depends_on, reads_table, ...).",
+            description: "Trace who calls an entity (inbound edges). Defaults to `calls` + `injects` + `declares` + `superclass_of` (calls+injects for the call/injection chain, `declares` so a trace from a class drills into its methods, `superclass_of` so a trace from a base/abstract class reaches concrete subclasses) — the dominant cross-file links in Java business code. Resolves the start point by exact entity name, then BFS inward up to `depth`. Cross-file calls/injections are low-confidence inferences; use verify_edge to ground a `tentative` edge in source before trusting it. Set edge_kinds to follow other dependencies (depends_on, reads_table, ...).",
             input_schema: trace_input.clone(),
             output_schema: trace_output.clone(),
         },
         ToolSpec {
             name: "trace_callees",
-            description: "Trace what an entity calls (outbound edges). Defaults to `calls` + `injects` so the chain covers both method calls and Spring bean injection (@Autowired) — the dominant cross-file link in Java business code. Resolves the start point by exact entity name, then BFS outward up to `depth`. Cross-file calls/injections are low-confidence inferences; use verify_edge to ground a `tentative` edge in source before trusting it. Set edge_kinds to follow other dependencies (depends_on, reads_table, ...).",
+            description: "Trace what an entity calls (outbound edges). Defaults to `calls` + `injects` + `declares` + `superclass_of` (calls+injects for the call/injection chain, `declares` so a trace from a class drills into its methods, `superclass_of` so a trace from a base/abstract class reaches concrete subclasses) — the dominant cross-file links in Java business code. Resolves the start point by exact entity name, then BFS outward up to `depth`. Cross-file calls/injections are low-confidence inferences; use verify_edge to ground a `tentative` edge in source before trusting it. Set edge_kinds to follow other dependencies (depends_on, reads_table, ...).",
             input_schema: trace_input,
             output_schema: trace_output.clone(),
         },
@@ -1200,17 +1201,7 @@ fn semantic_search(store: &SqliteGraphStore, query: &str, limit: usize) -> Resul
     Ok(json!({ "items": items, "count": items.len(), "query": query }))
 }
 
-/// 余弦相似度。
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if na == 0.0 || nb == 0.0 {
-        0.0
-    } else {
-        dot / (na * nb)
-    }
-}
+// cosine 已上移到 embedding crate(mcp 与 cli semantic-search 共用,避免复制漂移)。
 
 /// Shared body of the three substring-search tools (search_entities,
 /// find_endpoint, analyze_requirement): parse query/limit/offset/verbose, run the
