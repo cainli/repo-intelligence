@@ -203,8 +203,8 @@ fn tool_specs() -> Vec<ToolSpec> {
                         "annotated", "intercepts", "tests", "implements", "schedules", "superclass_of"
                     ]
                 },
-                "default": ["calls", "injects"],
-                "description": "Edge kinds to follow. Defaults to [\"calls\", \"injects\"] so a call chain includes Spring bean injection (@Autowired/@Resource) — the dominant cross-file link in Java business code, since cross-file method calls are inferred from injected types. Pass e.g. [\"depends_on\"] for table deps or [\"reads_table\",\"writes_table\"] for data flow."
+                "default": ["calls", "injects", "declares", "superclass_of"],
+                "description": "Edge kinds to follow. Defaults to [\"calls\",\"injects\",\"declares\",\"superclass_of\"]: calls+injects for the call chain, declares so a trace starting from a class drills into its methods, superclass_of so a trace from a base/abstract class reaches concrete subclasses (business logic is usually in the subclass). Pass e.g. [\"depends_on\"] for table deps or [\"reads_table\",\"writes_table\"] for data flow."
             },
             "min_confidence": {
                 "type": "number",
@@ -401,7 +401,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "name": {"type": "string", "description": "Exact table or mapper-method name to trace access to."},
                     "direction": {"type": "string", "enum": ["read", "write", "both"], "default": "both", "description": "read = reads_table only; write = writes_table only; both = either."},
-                    "depth": {"type": "integer", "minimum": 0, "default": 4},
+                    "depth": {"type": "integer", "minimum": 0, "default": 2},
                     "min_confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.0}
                 },
                 "required": ["name"]
@@ -423,7 +423,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                         "description": "Edge kinds to follow. Default spans calls/injects/reads_table/writes_table/exposes/matches_endpoint for cross-stack reach."
                     },
                     "direction": {"type": "string", "enum": ["outbound", "inbound"], "default": "outbound"},
-                    "depth": {"type": "integer", "minimum": 0, "default": 4},
+                    "depth": {"type": "integer", "minimum": 0, "default": 2},
                     "min_confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.0}
                 },
                 "required": ["name"]
