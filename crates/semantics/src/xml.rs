@@ -66,8 +66,8 @@ fn extract_xml(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges:
         let sql = capture.get(3).unwrap();
         let line = line_of(&file.content, statement_id.start());
         let metadata = match &namespace {
-            Some(ns) => json!({"operation": operation, "namespace": ns}),
-            None => json!({"operation": operation}),
+            Some(ns) => json!({"operation": operation, "namespace": ns, "sql": sql.as_str()}),
+            None => json!({"operation": operation, "sql": sql.as_str()}),
         };
         let statement = Entity::new(
             EntityId::stable(

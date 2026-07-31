@@ -1,6 +1,6 @@
 {
   "name": "@cainli/repo-intelligence-darwin-arm64",
-  "version": "0.1.28",
+  "version": "0.1.29",
   "description": "macOS arm64 native binary for @cainli/repo-intelligence",
   "license": "Apache-2.0",
   "repository": {

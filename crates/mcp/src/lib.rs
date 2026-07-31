@@ -106,7 +106,7 @@ fn edge_schema() -> Value {
                 "enum": [
                     "contains", "declares", "calls", "exposes", "sends_http_request",
                     "matches_endpoint", "has_response_field", "serialized_from", "mapped_from",
-                    "binds_to_statement", "executes_sql", "reads_table", "writes_table",
+                    "binds_to_statement", "reads_table", "writes_table",
                     "reads_column", "writes_column", "depends_on", "injects", "submodule_of",
                     "annotated", "intercepts", "tests", "implements", "schedules", "superclass_of"
                 ]
@@ -198,7 +198,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                     "enum": [
                         "contains", "declares", "calls", "exposes", "sends_http_request",
                         "matches_endpoint", "has_response_field", "serialized_from", "mapped_from",
-                        "binds_to_statement", "executes_sql", "reads_table", "writes_table",
+                        "binds_to_statement", "reads_table", "writes_table",
                         "reads_column", "writes_column", "depends_on", "injects", "submodule_of",
                         "annotated", "intercepts", "tests", "implements", "schedules", "superclass_of"
                     ]
@@ -212,6 +212,18 @@ fn tool_specs() -> Vec<ToolSpec> {
                 "maximum": 1.0,
                 "default": 0.0,
                 "description": "Drop edges whose confidence is below this. Default 0 returns all edges (low-confidence ones still returned but marked `tentative`). Use e.g. 0.8 to keep only well-evidenced edges."
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 50,
+                "description": "Pagination cap: max entities AND edges returned per page (each truncated independently at offset..offset+limit). Prevents the context explosion that depth-large traces cause. Page with offset."
+            },
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "default": 0,
+                "description": "Number of entities/edges to skip before the first returned row (pagination)."
             }
         },
         "required": ["name"]
@@ -222,7 +234,12 @@ fn tool_specs() -> Vec<ToolSpec> {
         "properties": {
             "items": {"type": "array", "items": entity_schema()},
             "edges": {"type": "array", "items": edge_schema()},
-            "count": {"type": "integer", "minimum": 0},
+            "count": {"type": "integer", "minimum": 0, "description": "Items in this page."},
+            "total_items": {"type": "integer", "minimum": 0, "description": "Total reachable entities (across all pages)."},
+            "total_edges": {"type": "integer", "minimum": 0, "description": "Total reachable edges (across all pages)."},
+            "has_more": {"type": "boolean", "description": "true if another page likely exists at offset+limit."},
+            "limit": {"type": "integer"},
+            "offset": {"type": "integer"},
             "start_count": {"type": "integer", "minimum": 0},
             "hint": {"type": "string"}
         },
@@ -864,8 +881,10 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
                 .as_f64()
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0) as f32;
+            let limit = arguments["limit"].as_u64().unwrap_or(50) as usize;
+            let offset = parse_offset(arguments);
             let store = SqliteGraphStore::open(&path)?;
-            trace_graph(&store, name, depth, kinds, false, min_confidence)?
+            trace_graph(&store, name, depth, kinds, false, min_confidence, limit, offset)?
         }
         "trace_callees" => {
             let name = arguments["name"].as_str().unwrap_or_default();
@@ -875,8 +894,10 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
                 .as_f64()
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0) as f32;
+            let limit = arguments["limit"].as_u64().unwrap_or(50) as usize;
+            let offset = parse_offset(arguments);
             let store = SqliteGraphStore::open(&path)?;
-            trace_graph(&store, name, depth, kinds, true, min_confidence)?
+            trace_graph(&store, name, depth, kinds, true, min_confidence, limit, offset)?
         }
         "trace_table_access" => {
             let name = arguments["name"].as_str().unwrap_or_default();
@@ -901,8 +922,10 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
                     kinds.push(EdgeKind::WritesTable);
                 }
             }
+            let limit = arguments["limit"].as_u64().unwrap_or(50) as usize;
+            let offset = parse_offset(arguments);
             let store = SqliteGraphStore::open(&path)?;
-            trace_graph(&store, name, depth, kinds, false, min_confidence)?
+            trace_graph(&store, name, depth, kinds, false, min_confidence, limit, offset)?
         }
         "trace_full_path" => {
             let name = arguments["name"].as_str().unwrap_or_default();
@@ -933,8 +956,10 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
                 ],
                 value => serde_json::from_value(value.clone())?,
             };
+            let limit = arguments["limit"].as_u64().unwrap_or(50) as usize;
+            let offset = parse_offset(arguments);
             let store = SqliteGraphStore::open(&path)?;
-            let mut result = trace_graph(&store, name, depth, kinds, outbound, min_confidence)?;
+            let mut result = trace_graph(&store, name, depth, kinds, outbound, min_confidence, limit, offset)?;
             if let Some(to_kind) = to_kind
                 && let Some(items) = result["items"].as_array_mut()
             {
@@ -1307,6 +1332,7 @@ fn edge_view(edge: &Edge) -> Value {
         "source": edge.source.0,
         "target": edge.target.0,
         "kind": edge.kind.as_str(),
+        "edge_kind": edge.kind.as_str(),
         "confidence": confidence,
         "tentative": tentative,
         "evidence": serde_json::to_value(&edge.evidence).unwrap_or_default(),
@@ -1330,6 +1356,8 @@ fn trace_graph(
     edge_kinds: Vec<EdgeKind>,
     outbound: bool,
     min_confidence: f32,
+    limit: usize,
+    offset: usize,
 ) -> Result<Value> {
     let matches = store.search(SearchQuery::new(name).with_limit(DEFAULT_SEARCH_LIMIT))?;
     let matched: Vec<Entity> = matches.into_iter().map(|m| m.entity).collect();
@@ -1410,10 +1438,21 @@ fn trace_graph(
     } else {
         "inbound (callers)"
     };
+    // 分页(治 trace 爆炸):edges/items 各自按 limit/offset 截断,peek 法判 has_more。
+    let total_items = items.len();
+    let total_edges = edge_views.len();
+    let items_page: Vec<Entity> = items.into_iter().skip(offset).take(limit).collect();
+    let edges_page: Vec<Value> = edge_views.into_iter().skip(offset).take(limit).collect();
+    let has_more = total_items > offset + limit || total_edges > offset + limit;
     let mut result = json!({
-        "items": serde_json::to_value(&items)?,
-        "edges": edge_views,
-        "count": items.len(),
+        "items": serde_json::to_value(&items_page)?,
+        "edges": edges_page,
+        "count": items_page.len(),
+        "total_items": total_items,
+        "total_edges": total_edges,
+        "has_more": has_more,
+        "limit": limit,
+        "offset": offset,
         "start_count": starts.len(),
     });
     // 多同名起点是调用链最关键的分叉点(mos 的 S27204 入口 vs mes 的 S27204 处理器)。
@@ -1657,7 +1696,7 @@ fn relay_edge_type(kind: EdgeKind, peer_kind: Option<EntityKind>) -> String {
     use EdgeKind as E;
     use EntityKind as K;
     match kind {
-        E::ReadsTable | E::ExecutesSql | E::ReadsColumn | E::BindsToStatement => "db_read",
+        E::ReadsTable | E::ReadsColumn | E::BindsToStatement => "db_read",
         E::WritesTable | E::WritesColumn => "db_write",
         E::MatchesEndpoint | E::SendsHttpRequest => "http_out",
         E::MappedFrom => "field_propagate",
@@ -1920,7 +1959,7 @@ mod tests {
             EdgeKind::Exposes,
             EdgeKind::MatchesEndpoint,
         ];
-        let r1 = trace_graph(&store, "Svc", 5, kinds_with, true, 0.0).unwrap();
+        let r1 = trace_graph(&store, "Svc", 5, kinds_with, true, 0.0, 50, 0).unwrap();
         let qns1: Vec<&str> = r1["items"]
             .as_array()
             .unwrap()
@@ -1941,7 +1980,7 @@ mod tests {
             EdgeKind::Exposes,
             EdgeKind::MatchesEndpoint,
         ];
-        let r2 = trace_graph(&store, "Svc", 5, kinds_without, true, 0.0).unwrap();
+        let r2 = trace_graph(&store, "Svc", 5, kinds_without, true, 0.0, 50, 0).unwrap();
         let qns2: Vec<&str> = r2["items"]
             .as_array()
             .unwrap()
@@ -1998,7 +2037,7 @@ mod tests {
             EdgeKind::Exposes,
             EdgeKind::MatchesEndpoint,
         ];
-        let r1 = trace_graph(&store, "AbstractBase", 5, kinds_with, true, 0.0).unwrap();
+        let r1 = trace_graph(&store, "AbstractBase", 5, kinds_with, true, 0.0, 50, 0).unwrap();
         let qns1: Vec<&str> = r1["items"]
             .as_array()
             .unwrap()
@@ -2019,7 +2058,7 @@ mod tests {
             EdgeKind::Exposes,
             EdgeKind::MatchesEndpoint,
         ];
-        let r2 = trace_graph(&store, "AbstractBase", 5, kinds_without, true, 0.0).unwrap();
+        let r2 = trace_graph(&store, "AbstractBase", 5, kinds_without, true, 0.0, 50, 0).unwrap();
         let qns2: Vec<&str> = r2["items"]
             .as_array()
             .unwrap()

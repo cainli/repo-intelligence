@@ -732,7 +732,12 @@ impl GraphStore for SqliteGraphStore {
         let offset_idx = terms.len() + 3;
         let sql = format!(
             "SELECT e.json FROM entity e WHERE {where_clause} \
-             ORDER BY CASE WHEN lower(e.name) = lower(?{name_idx}) THEN 0 ELSE 1 END, e.name \
+             ORDER BY CASE WHEN lower(e.name) = lower(?{name_idx}) THEN 0 ELSE 1 END, \
+             CASE e.kind \
+               WHEN 'file' THEN 0 WHEN 'class' THEN 1 WHEN 'interface' THEN 2 \
+               WHEN 'method' THEN 3 WHEN 'spring_bean' THEN 4 WHEN 'http_endpoint' THEN 5 \
+               ELSE 9 END, \
+             e.name \
              LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
         );
         let mut statement = self.connection.prepare(&sql)?;

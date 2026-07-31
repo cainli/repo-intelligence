@@ -7,6 +7,19 @@
 
 ## [Unreleased]
 
+## [0.1.29] - 2026-07-31
+
+### Fixed
+- **trace 分页(治 context 爆炸)**:trace_callers/callees/table_access/full_path 加 `limit`(默认 50)/`offset`/`has_more`/`total_items`/`total_edges`,trace_graph 按 offset..limit 截断。之前 depth=6 + 宽边集会爆出 366k 字符;现在分页可控,对齐 search_entities。
+- **edge_kind 命名统一**:edge_view 同时输出 `kind` 和 `edge_kind`(同值),治消费方按 `edge_kind` 取到 null 的现象。
+- **search kind 权重**:search ORDER BY 加 kind 权重(file>class>interface>method>spring_bean>http_endpoint>...),class/method 不再被 field/column 噪声按字母序挤掉。
+
+### Added
+- **SQL body 入图谱**:xml_statement 实体 metadata 现含 `sql`(SQL 正文),打通"方法→SQL 长什么样"。
+
+### Changed
+- 删除死枚举 `ExecutesSql`(从未被任何提取器创建的占位值),清死代码。
+
 ## [0.1.28] - 2026-07-31
 
 ### Added
