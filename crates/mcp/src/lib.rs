@@ -383,7 +383,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "trace_callers",
-            description: "Trace who calls an entity (inbound edges). Defaults to `calls` + `injects` + `declares` + `superclass_of` (calls+injects for the call/injection chain, `declares` so a trace from a class drills into its methods, `superclass_of` so a trace from a base/abstract class reaches concrete subclasses) — the dominant cross-file links in Java business code. Resolves the start point by exact entity name, then BFS inward up to `depth`. Cross-file calls/injections are low-confidence inferences; use verify_edge to ground a `tentative` edge in source before trusting it. Set edge_kinds to follow other dependencies (depends_on, reads_table, ...).",
+            description: "Trace who calls an entity (inbound edges). Defaults to `calls` + `injects` + `declares` + `superclass_of` (calls+injects for the call/injection chain, `declares` so a trace from a method reaches its declaring class, `superclass_of` so a trace from a subclass reaches its base/abstract class) — the dominant cross-file links in Java business code. Resolves the start point by exact entity name, then BFS inward up to `depth`. Cross-file calls/injections are low-confidence inferences; use verify_edge to ground a `tentative` edge in source before trusting it. Set edge_kinds to follow other dependencies (depends_on, reads_table, ...).",
             input_schema: trace_input.clone(),
             output_schema: trace_output.clone(),
         },
@@ -1190,6 +1190,9 @@ fn semantic_search(store: &SqliteGraphStore, query: &str, limit: usize) -> Resul
     let mut scored = all
         .into_iter()
         .map(|(id, v)| (id, cosine(&qvec, &v)))
+        // 过滤非有限 score(双保险:cosine 已归 NaN→0):损坏 embedding 不会既破坏
+        // 排序(NaN 与一切比 Equal)又让 json! 序列化 NaN 致 server panic。
+        .filter(|(_, s)| s.is_finite())
         .collect::<Vec<_>>();
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let mut items = Vec::new();

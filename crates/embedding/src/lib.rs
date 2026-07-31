@@ -57,14 +57,17 @@ impl Embedder {
 /// 余弦相似度(语义检索打分核)。向量运算的天然归属在此 crate,
 /// mcp 的 semantic_search 与 cli 的 semantic-search 子命令共用同一实现,避免复制漂移。
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    // 维度不等(跨版本 embedding / 损坏行):zip 会静默截断算出无意义有限值,
+    // 显式判 0 避免错误排序。含 NaN/Inf 的损坏向量算出的结果也归 0,
+    // 让调用方不必各自处理 NaN(json! 序列化 NaN 会 panic / serde_json Err)。
+    if a.len() != b.len() {
+        return 0.0;
+    }
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
     let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if na == 0.0 || nb == 0.0 {
-        0.0
-    } else {
-        dot / (na * nb)
-    }
+    let score = if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) };
+    if score.is_finite() { score } else { 0.0 }
 }
 
 #[cfg(test)]

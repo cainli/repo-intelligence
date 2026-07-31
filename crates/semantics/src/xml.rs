@@ -39,10 +39,12 @@ static SQL_JOIN_ON: LazyLock<Regex> = LazyLock::new(|| {
 static SQL_COLUMN_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)").unwrap()
 });
-// G1:MyBatis 参数占位符区间。落在其中的标识符(参数名、jdbcType、SQL 类型字面量)
-// 不是列——必须用区间屏蔽,逐字符推断拦不住 `#{name,jdbcType=VARCHAR}` 的深层属性。
-static SQL_PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)#\{[^}]*\}|\$\{[^}]*\}").unwrap()
+// G1:SQL 噪声区间——MyBatis 占位符 `#{...}`/`${...}`(参数名 + jdbcType + SQL 类型)
+// 与动态标签 `<...>`(if/test/collection 等 OGNL 属性名)。落在其中的标识符不是列,
+// 必须用区间屏蔽:逐字符推断拦不住深层 `#{name,jdbcType=VARCHAR}`,也不拦 `<if test=…>`
+// 里的 if/test/userId。WHERE/JOIN 与 UPDATE-SET 共用此清洗。
+static SQL_NOISE_SPAN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)#\{[^}]*\}|\$\{[^}]*\}|<[^>]*>").unwrap()
 });
 // <mapper namespace="com.x.UserDao">:MyBatis 接口绑定的权威键(=接口 Java 全限定名)。
 // 配对 method↔statement 走 namespace + statement_id,见 analysis::resolve_cross_stack。
@@ -183,17 +185,19 @@ fn extract_xml(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges:
                                 path,
                                 EntityKind::SqlField,
                                 &col_name,
-                                "where_join",
+                                statement_id.as_str(),
                             ),
                             EntityKind::SqlField,
                             &col_name,
                             format!("{path}#{}:{}", statement_id.as_str(), col_name),
                         )
                         .with_metadata(json!({"source_column": &col_name, "origin": "where_join"}))
-                        .with_evidence(path, field_line, field_line, EvidenceClass::Fact, 1.0, "SQL where/join column");
+                        // 启发式 regex 提取(可能误分类子查询别名/OGNL),标 Inferred 而非 Fact,
+                        // 让 confidence-gating 能将其与精确解析的 SELECT-alias ReadsColumn 区分、按需 verify。
+                        .with_evidence(path, field_line, field_line, EvidenceClass::Inferred, 0.7, "SQL where/join column (regex-inferred)");
                         edges.push(
                             Edge::new(statement_id_value.clone(), field.id.clone(), EdgeKind::ReadsColumn)
-                                .with_evidence(path, field_line, field_line, EvidenceClass::Fact, 1.0, "where/join reads column"),
+                                .with_evidence(path, field_line, field_line, EvidenceClass::Inferred, 0.7, "where/join reads column (regex-inferred)"),
                         );
                         entities.push(field);
                     }
@@ -233,10 +237,13 @@ fn extract_xml(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges:
                     .and_then(|capture| capture.get(1))
                     .map(|set_clause| set_clause.as_str())
                     .map(|set_clause| {
+                        // 先剥离占位符 + 动态标签:`SET status = #{status,jdbcType=VARCHAR}`
+                        // 清洗后只剩 `status = `,否则 assign_re 会把 `jdbcType =` 也当写入列。
+                        let cleaned = SQL_NOISE_SPAN.replace_all(set_clause, " ");
                         let assign_re =
                             Regex::new(r"([A-Za-z_]\w*)\s*=").unwrap();
                         assign_re
-                            .captures_iter(set_clause)
+                            .captures_iter(&cleaned)
                             .filter_map(|capture| {
                                 capture.get(1).map(|m| m.as_str().to_string())
                             })
@@ -277,7 +284,7 @@ fn extract_xml(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges:
 ///   SQL 关键字/函数名;③ `alias.col` 规范化取 col。不做去重——调用方按列名去重
 ///   (WHERE 与 JOIN 可能引用同列,EntityId 稳定故同列只建一条)。
 fn extract_where_join_columns(body: &str) -> Vec<(String, usize)> {
-    let placeholder_spans: Vec<(usize, usize)> = SQL_PLACEHOLDER
+    let noise_spans: Vec<(usize, usize)> = SQL_NOISE_SPAN
         .find_iter(body)
         .map(|m| (m.start(), m.end()))
         .collect();
@@ -285,7 +292,7 @@ fn extract_where_join_columns(body: &str) -> Vec<(String, usize)> {
     for tok in SQL_COLUMN_TOKEN.captures_iter(body) {
         let m = tok.get(1).unwrap();
         let start = m.start();
-        if placeholder_spans.iter().any(|(a, b)| start >= *a && start < *b) {
+        if noise_spans.iter().any(|(a, b)| start >= *a && start < *b) {
             continue;
         }
         let raw = m.as_str();
@@ -313,9 +320,21 @@ fn classify_where_column(token: &str, body: &str, match_start: usize) -> Option<
     if KEYWORDS.contains(&lower.as_str()) {
         return None;
     }
-    // MyBatis 参数占位符内的标识符:token 前紧邻 #{ 或 ${ → 不是列。
+    // MyBatis 参数占位符内的标识符:token 前紧邻 #{ 或 ${ → 不是列(冗余于 span 屏蔽,
+    // 但让 classify 作为独立纯函数可被单测直接验证)。
     let before = body[..match_start].trim_end();
     if before.ends_with("#{") || before.ends_with("${") {
+        return None;
+    }
+    // 表/别名上下文:token 前一个词是 FROM/JOIN/INTO → 当前是表名或别名,非列
+    // (拦子查询 `WHERE id IN (SELECT uid FROM t2 …)` 的 t2)。
+    let last_word = before
+        .split_whitespace()
+        .last()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    const TABLE_CONTEXT: &[&str] = &["from", "join", "into"];
+    if TABLE_CONTEXT.contains(&last_word.as_str()) {
         return None;
     }
     // 函数名:token 后紧跟 ( → DATE(x)/COUNT(*),不是列。
@@ -371,5 +390,23 @@ mod tests {
             .map(|(c, _)| c)
             .collect();
         assert_eq!(cols, vec!["data_name".to_string()]);
+    }
+    #[test]
+    fn extract_filters_dynamic_tags_and_ognl() {
+        // MyBatis 动态标签 `<if test="userId != null">` 整个被 <...> span 屏蔽,
+        // if/test/userId(OGNL 属性名)不进列;#{userId} 占位符也屏蔽;只剩 user_id 真列。
+        let body = r#"<if test="userId != null"> AND user_id = #{userId}</if>"#;
+        let cols: Vec<String> = extract_where_join_columns(body)
+            .into_iter()
+            .map(|(c, _)| c)
+            .collect();
+        assert_eq!(cols, vec!["user_id".to_string()]);
+    }
+    #[test]
+    fn classify_drops_subquery_table_alias() {
+        // 子查询 `FROM t2`:t2 前一个词是 from → 表名/别名,非列。
+        let body = "id IN (SELECT uid FROM t2 WHERE 1)";
+        let pos = body.find("t2").unwrap();
+        assert_eq!(classify_where_column("t2", body, pos), None);
     }
 }

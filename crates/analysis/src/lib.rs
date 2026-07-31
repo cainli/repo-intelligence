@@ -197,48 +197,49 @@ impl WorkspaceIndexer {
             combined.add_entities.extend(patch.add_entities);
             combined.add_edges.extend(patch.add_edges);
         }
-        // 快照本次变更实体(id + 向量化文本),供 resolve 后增量生成 embedding
-        // (apply_patch 将 move combined,故在此先 clone)。
+        // 快照本次变更实体(id + 向量化文本),供 resolve 后增量生成 embedding。
+        // 仅在 embedding 开启时构建——否则 ann_name_by_id/anns_by_owner 的 O(entities+edges)
+        // 迭代 + HashMap 分配是纯浪费(apply_patch 后 combined 被 move,故必须在此先构建)。
         // 去重 by id:add_entities 可能含重复 id(同实体多 patch),去重避免重复推理。
-        // 注解画像:给被注解实体拼上注解名,提升 semantic_search 召回质量
-        // (用户搜 "@Transactional" / "事务" 时,注解比 qualified_name 更对齐查询意图)。
-        // 注解在 RI 里建模为 owner -[Annotated]-> Annotation 实体,不在 metadata,
-        // 故需经边回查:先建 annotation_id→name,再按 owner 聚合注解名列表。
-        let ann_name_by_id: HashMap<&EntityId, &str> = combined
-            .add_entities
-            .iter()
-            .filter(|e| e.kind == EntityKind::Annotation)
-            .filter_map(|e| Some((&e.id, e.name.as_str())))
-            .collect();
-        let mut anns_by_owner: HashMap<&EntityId, Vec<&str>> = HashMap::new();
-        for edge in &combined.add_edges {
-            if edge.kind == EdgeKind::Annotated {
-                if let Some(name) = ann_name_by_id.get(&edge.target) {
-                    anns_by_owner.entry(&edge.source).or_default().push(*name);
-                }
-            }
-        }
-
-        let mut embed_seen = std::collections::HashSet::new();
-        let embed_inputs: Vec<(EntityId, String)> = combined
-            .add_entities
-            .iter()
-            .filter(|e| embed_seen.insert(e.id.0.clone()))
-            .map(|e| {
-                let mut text =
-                    format!("{} {} {}", e.kind.as_str(), e.qualified_name, e.name);
-                if let Some(anns) = anns_by_owner.get(&e.id) {
-                    if !anns.is_empty() {
-                        // 带 @ 前缀,贴近 Java 源码与用户查询习惯。
-                        text.push(' ');
-                        text.push_str(
-                            &anns.iter().map(|a| format!("@{a}")).collect::<Vec<_>>().join(" "),
-                        );
+        let embed_inputs: Vec<(EntityId, String)> = if config.index.embedding {
+            // 注解画像:给被注解实体拼上注解名(经 Annotated 边回查,注解不在 metadata)。
+            let ann_name_by_id: HashMap<&EntityId, &str> = combined
+                .add_entities
+                .iter()
+                .filter(|e| e.kind == EntityKind::Annotation)
+                .filter_map(|e| Some((&e.id, e.name.as_str())))
+                .collect();
+            let mut anns_by_owner: HashMap<&EntityId, Vec<&str>> = HashMap::new();
+            for edge in &combined.add_edges {
+                if edge.kind == EdgeKind::Annotated {
+                    if let Some(name) = ann_name_by_id.get(&edge.target) {
+                        anns_by_owner.entry(&edge.source).or_default().push(*name);
                     }
                 }
-                (e.id.clone(), text)
-            })
-            .collect();
+            }
+            let mut embed_seen = std::collections::HashSet::new();
+            combined
+                .add_entities
+                .iter()
+                .filter(|e| embed_seen.insert(e.id.0.clone()))
+                .map(|e| {
+                    let mut text =
+                        format!("{} {} {}", e.kind.as_str(), e.qualified_name, e.name);
+                    if let Some(anns) = anns_by_owner.get(&e.id) {
+                        if !anns.is_empty() {
+                            // 带 @ 前缀,贴近 Java 源码与用户查询习惯。
+                            text.push(' ');
+                            text.push_str(
+                                &anns.iter().map(|a| format!("@{a}")).collect::<Vec<_>>().join(" "),
+                            );
+                        }
+                    }
+                    (e.id.clone(), text)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         if !combined.add_entities.is_empty() || !combined.add_edges.is_empty() {
             let n_ent = combined.add_entities.len();
             let n_edg = combined.add_edges.len();
@@ -354,10 +355,22 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
         match entity.kind {
             EntityKind::Field
             | EntityKind::FrontendField
-            | EntityKind::SqlField
             | EntityKind::ApiField
             | EntityKind::Column => {
                 fields.entry(entity.name.clone()).or_default().push(entity);
+            }
+            EntityKind::SqlField => {
+                // 排除 G1 的 where_join 列:它们是 statement-局部的"读了哪个列"(regex 推断),
+                // 非跨层字段映射语义;其裸列名(id/name/status)若参与 name 分组会与 Java
+                // Field/Column 跨层碰撞,污染 MappedFrom → impact/relay。SELECT-alias 仍参与。
+                let is_where_join = entity
+                    .metadata
+                    .get("origin")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| s == "where_join");
+                if !is_where_join {
+                    fields.entry(entity.name.clone()).or_default().push(entity);
+                }
             }
             EntityKind::HttpEndpoint => endpoints.push(entity),
             EntityKind::HttpClientCall => calls.push(entity),

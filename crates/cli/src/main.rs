@@ -283,7 +283,11 @@ fn emit<T: serde::Serialize>(format: OutputFormat, data: T) -> Result<()> {
 
 #[derive(serde::Serialize)]
 struct SemanticHit {
-    entity: repo_intelligence_model::Entity,
+    id: String,
+    kind: String,
+    name: String,
+    qualified_name: String,
+    evidence_count: usize,
     score: f32,
 }
 
@@ -313,12 +317,22 @@ fn semantic_search_items(
     let mut scored: Vec<(EntityId, f32)> = all
         .into_iter()
         .map(|(id, v)| (id, repo_intelligence_embedding::cosine(&qvec, &v)))
+        .filter(|(_, s)| s.is_finite())
         .collect();
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let mut hits = Vec::new();
     for (id, score) in scored.into_iter().take(limit) {
         if let Some(entity) = store.get_entity(&id)? {
-            hits.push(SemanticHit { entity, score });
+            // 紧凑形(对齐 MCP semantic_search 的 compact):不展开 evidence[]/metadata,
+            // 用户要完整实体可用 search 命令。
+            hits.push(SemanticHit {
+                id: entity.id.0.clone(),
+                kind: entity.kind.as_str().to_string(),
+                name: entity.name.clone(),
+                qualified_name: entity.qualified_name.clone(),
+                evidence_count: entity.evidence.len(),
+                score,
+            });
         }
     }
     Ok(hits)
