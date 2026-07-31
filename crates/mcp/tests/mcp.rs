@@ -11,7 +11,8 @@ fn mcp_lists_supported_tools_over_json_rpc() {
     let input = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, None).unwrap();
+    let base = tempfile::tempdir().unwrap();
+    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, None, base.path()).unwrap();
     let response: serde_json::Value =
         serde_json::from_slice(output.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
     assert_eq!(response["id"], 1);
@@ -43,7 +44,7 @@ fn mcp_searches_the_persistent_graph() {
     let input = br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_entities","arguments":{"query":"customerName"}}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database)).unwrap();
+    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database), directory.path()).unwrap();
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     assert_eq!(response["id"], 2);
     assert!(
@@ -63,7 +64,8 @@ fn malformed_message_does_not_close_the_mcp_session() {
 "#;
     let mut output = Vec::new();
 
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, None).unwrap();
+    let base = tempfile::tempdir().unwrap();
+    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, None, base.path()).unwrap();
 
     let responses: Vec<serde_json::Value> = output
         .split(|byte| *byte == b'\n')
@@ -107,7 +109,7 @@ fn index_status_is_bounded_for_large_graphs() {
     let input = br#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"get_index_status","arguments":{}}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database)).unwrap();
+    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database), directory.path()).unwrap();
 
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     assert_eq!(
@@ -131,7 +133,7 @@ fn index_status_reports_an_uninitialized_index() {
     let input = br#"{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"get_index_status","arguments":{}}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database)).unwrap();
+    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database), directory.path()).unwrap();
 
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     let structured = &response["result"]["structuredContent"];
@@ -157,7 +159,7 @@ fn index_status_reports_absolute_database_path() {
     let input = br#"{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"get_index_status","arguments":{}}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database)).unwrap();
+    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database), directory.path()).unwrap();
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     let reported = response["result"]["structuredContent"]["database"]
         .as_str()
@@ -179,7 +181,7 @@ fn analyze_change_warns_when_index_is_empty() {
     let input = br#"{"jsonrpc":"2.0","id":43,"method":"tools/call","params":{"name":"analyze_change","arguments":{"target_kind":"field","operation":"rename","from":"x","to":"y"}}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database)).unwrap();
+    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database), directory.path()).unwrap();
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     let questions = response["result"]["structuredContent"]["open_questions"]
         .as_array()
@@ -235,7 +237,7 @@ fn system_view_is_bounded_and_groups_by_kind() {
     let input = br#"{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"show_system_view","arguments":{"view":"repositories"}}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database)).unwrap();
+    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database), directory.path()).unwrap();
 
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     let structured = &response["result"]["structuredContent"];
@@ -267,7 +269,7 @@ fn search_returns_structured_content_as_an_object() {
     let input = br#"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"search_entities","arguments":{"query":"customerName"}}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database)).unwrap();
+    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database), directory.path()).unwrap();
 
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     let structured = &response["result"]["structuredContent"];
@@ -322,7 +324,7 @@ fn system_view_filters_to_the_requested_plane() {
     let input = br#"{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"show_system_view","arguments":{"view":"data"}}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database)).unwrap();
+    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database), directory.path()).unwrap();
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     let by_kind = &response["result"]["structuredContent"]["entities_by_kind"];
     assert_eq!(by_kind["table"], 1);
@@ -344,7 +346,8 @@ fn tools_list_declares_typed_input_and_output_schemas() {
     let input = br#"{"jsonrpc":"2.0","id":22,"method":"tools/list","params":{}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, None).unwrap();
+    let base = tempfile::tempdir().unwrap();
+    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, None, base.path()).unwrap();
 
     let response: serde_json::Value =
         serde_json::from_slice(output.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
@@ -404,7 +407,7 @@ fn find_endpoint_returns_only_endpoint_kinds() {
     let input = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"find_endpoint","arguments":{"query":"order"}}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database)).unwrap();
+    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database), directory.path()).unwrap();
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     let items = response["result"]["structuredContent"]["items"]
         .as_array()
@@ -442,7 +445,7 @@ fn analyze_change_paginates_findings_and_reports_total() {
     let input = br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"analyze_change","arguments":{"target_kind":"field","operation":"remove","from":"sharedName","limit":2,"offset":0}}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database)).unwrap();
+    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database), directory.path()).unwrap();
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     let structured = &response["result"]["structuredContent"];
     assert_eq!(structured["findings"].as_array().unwrap().len(), 2);
@@ -471,7 +474,7 @@ fn scan_workspace_reports_kind_distribution_and_excluded_dirs() {
     let input = serde_json::to_string(&request).unwrap();
 
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input.as_bytes()), &mut output, Some(&database))
+    repo_intelligence_mcp::serve(Cursor::new(input.as_bytes()), &mut output, Some(&database), database.parent().unwrap())
         .unwrap();
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     let structured = &response["result"]["structuredContent"];
@@ -499,7 +502,7 @@ fn empty_search_attaches_a_hint_instead_of_silent_zero() {
     let input = br#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"analyze_requirement","arguments":{"query":"nonexistent"}}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database)).unwrap();
+    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database), directory.path()).unwrap();
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     let structured = &response["result"]["structuredContent"];
     assert_eq!(structured["count"], 0);
@@ -597,7 +600,7 @@ fn call_tool(
     });
     let mut output = Vec::new();
     let line = format!("{request}\n");
-    repo_intelligence_mcp::serve(Cursor::new(line.as_bytes()), &mut output, Some(database))
+    repo_intelligence_mcp::serve(Cursor::new(line.as_bytes()), &mut output, Some(database), database.parent().unwrap())
         .unwrap();
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     response["result"]["structuredContent"].clone()
@@ -851,7 +854,8 @@ fn trace_tools_declare_typed_schemas() {
     let input = br#"{"jsonrpc":"2.0","id":60,"method":"tools/list","params":{}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, None).unwrap();
+    let base = tempfile::tempdir().unwrap();
+    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, None, base.path()).unwrap();
     let response: serde_json::Value =
         serde_json::from_slice(output.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
     let tools = response["result"]["tools"].as_array().unwrap();

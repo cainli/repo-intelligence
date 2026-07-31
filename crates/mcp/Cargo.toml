@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
 repo-intelligence-analysis = { path = "../analysis" }
 repo-intelligence-embedding = { path = "../embedding" }
 repo-intelligence-config = { path = "../config" }

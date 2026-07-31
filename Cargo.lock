@@ -2303,6 +2303,7 @@ name = "repo-intelligence-mcp"
 version = "0.1.27"
 dependencies = [
  "anyhow",
+ "blake3",
  "repo-intelligence-analysis",
  "repo-intelligence-config",
  "repo-intelligence-embedding",

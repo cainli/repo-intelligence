@@ -229,7 +229,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         "required": ["items", "edges", "count", "start_count"]
     });
 
-    vec![
+    let mut specs = vec![
         ToolSpec {
             name: "scan_workspace",
             description: "Index a workspace into the local system graph. Returns a health report (entity counts by kind and the excluded-directory list).",
@@ -263,7 +263,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "search_entities",
-            description: "Search indexed entities by name or qualified name (case-insensitive substring). Returns matches of any kind.",
+            description: "Search indexed entities by name or qualified name (case-insensitive substring). For concept/meaning matches (e.g. find login methods when searching 'authenticate') use semantic_search instead. Returns matches of any kind.",
             input_schema: search_input.clone(),
             output_schema: search_output.clone(),
         },
@@ -275,9 +275,27 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "semantic_search",
-            description: "Semantic search over entities by meaning (not substring). Uses a bundled local ONNX model to embed the query and ranks entities by cosine similarity — e.g. find login-related entities when you search 'authenticate'. Requires embedding enabled (default on) and a prior scan_workspace.",
-            input_schema: search_input.clone(),
-            output_schema: search_output.clone(),
+            description: "Semantic search over entities by MEANING (not substring) — find login/auth entities when you search 'authenticate'. Uses a bundled local ONNX model (384-dim cosine). For substring/exact-name matches use search_entities instead. Requires embedding enabled (default on) + prior scan_workspace.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "query": {"type": "string", "description": "Natural-language or concept query; embedded and matched by cosine similarity."},
+                    "limit": {"type": "integer", "minimum": 1, "default": 20, "description": "Max entities (top-k by similarity) to return."}
+                },
+                "required": ["query"]
+            }),
+            output_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "items": {"type": "array", "description": "Top-k entities, each {entity, score}."},
+                    "count": {"type": "integer", "minimum": 0},
+                    "query": {"type": "string"},
+                    "hint": {"type": "string"}
+                },
+                "required": ["items", "count"]
+            }),
         },
         ToolSpec {
             name: "analyze_change",
@@ -491,6 +509,20 @@ fn tool_specs() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "list_repositories",
+            description: "List all indexed repositories in multi-repo mode. Reads <base>/manifest.json + each repo's counts. Returns repo_path, repo_id, entity_count, edge_count. Use to discover which repositories are indexed and pick the right `repository` argument for other tools.",
+            input_schema: json!({"type": "object", "additionalProperties": false, "properties": {}}),
+            output_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "repositories": {"type": "array"},
+                    "count": {"type": "integer", "minimum": 0}
+                },
+                "required": ["repositories", "count"]
+            }),
+        },
+        ToolSpec {
             name: "build_relay_doc",
             description: "Build a structured 'relay doc' skeleton (relay-schema v1) around a target entity, resolved by exact qualified name. Collects inbound (who points at it) and outbound (what it points at) edges, each with a call-site anchor and a machine-mapped edge_type. Fills the structure layer (qn, file:line anchors, tool edge_kind → edge_type); semantic fields are marked `custom:needs-review` for the consuming agent. Known limit: Java `calls` edges are extracted only within the same file, so cross-file inbound callers may be missing.",
             input_schema: json!({
@@ -534,10 +566,37 @@ fn tool_specs() -> Vec<ToolSpec> {
                 "required": ["schema_version", "target", "edges"]
             }),
         },
-    ]
+    ];
+    // 多仓库:统一给每个工具注入 repository 参数(路由到 <base>/repos/<id>.sqlite;
+    // 省略则用 server 的 --database 单库兼容)。所有工具共用,客户端可见。
+    for spec in &mut specs {
+        // list_repositories 列所有仓库,自身不需要 repository 路由参数。
+        if spec.name == "list_repositories" {
+            continue;
+        }
+        if let Some(props) = spec
+            .input_schema
+            .get_mut("properties")
+            .and_then(|p| p.as_object_mut())
+        {
+            props.insert(
+                "repository".to_string(),
+                json!({
+                    "type": "string",
+                    "description": "仓库根路径。多仓库模式下路由到 <base>/repos/<id>.sqlite;省略则用 server 的 --database(单库兼容)。scan_workspace 用它作扫描根。"
+                }),
+            );
+        }
+    }
+    specs
 }
 
-pub fn serve<R: Read, W: Write>(reader: R, mut writer: W, database: Option<&Path>) -> Result<()> {
+pub fn serve<R: Read, W: Write>(
+    reader: R,
+    mut writer: W,
+    database: Option<&Path>,
+    base: &Path,
+) -> Result<()> {
     for line in BufReader::new(reader).lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -591,7 +650,7 @@ pub fn serve<R: Read, W: Write>(reader: R, mut writer: W, database: Option<&Path
                 json!({"jsonrpc": "2.0", "id": id, "result": {"tools": tools}})
             }
             "ping" => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
-            "tools/call" => dispatch_tool_call(&request, database, &id),
+            "tools/call" => dispatch_tool_call(&request, database, base, &id),
             _ => json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -617,13 +676,13 @@ pub fn serve<R: Read, W: Write>(reader: R, mut writer: W, database: Option<&Path
 /// unwind turns a panic into a normal MCP `isError` response, so the loop
 /// continues. The default panic hook still writes the panic + location to
 /// stderr for diagnosis.
-fn dispatch_tool_call(request: &Value, database: Option<&Path>, id: &Value) -> Value {
+fn dispatch_tool_call(request: &Value, database: Option<&Path>, base: &Path, id: &Value) -> Value {
     let tool_name = request["params"]["name"]
         .as_str()
         .unwrap_or("unknown")
         .to_string();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        call_tool(request, database)
+        call_tool(request, database, base)
     }));
     match outcome {
         Ok(Ok(result)) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
@@ -656,14 +715,80 @@ fn dispatch_tool_call(request: &Value, database: Option<&Path>, id: &Value) -> V
     }
 }
 
-fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
+/// 多仓库路由:有 `repository` 参数 → `<base>/repos/<repo_id>.sqlite`
+/// (repo_id = blake3(规范化路径)[:16]);无 → fallback_db(单库兼容,向后兼容 --database)。
+fn resolve_database(
+    arguments: &Value,
+    base: &Path,
+    fallback: Option<&Path>,
+) -> Result<std::path::PathBuf> {
+    if let Some(repo) = arguments["repository"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+    {
+        let canon =
+            std::fs::canonicalize(repo).unwrap_or_else(|_| std::path::PathBuf::from(repo));
+        let id = blake3::hash(canon.to_string_lossy().as_bytes()).to_hex()[..16].to_string();
+        let dir = base.join("repos");
+        std::fs::create_dir_all(&dir).ok();
+        let db_path = dir.join(format!("{id}.sqlite"));
+        record_manifest(base, &id, &canon);
+        Ok(db_path)
+    } else {
+        fallback.map(std::path::PathBuf::from).ok_or_else(|| {
+            anyhow::anyhow!("MCP server has no database configured (无 repository 参数且无 --database)")
+        })
+    }
+}
+
+/// manifest 记 repo_id → repo_path,供 list_repositories 展示可读路径。读改写,失败不阻塞。
+fn record_manifest(base: &Path, id: &str, repo_path: &Path) {
+    let manifest = base.join("manifest.json");
+    let mut map = std::fs::read(&manifest)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    map.insert(id.to_string(), json!(repo_path.to_string_lossy()));
+    if let Ok(s) = serde_json::to_string(&Value::Object(map)) {
+        let _ = std::fs::write(&manifest, s);
+    }
+}
+
+/// 列出多仓库模式下已索引的所有仓库:读 <base>/manifest.json(id→repo_path),
+/// 逐库 open counts。单库模式(--database 无 repository)manifest 不存在 → 返回空列表。
+fn list_repositories(base: &Path) -> Result<Value> {
+    let manifest = base.join("manifest.json");
+    let map = std::fs::read(&manifest)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    let mut repos = Vec::new();
+    for (id, repo_val) in &map {
+        let repo_path = repo_val.as_str().unwrap_or("?");
+        let db = base.join("repos").join(format!("{id}.sqlite"));
+        let (entity_count, edge_count) = SqliteGraphStore::open(&db)
+            .and_then(|s| s.counts())
+            .unwrap_or((0, 0));
+        repos.push(json!({
+            "repo_id": id,
+            "repo_path": repo_path,
+            "entity_count": entity_count,
+            "edge_count": edge_count,
+        }));
+    }
+    Ok(json!({ "repositories": repos, "count": repos.len() }))
+}
+
+fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Value> {
     let params = &request["params"];
     let name = params["name"].as_str().unwrap_or_default();
     let arguments = &params["arguments"];
-    let path = database.ok_or_else(|| anyhow::anyhow!("MCP server has no database configured"))?;
+    let path = resolve_database(arguments, base, database)?;
     let data = match name {
         "search_entities" => {
-            let store = SqliteGraphStore::open(path)?;
+            let store = SqliteGraphStore::open(&path)?;
             let mut result = run_search(&store, arguments, None)?;
             // On zero hits, distinguish "not found" from "empty index": the latter
             // points at a wrong database connection. Counts are only read on miss.
@@ -679,7 +804,7 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
             result
         }
         "find_endpoint" => {
-            let store = SqliteGraphStore::open(path)?;
+            let store = SqliteGraphStore::open(&path)?;
             let endpoint_kinds = [
                 EntityKind::HttpEndpoint,
                 EntityKind::HttpClientCall,
@@ -697,13 +822,13 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
             result
         }
         "semantic_search" => {
-            let store = SqliteGraphStore::open(path)?;
+            let store = SqliteGraphStore::open(&path)?;
             let query = arguments["query"].as_str().unwrap_or_default();
             let limit = parse_limit(arguments);
             semantic_search(&store, query, limit)?
         }
         "analyze_requirement" => {
-            let store = SqliteGraphStore::open(path)?;
+            let store = SqliteGraphStore::open(&path)?;
             let mut result = run_search(&store, arguments, None)?;
             if result["count"].as_u64() == Some(0) {
                 result["hint"] = json!(
@@ -716,7 +841,7 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
         }
         "analyze_change" => {
             let change: ChangeRequest = serde_json::from_value(arguments.clone())?;
-            let store = SqliteGraphStore::open(path)?;
+            let store = SqliteGraphStore::open(&path)?;
             let mut report = ImpactAnalyzer::new(&store).analyze(&change)?;
             // An empty index makes impact analysis meaningless — surface it so a
             // "zero findings" result isn't misread as "this change is safe".
@@ -739,7 +864,7 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
                 .as_f64()
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0) as f32;
-            let store = SqliteGraphStore::open(path)?;
+            let store = SqliteGraphStore::open(&path)?;
             trace_graph(&store, name, depth, kinds, false, min_confidence)?
         }
         "trace_callees" => {
@@ -750,7 +875,7 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
                 .as_f64()
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0) as f32;
-            let store = SqliteGraphStore::open(path)?;
+            let store = SqliteGraphStore::open(&path)?;
             trace_graph(&store, name, depth, kinds, true, min_confidence)?
         }
         "trace_table_access" => {
@@ -776,7 +901,7 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
                     kinds.push(EdgeKind::WritesTable);
                 }
             }
-            let store = SqliteGraphStore::open(path)?;
+            let store = SqliteGraphStore::open(&path)?;
             trace_graph(&store, name, depth, kinds, false, min_confidence)?
         }
         "trace_full_path" => {
@@ -808,7 +933,7 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
                 ],
                 value => serde_json::from_value(value.clone())?,
             };
-            let store = SqliteGraphStore::open(path)?;
+            let store = SqliteGraphStore::open(&path)?;
             let mut result = trace_graph(&store, name, depth, kinds, outbound, min_confidence)?;
             if let Some(to_kind) = to_kind
                 && let Some(items) = result["items"].as_array_mut()
@@ -821,17 +946,25 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
         "verify_edge" => {
             let source = arguments["source"].as_str().unwrap_or_default();
             let target = arguments["target"].as_str().unwrap_or_default();
-            let workspace = arguments["workspace"].as_str().unwrap_or(".");
-            let store = SqliteGraphStore::open(path)?;
-            verify_edge(&store, source, target, workspace)?
+            // repository(多仓库)优先,回退 workspace(旧参数兼容);用于读源码文件。
+            let repository = arguments["repository"]
+                .as_str()
+                .or_else(|| arguments["workspace"].as_str())
+                .unwrap_or(".");
+            let store = SqliteGraphStore::open(&path)?;
+            verify_edge(&store, source, target, repository)?
         }
         "scan_workspace" => {
-            let workspace = arguments["workspace"].as_str().unwrap_or(".");
-            let workspace_path = Path::new(workspace);
+            // repository(多仓库)优先,回退 workspace(旧参数兼容);作扫描根 + 派生 database。
+            let repository = arguments["repository"]
+                .as_str()
+                .or_else(|| arguments["workspace"].as_str())
+                .unwrap_or(".");
+            let workspace_path = Path::new(repository);
             // 配置跟 workspace 走:从 workspace 根目录发现 .repo-intelligence.toml,
             // 无文件则 builtin default(scan 行为与历史一致)。
             let config = IndexerConfig::load(workspace_path)?;
-            let mut store = SqliteGraphStore::open_with_fts(path, config.index.fts5_fulltext)?;
+            let mut store = SqliteGraphStore::open_with_fts(&path, config.index.fts5_fulltext)?;
             let summary =
                 WorkspaceIndexer.scan_with_config(workspace_path, &mut store, &config, |_| {})?;
             // Echo the resulting kind distribution and the effective exclusion
@@ -853,7 +986,7 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
             })
         }
         "get_index_status" => {
-            let store = SqliteGraphStore::open(path)?;
+            let store = SqliteGraphStore::open(&path)?;
             let (entity_count, edge_count) = store.counts()?;
             // Surface an uninitialized index explicitly: a zero-entity result
             // otherwise looks indistinguishable from a healthy server, so a
@@ -864,7 +997,7 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
             // whether the connected database is the one they expect. The default
             // (`.repo-intelligence/workspace.sqlite`) is relative to cwd, so a wrong
             // working dir silently lands on an empty database.
-            let database = std::fs::canonicalize(path)
+            let database = std::fs::canonicalize(&path)
                 .map(|resolved| resolved.display().to_string())
                 .unwrap_or_else(|_| path.display().to_string());
             let mut status = json!({
@@ -879,8 +1012,9 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
             }
             status
         }
+        "list_repositories" => list_repositories(base)?,
         "show_system_view" => {
-            let store = SqliteGraphStore::open(path)?;
+            let store = SqliteGraphStore::open(&path)?;
             let view = arguments["view"].as_str().unwrap_or("repositories");
             let (entity_count, edge_count) = store.counts()?;
             let mut entities_by_kind = store.counts_by_kind()?;
@@ -931,7 +1065,7 @@ fn call_tool(request: &Value, database: Option<&Path>) -> Result<Value> {
             let qn = arguments["qn"].as_str().unwrap_or_default();
             let depth = parse_depth(arguments, 1);
             let verbose = arguments["verbose"].as_bool().unwrap_or(false);
-            let store = SqliteGraphStore::open(path)?;
+            let store = SqliteGraphStore::open(&path)?;
             build_relay(&store, qn, depth, verbose)?
         }
         _ => return Err(anyhow::anyhow!("tool not implemented: {name}")),
@@ -990,6 +1124,11 @@ fn search_with_filter(
 
 /// 语义检索:用本地 ONNX 给 query 生成 embedding,与全部 entity embedding 算余弦相似度,
 /// 返回 top-k(对标 codebase-memory 的 semantic_query)。无 embedding 时返回空 + hint。
+/// Embedder 单例:首次 semantic_search 时加载 ONNX(含模型,~1-2s),之后复用,
+/// 避免 mcp serve 长驻时每次查询都重载模型。
+static EMBEDDER: std::sync::Mutex<Option<repo_intelligence_embedding::Embedder>> =
+    std::sync::Mutex::new(None);
+
 fn semantic_search(store: &SqliteGraphStore, query: &str, limit: usize) -> Result<Value> {
     if query.trim().is_empty() {
         return Ok(json!({ "items": [], "count": 0, "hint": "empty query" }));
@@ -1002,12 +1141,26 @@ fn semantic_search(store: &SqliteGraphStore, query: &str, limit: usize) -> Resul
             "hint": "无 embedding:未 scan 或 [index] embedding=false。scan 后再查。"
         }));
     }
-    let mut embedder = repo_intelligence_embedding::Embedder::new()?;
-    let qvec = embedder
-        .embed(vec![query.to_string()])?
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("query embedding 为空"))?;
+    let qvec = {
+        let mut guard = EMBEDDER.lock().unwrap();
+        if guard.is_none() {
+            *guard = repo_intelligence_embedding::Embedder::new().ok();
+        }
+        match guard.as_mut() {
+            Some(e) => e
+                .embed(vec![query.to_string()])?
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("query embedding 为空"))?,
+            None => {
+                return Ok(json!({
+                    "items": [],
+                    "count": 0,
+                    "hint": "模型加载失败(Embedder 单例 init 失败),语义检索不可用。检查 binary 是否含模型。"
+                }));
+            }
+        }
+    };
     let mut scored = all
         .into_iter()
         .map(|(id, v)| (id, cosine(&qvec, &v)))
@@ -1582,6 +1735,41 @@ mod tests {
 
     fn id(value: &str) -> EntityId {
         EntityId(value.to_string())
+    }
+
+    #[test]
+    fn resolve_database_routes_by_repository_and_lists() {
+        let base = tempfile::tempdir().unwrap();
+        let repo_a = tempfile::tempdir().unwrap();
+        let repo_b = tempfile::tempdir().unwrap();
+        // repository=A → <base>/repos/<hashA>.sqlite
+        let db_a = resolve_database(
+            &json!({"repository": repo_a.path().to_string_lossy().to_string()}),
+            base.path(),
+            None,
+        )
+        .unwrap();
+        assert!(db_a.starts_with(base.path().join("repos")));
+        assert_eq!(db_a.extension().unwrap(), "sqlite");
+        // repository=B → 不同库(不串)
+        let db_b = resolve_database(
+            &json!({"repository": repo_b.path().to_string_lossy().to_string()}),
+            base.path(),
+            None,
+        )
+        .unwrap();
+        assert_ne!(db_a, db_b);
+        // 无 repository → fallback(单库 --database 兼容)
+        let db_none = resolve_database(
+            &json!({}),
+            base.path(),
+            Some(std::path::Path::new("fallback.sqlite")),
+        )
+        .unwrap();
+        assert_eq!(db_none, std::path::PathBuf::from("fallback.sqlite"));
+        // list_repositories → 2 repos(A, B)
+        let list = list_repositories(base.path()).unwrap();
+        assert_eq!(list["count"].as_u64(), Some(2));
     }
 
     #[test]

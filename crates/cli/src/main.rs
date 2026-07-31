@@ -24,6 +24,10 @@ struct Cli {
         global = true
     )]
     database: PathBuf,
+    /// 多仓库 base 目录(一个 MCP server 管多库);默认 ~/.repo-intelligence/。
+    /// Mcp 模式下,工具带 repository 参数时路由到 <base>/repos/<id>.sqlite。
+    #[arg(long, global = true)]
+    base: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -96,6 +100,12 @@ fn main() {
     }
 }
 
+/// 默认多仓库 base 目录:~/.repo-intelligence/(从 HOME 派生,跨用户隔离)。
+fn default_base() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".repo-intelligence")
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
     if let Some(parent) = cli.database.parent() {
@@ -103,11 +113,15 @@ fn run() -> Result<()> {
             .with_context(|| format!("create data directory {}", parent.display()))?;
     }
     match cli.command {
-        Command::Mcp => repo_intelligence_mcp::serve(
-            io::stdin().lock(),
-            io::stdout().lock(),
-            Some(&cli.database),
-        ),
+        Command::Mcp => {
+            let base = cli.base.clone().unwrap_or_else(default_base);
+            repo_intelligence_mcp::serve(
+                io::stdin().lock(),
+                io::stdout().lock(),
+                Some(&cli.database),
+                &base,
+            )
+        }
         Command::Init { workspace, format } => {
             let _store = SqliteGraphStore::open(&cli.database)?;
             emit(

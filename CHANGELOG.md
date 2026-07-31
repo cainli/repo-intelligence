@@ -7,6 +7,28 @@
 
 ## [Unreleased]
 
+## [0.1.28] - 2026-07-31
+
+### Added
+
+- **多仓库支持(对标 codebase-memory)**:一个 MCP server 配 `--base` 目录(默认 `~/.repo-intelligence/`),
+  工具带 `repository` 参数路由到 `<base>/repos/<repo_id>.sqlite`(repo_id=blake3 规范化路径[:16])。
+  消除"每仓库单独配 database/server"的痛点。新增 `list_repositories` 工具(manifest + 各库 counts)。
+  保留 `--database` 单库向后兼容(无 repository 参数 → fallback)。
+- **semantic_search 可用化(MVP)**:Embedder 单例(static Mutex,首次加载 ONNX 后复用,不再每次重载);
+  专用 input/output schema(去掉误导的 kind/offset/verbose,output 含 score);
+  search_entities / semantic_search description 互相指引(子串 vs 语义)。
+  端到端验证:ruoyi repository 路由 + list + 查 "user login authentication" 召回 `POST /auth/login`/`LoginHelper`。
+
+### Changed
+
+- scan_workspace / verify_edge 的 workspace 参数统一为 repository(回退兼容旧 workspace)。
+
+### Notes
+
+- sqlite-vec 向量索引(原计划 O(log n) KNN)因 alpha crate C 编译失败暂缓,semantic_search 在大项目仍走
+  O(n) 全表余弦(中小库即时可用)。大项目优化留待后续(纯 Rust 向量库或 sqlite-vec 稳定版)。
+
 ## [0.1.27] - 2026-07-30
 
 ### Fixed
