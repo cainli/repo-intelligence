@@ -3,7 +3,7 @@
 本地运行的跨技术栈代码知识图谱与字段变更影响分析引擎。核心使用 Rust、bundled
 SQLite、FTS5 和 Tree-sitter，通过 npm CLI 或原生二进制运行，不依赖图数据库。
 
-当前 Rust 引擎 `0.1.32`，已经支持：
+当前 Rust 引擎 `0.1.33`，已经支持：
 
 - 遵循 Git ignore 规则扫描 Java、Vue/TypeScript、MyBatis XML 等文件。
 - 使用 Tree-sitter 验证 Java 语法，并提取 Java 字段与 Spring Mapping。

@@ -7,6 +7,16 @@
 
 ## [Unreleased]
 
+## [0.1.33] - 2026-08-04
+
+### Added
+- **多平台 npm 分发**:除既有的 darwin-arm64,新增 darwin-x64 / linux-x64-gnu / linux-arm64-gnu /
+  win32-x64 四个平台包,主包 `optionalDependencies` 全部接上。此前 Linux/Windows 用户 `npm i`
+  后因找不到对应平台包而启动失败。
+- **release CI 工作流**(`.github/workflows/release.yml`):打 `v*` tag 或手动触发时,在
+  各平台原生 runner 上构建 binary 并发对应平台包,最后发主包。后续每个版本自动多平台,
+  不再依赖本机手工发布。需要仓库配 `NPM_TOKEN` secret。
+
 ## [0.1.32] - 2026-08-04
 
 ### Fixed

@@ -1,17 +1,17 @@
 {
-  "name": "@cainli/repo-intelligence-darwin-arm64",
+  "name": "@cainli/repo-intelligence-linux-x64-gnu",
   "version": "0.1.33",
-  "description": "macOS arm64 native binary for @cainli/repo-intelligence",
+  "description": "Linux x86_64 (glibc) native binary for @cainli/repo-intelligence",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/cainli/repo-intelligence.git"
   },
   "os": [
-    "darwin"
+    "linux"
   ],
   "cpu": [
-    "arm64"
+    "x64"
   ],
   "files": [
     "bin"

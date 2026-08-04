@@ -1,0 +1,104 @@
+name: release
+
+# 打 v* tag 自动触发,或 Actions 页手动触发(从某 tag 的 ref 上跑)。
+# 在各平台「原生 runner」上构建 binary(避免交叉编译原生依赖 ort/fastembed/rusqlite),
+# 发对应平台包;全部平台成功后才发主包(缺一个平台就阻断——宁可晚发也不发半成品)。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-platform:
+    name: build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            runner: macos-14              # Apple Silicon
+            executable: repo-intelligence
+            pkg-dir: packages/npm-platforms/darwin-arm64
+          - platform: darwin-x64
+            runner: macos-13              # Intel
+            executable: repo-intelligence
+            pkg-dir: packages/npm-platforms/darwin-x64
+          - platform: linux-x64-gnu
+            runner: ubuntu-latest         # x86_64
+            executable: repo-intelligence
+            pkg-dir: packages/npm-platforms/linux-x64-gnu
+          - platform: linux-arm64-gnu
+            runner: ubuntu-24.04-arm      # arm64(GitHub 免费 arm runner)
+            executable: repo-intelligence
+            pkg-dir: packages/npm-platforms/linux-arm64-gnu
+          - platform: win32-x64
+            runner: windows-latest
+            executable: repo-intelligence.exe
+            pkg-dir: packages/npm-platforms/win32-x64
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '.'
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Smoke-test binary
+        run: ./target/release/${{ matrix.executable }} --version
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Place binary into platform package
+        run: |
+          mkdir -p ${{ matrix.pkg-dir }}/bin
+          cp target/release/${{ matrix.executable }} ${{ matrix.pkg-dir }}/bin/${{ matrix.executable }}
+
+      - name: Verify package contents
+        run: npm pack --dry-run
+        working-directory: ${{ matrix.pkg-dir }}
+
+      - name: Publish platform package
+        run: npm publish --access public
+        working-directory: ${{ matrix.pkg-dir }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-main:
+    name: publish main package
+    needs: build-platform
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Verify package contents
+        run: npm pack --dry-run
+        working-directory: packages/npm
+
+      - name: Publish main package
+        run: npm publish --access public
+        working-directory: packages/npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
