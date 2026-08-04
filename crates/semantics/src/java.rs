@@ -22,34 +22,47 @@ static JAVA_FIELD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)\b(?:private|protected|public)\s+[\w<>,.?]+\s+([A-Za-z_]\w*)\s*;").unwrap()
 });
 static REQUEST_MAPPING: LazyLock<Regex> = LazyLock::new(|| {
-    // 类级 base 路径。放宽以覆盖三种写法:`@RequestMapping("/x")`、
-    // `@RequestMapping(value = "/x", ...)`、`@RequestMapping({"/a","/b"})`(取首个)。
-    // 不要求闭合 `)`,以容忍 `value="/x", method=POST` 这类带额外参数的形式。
-    Regex::new(r#"@RequestMapping\(\s*(?:value\s*=\s*)?"([^"]+)""#).unwrap()
+    // 类级 base 路径。只捕获注解括号内的参数列表,path 提取交给 annotation_path
+    // (兼容 value 不在首位、裸字符串、数组 {"/a","/b"} 三类写法)。
+    Regex::new(r#"@RequestMapping\s*\(([^)]*)\)"#).unwrap()
 });
 static METHOD_MAPPING: LazyLock<Regex> = LazyLock::new(|| {
     // 方法级 HTTP 映射注解,两类写法:
     //  (a) @(Get|Post|Put|Delete|Patch)Mapping("/x"…) → group1 = 动词;
     //  (b) @RequestMapping("/x"…)                     → group1 缺失(method 通配)。
-    // 认裸 "..." 与 value="...";path 取首个字符串字面量。放宽旧正则的强制 ("…") 形式 ——
-    // 修复 REST controller 普遍用方法级 @RequestMapping 却完全不产 endpoint 的根因
-    // (下游 matches_endpoint 因此几乎为 0)。类级 @RequestMapping 虽也被该正则命中,
-    // 但由配对阶段的 class_offset 检查排除(见 extract_java),仅作 base。
-    Regex::new(
-        r#"@(?:(Get|Post|Put|Delete|Patch)Mapping|RequestMapping)\s*\(\s*(?:value\s*=\s*)?"([^"]*)""#,
-    )
-    .unwrap()
+    // group2 = 括号内参数列表,path 由 annotation_path 解析(支持 value 在任意属性位)。
+    // 类级 @RequestMapping 虽也被该正则命中,但由配对阶段的 class_offset 检查排除
+    // (见 extract_java),仅作 base。
+    Regex::new(r#"@(?:(Get|Post|Put|Delete|Patch)Mapping|RequestMapping)\s*\(([^)]*)\)"#)
+        .unwrap()
 });
 static STRING_LITERAL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""([^"]*)""#).unwrap());
+// 注解参数里的 path 提取:value/path 属性优先(任意属性位置,兼容数组 value={"/a","/b"}
+// 取首个元素),否则首个裸字符串字面量。
+static ANN_VALUE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?:value|path)\s*=\s*\{?\s*"([^"]*)""#).unwrap()
+});
+
+/// 从注解参数列表提取 path 字符串。修复 `@RequestMapping(method = POST, value = "/x")`
+/// 这类 value 不在首位的写法被静默丢弃的历史问题(旧正则要求 value/裸串紧跟左括号)。
+fn annotation_path(args: &str) -> Option<String> {
+    if let Some(capture) = ANN_VALUE.captures(args) {
+        return Some(capture[1].to_string());
+    }
+    STRING_LITERAL
+        .captures(args)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+}
 // 通用注解简单名:@Foo(…) / @Foo → group1=Foo。用于白名单注解索引(P1-1)。
 static AT_ANNOTATION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"@([A-Za-z_]\w*)").unwrap());
 // @Test 方法定位(P1-4)。
 static AT_TEST: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@Test\b").unwrap());
-// AOP advice 注解 + 其 pointcut 字面量(P1-2)。
+// AOP advice 注解 + 其 pointcut 字面量(P1-2)。group2 = 参数列表,pointcut 经
+// annotation_path 提取(兼容 value 不在首位)。
 static ADVICE_ANN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"@(Around|Before|After|AfterReturning|AfterThrowing)\s*\(\s*(?:value\s*=\s*)?"([^"]*)""#)
-        .unwrap()
+    Regex::new(r#"@(Around|Before|After|AfterReturning|AfterThrowing)\s*\(([^)]*)\)"#).unwrap()
 });
 // execution(返回类型 包.类.方法(..)) → 全限定方法签名(组1)。简单版,不处理通配 */||/within。
 static EXECUTION_SIG: LazyLock<Regex> = LazyLock::new(|| {
@@ -76,12 +89,14 @@ static JAVA_ABSTRACT: LazyLock<Regex> = LazyLock::new(|| {
 
 // ---- MyBatis Plus 持久层(MP 3.5.7 主力 ORM:注解实体 + BaseMapper + Wrapper) ----
 // 注解-声明关联用 offset 配对(见 extract_mybatis_plus),不走 AST,避免 grammar 改动。
+// 括号内参数列表捕获,path 交 annotation_path(兼容 @TableName(schema="x", value="t")
+// 这类 value 不在首位的写法)。
 static MP_TABLE_NAME: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"@TableName\s*\(\s*(?:value\s*=\s*)?"([^"]+)""#).unwrap());
+    LazyLock::new(|| Regex::new(r#"@TableName\s*\(([^)]*)\)"#).unwrap());
 static MP_TABLE_FIELD: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"@TableField\s*\(\s*(?:value\s*=\s*)?"([^"]+)""#).unwrap());
+    LazyLock::new(|| Regex::new(r#"@TableField\s*\(([^)]*)\)"#).unwrap());
 static MP_TABLE_ID_VAL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"@TableId\s*\(\s*(?:value\s*=\s*)?"([^"]+)""#).unwrap());
+    LazyLock::new(|| Regex::new(r#"@TableId\s*\(([^)]*)\)"#).unwrap());
 // @TableField(exist = false):非表字段,推断时跳过以降误报。
 static MP_NON_EXISTENT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"@TableField\s*\([^)]*exist\s*=\s*false").unwrap());
@@ -106,6 +121,155 @@ static MP_WRAPPER_LAMBDA: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
+
+/// 保偏移的双档掩码源码(见 `mask_java`):两档都保留字节偏移与换行,
+/// 掩码后的内容可直接跑原正则,offset 配对/line_of 全部不受影响。
+struct MaskedSource {
+    /// 仅掩码注释,保留字符串字面量 —— 给需要读字符串实参的正则
+    /// (mapping 路径/@TableName 列名/wrapper 列名/pointcut)。
+    code: String,
+    /// 注释 + 字符串/字符字面量全掩码 —— 给结构性正则
+    /// (class/field/annotation/extends/implements),根除 Javadoc 里的
+    /// "@Transactional"、注释里的 "class Foo" 产幻影实体。
+    bare: String,
+}
+
+/// 单遍扫描产出两档掩码(状态机:行注释/块注释/字符串/字符/text block)。
+/// 被掩码字节替换为空格,`\n` 原样保留(保证 line_of 与 offset 配对正确)。
+/// tree-sitter 路径仍用原文;掩码只服务正则提取。
+fn mask_java(content: &str) -> MaskedSource {
+    let bytes = content.as_bytes();
+    let n = bytes.len();
+    let mut code = bytes.to_vec();
+    let mut bare = bytes.to_vec();
+    #[derive(Clone, Copy, PartialEq)]
+    enum State {
+        Code,
+        LineComment,
+        BlockComment,
+        Str,
+        Char,
+        TextBlock,
+    }
+    let mut state = State::Code;
+    let mut i = 0;
+    while i < n {
+        let b = bytes[i];
+        match state {
+            State::Code => {
+                if b == b'/' && i + 1 < n && bytes[i + 1] == b'/' {
+                    state = State::LineComment;
+                    code[i] = b' ';
+                    bare[i] = b' ';
+                    code[i + 1] = b' ';
+                    bare[i + 1] = b' ';
+                    i += 2;
+                } else if b == b'/' && i + 1 < n && bytes[i + 1] == b'*' {
+                    state = State::BlockComment;
+                    code[i] = b' ';
+                    bare[i] = b' ';
+                    code[i + 1] = b' ';
+                    bare[i + 1] = b' ';
+                    i += 2;
+                } else if b == b'"' && i + 2 < n && bytes[i + 1] == b'"' && bytes[i + 2] == b'"' {
+                    state = State::TextBlock;
+                    bare[i] = b' ';
+                    bare[i + 1] = b' ';
+                    bare[i + 2] = b' ';
+                    i += 3;
+                } else if b == b'"' {
+                    state = State::Str;
+                    bare[i] = b' ';
+                    i += 1;
+                } else if b == b'\'' {
+                    state = State::Char;
+                    bare[i] = b' ';
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+            State::LineComment => {
+                if b == b'\n' {
+                    state = State::Code;
+                    i += 1;
+                } else {
+                    code[i] = b' ';
+                    bare[i] = b' ';
+                    i += 1;
+                }
+            }
+            State::BlockComment => {
+                if b == b'*' && i + 1 < n && bytes[i + 1] == b'/' {
+                    code[i] = b' ';
+                    bare[i] = b' ';
+                    code[i + 1] = b' ';
+                    bare[i + 1] = b' ';
+                    i += 2;
+                    state = State::Code;
+                } else if b == b'\n' {
+                    i += 1;
+                } else {
+                    code[i] = b' ';
+                    bare[i] = b' ';
+                    i += 1;
+                }
+            }
+            State::Str => {
+                if b == b'\\' && i + 1 < n {
+                    bare[i] = b' ';
+                    bare[i + 1] = b' ';
+                    i += 2;
+                } else if b == b'"' || b == b'\n' {
+                    // `\n`:容忍未闭合字符串(畸形输入),回到代码态。
+                    if b == b'"' {
+                        bare[i] = b' ';
+                    }
+                    state = State::Code;
+                    i += 1;
+                } else {
+                    bare[i] = b' ';
+                    i += 1;
+                }
+            }
+            State::Char => {
+                if b == b'\\' && i + 1 < n {
+                    bare[i] = b' ';
+                    bare[i + 1] = b' ';
+                    i += 2;
+                } else if b == b'\'' || b == b'\n' {
+                    if b == b'\'' {
+                        bare[i] = b' ';
+                    }
+                    state = State::Code;
+                    i += 1;
+                } else {
+                    bare[i] = b' ';
+                    i += 1;
+                }
+            }
+            State::TextBlock => {
+                if b == b'"' && i + 2 < n && bytes[i + 1] == b'"' && bytes[i + 2] == b'"' {
+                    bare[i] = b' ';
+                    bare[i + 1] = b' ';
+                    bare[i + 2] = b' ';
+                    i += 3;
+                    state = State::Code;
+                } else if b == b'\n' {
+                    i += 1;
+                } else {
+                    bare[i] = b' ';
+                    i += 1;
+                }
+            }
+        }
+    }
+    MaskedSource {
+        // 掩码只写空格,原文其余字节不变,结果必然是合法 UTF-8。
+        code: String::from_utf8(code).unwrap_or_else(|_| content.to_string()),
+        bare: String::from_utf8(bare).unwrap_or_else(|_| content.to_string()),
+    }
+}
 
 pub struct JavaExtractor;
 
@@ -135,11 +299,15 @@ fn extract_java(
 ) -> Result<()> {
     let parsed = JavaParser.parse(file)?;
     let syntax_confidence = if parsed.has_syntax_errors { 0.8 } else { 1.0 };
+    // 正则提取统一跑在掩码源码上(保偏移):结构正则用 bare(注释+字符串全掩),
+    // 需读字符串实参的正则用 code(仅掩注释)。tree-sitter 路径不受影响。
+    let masked = mask_java(&file.content);
     // 先跑 AST 遍历:产出 Bean DI 边 + 收集 Spring 信号(事务/定时),后者作为
     // metadata 挂到对应 class 实体,故必须在 class 实体创建前完成。
     let mut signals: HashMap<String, SpringSignals> = HashMap::new();
     let mut injected_fields: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    let mut methods: HashMap<String, EntityId> = HashMap::new();
+    // 同名方法(重载/同文件跨类同名)收集为 Vec:A+ 策略——调用解析遇歧义跳过不猜。
+    let mut methods: HashMap<String, Vec<EntityId>> = HashMap::new();
     let mut invocations: Vec<Invocation> = Vec::new();
     // 每个 method 的 (name 节点 offset, id),供 endpoint 注解 offset 配对到所在 method。
     let mut method_spans: Vec<(usize, EntityId)> = Vec::new();
@@ -167,27 +335,38 @@ fn extract_java(
             None,
         );
     }
-    // 同文件 method 调用 → Calls 边(低保真:按方法名匹配,跨类同名混淆、跨文件留后续)。
+    // 同文件 method 调用 → Calls 边。A+ 策略:caller/callee 名字对应多个方法
+    // (重载或同文件跨类同名)即歧义 → 跳过不猜连;唯一命中才建边。
     for inv in &invocations {
-        if let (Some(caller_id), Some(callee_id)) =
+        let (Some(caller_ids), Some(callee_ids)) =
             (methods.get(&inv.caller), methods.get(&inv.callee))
-            && caller_id != callee_id
-        {
-            edges.push(
-                Edge::new(caller_id.clone(), callee_id.clone(), EdgeKind::Calls).with_evidence(
-                    path,
-                    inv.line,
-                    inv.line,
-                    EvidenceClass::Inferred,
-                    0.7,
-                    "same-file method call",
-                ),
-            );
+        else {
+            continue;
+        };
+        let [caller_id] = caller_ids.as_slice() else {
+            continue;
+        };
+        let [callee_id] = callee_ids.as_slice() else {
+            continue;
+        };
+        if caller_id == callee_id {
+            continue;
         }
+        edges.push(
+            Edge::new(caller_id.clone(), callee_id.clone(), EdgeKind::Calls).with_evidence(
+                path,
+                inv.line,
+                inv.line,
+                EvidenceClass::Inferred,
+                0.7,
+                "same-file method call",
+            ),
+        );
     }
     // 把调用意图存入 method 实体 metadata.invokes,供 resolve_cross_stack 跨文件解析
     // (Controller→Service 这类跨文件调用 = 注入依赖类型 + 方法名匹配)。按 caller short
-    // name 分组回填;文件内方法名通常唯一,重名时后者覆盖前者。
+    // name 分组回填;重载同名方法共享 invokes(跨文件解析本就按名匹配,歧义由
+    // resolve 层的 A+ 防护兜底)。
     let mut invokes_by_caller: HashMap<&str, Vec<serde_json::Value>> = HashMap::new();
     for inv in &invocations {
         invokes_by_caller.entry(inv.caller.as_str()).or_default().push(json!({
@@ -211,17 +390,30 @@ fn extract_java(
         meta.insert("invokes".into(), serde_json::Value::Array(calls.clone()));
         entity.metadata = serde_json::Value::Object(meta);
     }
-    for capture in JAVA_CLASS.captures_iter(&file.content) {
-        let name = capture.get(2).unwrap();
-        let kind = if &capture[1] == "interface" {
-            EntityKind::Interface
-        } else {
-            EntityKind::Class
-        };
-        let line = line_of(&file.content, name.start());
+    // 类型声明统一采集一次(掩码后源码,注释里的 "class Foo" 不再产幻影实体),
+    // 供实体创建、class_offsets、字段所属类判定三处复用。
+    let class_hits: Vec<(usize, String, EntityKind)> = JAVA_CLASS
+        .captures_iter(&masked.bare)
+        .map(|capture| {
+            let name = capture.get(2).unwrap();
+            let kind = if &capture[1] == "interface" {
+                EntityKind::Interface
+            } else {
+                EntityKind::Class
+            };
+            (name.start(), name.as_str().to_string(), kind)
+        })
+        .collect();
+    // 字段所属类判定用:(class name offset, name) 序列。
+    let classes: Vec<(usize, String)> = class_hits
+        .iter()
+        .map(|(offset, name, _)| (*offset, name.clone()))
+        .collect();
+    for (offset, name, kind) in &class_hits {
+        let line = line_of(&file.content, *offset);
         let mut entity = Entity::new(
-            EntityId::stable("workspace", path, kind, name.as_str(), ""),
-            kind,
+            EntityId::stable("workspace", path, *kind, name.as_str(), ""),
+            *kind,
             name.as_str(),
             name.as_str(),
         );
@@ -256,14 +448,16 @@ fn extract_java(
         );
         add_contained(file, path, entity, line, entities, edges);
     }
-    for capture in JAVA_FIELD.captures_iter(&file.content) {
+    for capture in JAVA_FIELD.captures_iter(&masked.bare) {
         let name = capture.get(1).unwrap();
         let line = line_of(&file.content, name.start());
+        // EntityId 含所属类判别符:同文件跨类同名字段(外部类+内部类常见)不再坍缩。
+        let qualified = field_qualified_name(name.as_str(), &classes, name.start());
         let entity = Entity::new(
-            EntityId::stable("workspace", path, EntityKind::Field, name.as_str(), ""),
+            field_entity_id(path, name.as_str(), &classes, name.start()),
             EntityKind::Field,
             name.as_str(),
-            format!("{path}#{}", name.as_str()),
+            format!("{path}#{qualified}"),
         )
         .with_evidence(
             path,
@@ -277,15 +471,12 @@ fn extract_java(
     }
     // class/interface 与 method 的 name offset,供 base 与 endpoint 注解的级别判定。
     method_spans.sort_by_key(|(offset, _)| *offset);
-    let class_offsets: Vec<usize> = JAVA_CLASS
-        .captures_iter(&file.content)
-        .filter_map(|capture| capture.get(2).map(|name| name.start()))
-        .collect();
+    let class_offsets: Vec<usize> = class_hits.iter().map(|(offset, _, _)| *offset).collect();
     // 类级 base:取其后最近声明是 class/interface(且中间无更近的 method)的
     // @RequestMapping 的 path —— 排除方法级 @RequestMapping 被误当 base(否则
     // base=path 再拼方法 path 会翻倍成 /foo/foo)。
     let base = REQUEST_MAPPING
-        .captures_iter(&file.content)
+        .captures_iter(&masked.code)
         .find_map(|capture| {
             let ann_end = capture.get(0)?.end();
             let nearest_class = class_offsets.iter().filter(|off| **off >= ann_end).min().copied();
@@ -296,12 +487,12 @@ fn extract_java(
                 .min();
             match (nearest_class, nearest_method) {
                 (Some(coff), Some(moff)) if moff < coff => None, // 方法更近 → 方法级,跳过
-                (Some(_), _) => Some(capture[1].to_string()),
+                (Some(_), _) => annotation_path(capture.get(1)?.as_str()),
                 _ => None,
             }
         })
         .unwrap_or_default();
-    for capture in METHOD_MAPPING.captures_iter(&file.content) {
+    for capture in METHOD_MAPPING.captures_iter(&masked.code) {
         let matched = capture.get(0).unwrap();
         let ann_offset = matched.start();
         // 配对 ann 之后最近的 method;若 ann 与该 method 之间隔着 class/interface 声明,
@@ -322,7 +513,12 @@ fn extract_java(
         // group1 缺失 = @RequestMapping(无动词)→ method 通配,metadata 不含 method,
         // 让 analysis 端 endpoint_method=None → 与任意前端 call_method 低置信匹配。
         let method = capture.get(1).map(|m| m.as_str().to_uppercase());
-        let endpoint_path = normalize_path(&format!("{base}{}", &capture[2]));
+        // group2 = 注解参数列表;path 经 annotation_path 解析(value 可在任意属性位)。
+        // 括号内无字符串字面量(如纯 method=POST 无路径)→ 不产 endpoint。
+        let Some(path_arg) = capture.get(2).and_then(|m| annotation_path(m.as_str())) else {
+            continue;
+        };
+        let endpoint_path = normalize_path(&format!("{base}{path_arg}"));
         let name = match &method {
             Some(verb) => format!("{verb} {endpoint_path}"),
             None => format!("ANY {endpoint_path}"),
@@ -358,21 +554,37 @@ fn extract_java(
             );
         }
     }
-    extract_custom_endpoints(file, path, entities, edges, config);
-    extract_mybatis_plus(file, path, entities, edges);
-    extract_implements(file, entities);
-    extract_extends(file, entities);
+    extract_custom_endpoints(file, path, &masked, entities, edges, config);
+    extract_mybatis_plus(file, path, &masked, entities, edges);
+    extract_implements(&masked, entities);
+    extract_extends(&masked, entities);
     extract_interface_endpoints(file, path, entities, edges, config);
-    extract_annotations(file, path, &method_spans, entities, edges, config);
-    extract_tests(file, path, &method_spans, entities, edges);
-    extract_jobs(file, path, &method_spans, entities, edges, config);
-    extract_aspects(file, path, &method_spans, entities, edges);
+    extract_annotations(file, path, &masked, &method_spans, entities, edges, config);
+    extract_tests(file, path, &masked, &method_spans, entities, edges);
+    extract_jobs(file, path, &masked, &method_spans, entities, edges, config);
+    extract_aspects(&masked, &method_spans, entities, edges);
     Ok(())
+}
+
+/// 字段 qualified_name:有所属类时前缀类名(`Outer.name`),消除同文件跨类同名字段歧义。
+/// classes 为 (class name offset, name) 序列;所属类 = offset ≤ 字段 offset 的最近 class。
+fn field_qualified_name(name: &str, classes: &[(usize, String)], offset: usize) -> String {
+    match classes.iter().rev().find(|(start, _)| *start <= offset) {
+        Some((_, class)) => format!("{class}.{name}"),
+        None => name.to_string(),
+    }
+}
+
+/// 字段 EntityId(与 field_qualified_name 同源,保证实体与引用它的边 id 一致)。
+fn field_entity_id(path: &str, name: &str, classes: &[(usize, String)], offset: usize) -> EntityId {
+    let qualified = field_qualified_name(name, classes, offset);
+    EntityId::stable("workspace", path, EntityKind::Field, &qualified, "")
 }
 
 fn extract_custom_endpoints(
     file: &SourceFile,
     path: &str,
+    masked: &MaskedSource,
     entities: &mut Vec<Entity>,
     edges: &mut Vec<Edge>,
     config: &SemanticsConfig,
@@ -389,15 +601,12 @@ fn extract_custom_endpoints(
         .collect::<Vec<_>>()
         .join("|");
     let custom_re = Regex::new(&format!(r#"@({alternation})\b\s*(?:\(([^)]*)\))?"#)).unwrap();
-    for capture in custom_re.captures_iter(&file.content) {
+    for capture in custom_re.captures_iter(&masked.code) {
         let token = capture.get(0).unwrap();
         let annotation = capture.get(1).unwrap();
         let args = capture.get(2).map(|m| m.as_str()).unwrap_or("");
-        let value = STRING_LITERAL
-            .captures(args)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str())
-            .unwrap_or("");
+        // value= 优先于首个裸字符串(容忍 @MosApi(group="x", value="CODE") 写法)。
+        let value = annotation_path(args).unwrap_or_default();
         let line = line_of(&file.content, token.start());
         // Preserve the raw identifier (an RMB business code is not a URL path);
         // normalizing it would distort the value users actually search for.
@@ -478,21 +687,23 @@ fn method_to_field(method: &str) -> String {
 fn extract_mybatis_plus(
     file: &SourceFile,
     path: &str,
+    masked: &MaskedSource,
     entities: &mut Vec<Entity>,
     edges: &mut Vec<Edge>,
 ) {
     let content = &file.content;
 
-    // 收集 class / field 的 (名字 offset, 名字),复用 extract_java 同源 regex。
+    // 收集 class / field 的 (名字 offset, 名字),复用 extract_java 同源 regex
+    // (bare 掩码:注释里的声明样式文本不产幻影,offset 与 code 档一致)。
     let classes: Vec<(usize, String)> = JAVA_CLASS
-        .captures_iter(content)
+        .captures_iter(&masked.bare)
         .map(|c| {
             let name = c.get(2).unwrap();
             (name.start(), name.as_str().to_string())
         })
         .collect();
     let fields: Vec<(usize, String)> = JAVA_FIELD
-        .captures_iter(content)
+        .captures_iter(&masked.bare)
         .map(|c| {
             let name = c.get(1).unwrap();
             (name.start(), name.as_str().to_string())
@@ -502,8 +713,12 @@ fn extract_mybatis_plus(
     // (1) @TableName → 类 → Table + (后续)类内字段 → Column。
     // table_by_class: class_name -> table_name(本文件内 @TableName 标注的实体类)
     let mut table_by_class: HashMap<String, String> = HashMap::new();
-    for table_cap in MP_TABLE_NAME.captures_iter(content) {
-        let table_name = table_cap.get(1).unwrap();
+    for table_cap in MP_TABLE_NAME.captures_iter(&masked.code) {
+        // group1 = 注解参数列表;表名经 annotation_path 提取(value 可在任意属性位)。
+        let Some(table_name_m) = table_cap.get(1).and_then(|m| annotation_path(m.as_str())) else {
+            continue;
+        };
+        let table_name_str = table_name_m;
         let ann_end = table_cap.get(0).unwrap().end();
         // 注解之后最近的 class 声明 = 注解所属类
         let class_name = match classes
@@ -514,13 +729,13 @@ fn extract_mybatis_plus(
             Some((_, name)) => name.clone(),
             None => continue,
         };
-        table_by_class.insert(class_name.clone(), table_name.as_str().to_string());
-        let line = line_of(content, table_name.start());
+        table_by_class.insert(class_name.clone(), table_name_str.clone());
+        let line = line_of(content, table_cap.get(0).unwrap().start());
         let table = Entity::new(
-            EntityId::stable("workspace", path, EntityKind::Table, table_name.as_str(), ""),
+            EntityId::stable("workspace", path, EntityKind::Table, &table_name_str, ""),
             EntityKind::Table,
-            table_name.as_str(),
-            table_name.as_str(),
+            &table_name_str,
+            &table_name_str,
         )
         .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "MyBatis Plus @TableName");
         let class_id = EntityId::stable("workspace", path, EntityKind::Class, &class_name, "");
@@ -540,11 +755,14 @@ fn extract_mybatis_plus(
     // 显式 @TableField/@TableId → 字段偏移 -> (列名, 注解行)
     let mut explicit_col: HashMap<usize, (String, u32)> = HashMap::new();
     for ann in MP_TABLE_FIELD
-        .captures_iter(content)
-        .chain(MP_TABLE_ID_VAL.captures_iter(content))
+        .captures_iter(&masked.code)
+        .chain(MP_TABLE_ID_VAL.captures_iter(&masked.code))
     {
-        let col = ann.get(1).unwrap();
-        let ann_start = ann.get(0).unwrap().start();
+        let ann_match = ann.get(0).unwrap();
+        let Some(col) = ann.get(1).and_then(|m| annotation_path(m.as_str())) else {
+            continue;
+        };
+        let ann_start = ann_match.start();
         if let Some((foff, _)) = fields
             .iter()
             .filter(|(foff, _)| *foff > ann_start)
@@ -552,13 +770,13 @@ fn extract_mybatis_plus(
         {
             explicit_col
                 .entry(*foff)
-                .or_insert((col.as_str().to_string(), line_of(content, col.start())));
+                .or_insert((col, line_of(content, ann_start)));
         }
     }
 
     // exist=false → 被标注的字段偏移集合(跳过)
     let non_existent: HashSet<usize> = MP_NON_EXISTENT
-        .captures_iter(content)
+        .captures_iter(&masked.code)
         .filter_map(|ann| {
             let ann_start = ann.get(0).unwrap().start();
             fields
@@ -608,7 +826,8 @@ fn extract_mybatis_plus(
         )
         .with_metadata(json!({"mapped_field": fname, "source": "mybatis_plus"}))
         .with_evidence(path, line, line, classification, confidence, reason);
-        let field_id = EntityId::stable("workspace", path, EntityKind::Field, fname, "");
+        // 与 extract_java 的 Field 实体同公式(含所属类判别符),保证边能命中实体。
+        let field_id = field_entity_id(path, fname, &classes, *foff);
         edges.push(
             Edge::new(field_id, col.id.clone(), EdgeKind::MappedFrom).with_evidence(
                 path,
@@ -622,8 +841,9 @@ fn extract_mybatis_plus(
         entities.push(col);
     }
 
-    // (2) Mapper 接口:interface XxxMapper extends BaseMapper<Entity>
-    for mapper_cap in MP_MAPPER.captures_iter(content) {
+    // (2) Mapper 接口:interface XxxMapper extends BaseMapper<Entity>(bare 掩码,
+    // 注释里的 BaseMapper 字样不产幻影 Mapper)
+    for mapper_cap in MP_MAPPER.captures_iter(&masked.bare) {
         let mname = mapper_cap.get(1).unwrap();
         let entity_type = mapper_cap.get(2).unwrap().as_str().to_string();
         let line = line_of(content, mname.start());
@@ -660,8 +880,9 @@ fn extract_mybatis_plus(
         }
     }
 
-    // (3) Wrapper 链式列引用:.eq("col", …) 等
-    for wrapper_cap in MP_WRAPPER_COLUMN.captures_iter(content) {
+    // (3) Wrapper 链式列引用:.eq("col", …) 等(code 掩码:注释里的 .eq 不命中,
+    // 字符串实参保留)
+    for wrapper_cap in MP_WRAPPER_COLUMN.captures_iter(&masked.code) {
         let col = wrapper_cap.get(2).unwrap();
         let col_name = col.as_str();
         let line = line_of(content, col.start());
@@ -696,7 +917,7 @@ fn extract_mybatis_plus(
     // (4) Lambda 方法引用:wrapper.eq(Entity::getXxx, …) → 列(Inferred)
     //     getXxx→字段名→驼峰列名。跨文件 Entity 的显式 @TableField 未查(精度换覆盖);
     //     同 (文件,列名) 的 Column 因 EntityId 确定性合并。
-    for lambda_cap in MP_WRAPPER_LAMBDA.captures_iter(content) {
+    for lambda_cap in MP_WRAPPER_LAMBDA.captures_iter(&masked.code) {
         let method = lambda_cap.get(3).unwrap();
         let field_name = method_to_field(method.as_str());
         if field_name.is_empty() {
@@ -737,10 +958,9 @@ fn extract_mybatis_plus(
 /// EntityId 是 path-scoped(每文件独立命名空间),class 在本文件、interface 实体在定义
 /// 文件,extract 层建不了跨文件边(id 不匹配)。故只传递接口名,由 resolve_cross_stack
 /// 按全局 interface 实体名解析建边(与跨文件 Mapper→Table 同模式)。
-fn extract_implements(file: &SourceFile, entities: &mut [Entity]) {
-    let content = &file.content;
+fn extract_implements(masked: &MaskedSource, entities: &mut [Entity]) {
     let caps: Vec<(String, Vec<serde_json::Value>)> = JAVA_IMPLEMENTS
-        .captures_iter(content)
+        .captures_iter(&masked.bare)
         .filter_map(|cap| {
             let class_name = cap[1].to_string();
             let list = cap.get(2).map(|m| m.as_str()).unwrap_or("");
@@ -783,10 +1003,10 @@ fn extract_implements(file: &SourceFile, entities: &mut [Entity]) {
 /// extends 关系 + abstract 标记提取:存 class.metadata.superclass(超类简单名,单继承)与
 /// class.metadata.abstract(true)。跨文件继承边(SuperclassOf)由 resolve_cross_stack 按
 /// superclass 名解析,与 implements 同模式(Extract 层 EntityId path-scoped,建不了跨文件边)。
-fn extract_extends(file: &SourceFile, entities: &mut [Entity]) {
-    let content = &file.content;
-    // superclass:class Sub extends Super(单继承,去泛型)。
-    for cap in JAVA_EXTENDS.captures_iter(content) {
+fn extract_extends(masked: &MaskedSource, entities: &mut [Entity]) {
+    // superclass:class Sub extends Super(单继承,去泛型)。bare 掩码:Javadoc 里的
+    // "class A extends B" 字样不再污染 metadata.superclass。
+    for cap in JAVA_EXTENDS.captures_iter(&masked.bare) {
         let class_name = cap[1].to_string();
         let superclass = cap[2].to_string();
         for entity in entities.iter_mut() {
@@ -801,7 +1021,7 @@ fn extract_extends(file: &SourceFile, entities: &mut [Entity]) {
         }
     }
     // abstract:abstract class Foo(不论有无 extends)。
-    for cap in JAVA_ABSTRACT.captures_iter(content) {
+    for cap in JAVA_ABSTRACT.captures_iter(&masked.bare) {
         let class_name = cap[1].to_string();
         for entity in entities.iter_mut() {
             if entity.kind == EntityKind::Class && entity.name == class_name {
@@ -910,6 +1130,7 @@ fn extract_interface_endpoints(
 fn extract_annotations(
     file: &SourceFile,
     path: &str,
+    masked: &MaskedSource,
     method_spans: &[(usize, EntityId)],
     entities: &mut Vec<Entity>,
     edges: &mut Vec<Edge>,
@@ -923,8 +1144,10 @@ fn extract_annotations(
     let blacklist: HashSet<&str> = config.annotation_blacklist.iter().map(|s| s.as_str()).collect();
     let content = &file.content;
     // owner 候选:(声明 name offset, EntityId)。class/interface、method、field 合并取最近。
+    // 全部跑在 bare 掩码上,且 Field id 与 extract_java 同公式(含所属类判别符)。
     let mut owners: Vec<(usize, EntityId)> = Vec::new();
-    for capture in JAVA_CLASS.captures_iter(content) {
+    let mut classes: Vec<(usize, String)> = Vec::new();
+    for capture in JAVA_CLASS.captures_iter(&masked.bare) {
         let name = capture.get(2).unwrap();
         let kind = if &capture[1] == "interface" {
             EntityKind::Interface
@@ -935,19 +1158,22 @@ fn extract_annotations(
             name.start(),
             EntityId::stable("workspace", path, kind, name.as_str(), ""),
         ));
+        classes.push((name.start(), name.as_str().to_string()));
     }
     for (offset, id) in method_spans {
         owners.push((*offset, id.clone()));
     }
-    for capture in JAVA_FIELD.captures_iter(content) {
+    for capture in JAVA_FIELD.captures_iter(&masked.bare) {
         let name = capture.get(1).unwrap();
         owners.push((
             name.start(),
-            EntityId::stable("workspace", path, EntityKind::Field, name.as_str(), ""),
+            field_entity_id(path, name.as_str(), &classes, name.start()),
         ));
     }
     owners.sort_by_key(|(offset, _)| *offset);
-    for capture in AT_ANNOTATION.captures_iter(content) {
+    // AT_ANNOTATION 跑在 bare 掩码上:Javadoc/字符串里提及的 @Transactional 等不再
+    // 产幻影 Annotation 实体(历史污染 annotation 覆盖指标的主要来源)。
+    for capture in AT_ANNOTATION.captures_iter(&masked.bare) {
         let ann_name = capture.get(1).unwrap();
         if !whitelist.contains(ann_name.as_str()) || blacklist.contains(ann_name.as_str()) {
             continue;
@@ -994,6 +1220,7 @@ fn extract_annotations(
 fn extract_tests(
     file: &SourceFile,
     path: &str,
+    masked: &MaskedSource,
     method_spans: &[(usize, EntityId)],
     entities: &mut Vec<Entity>,
     _edges: &mut Vec<Edge>,
@@ -1008,7 +1235,7 @@ fn extract_tests(
             .filter_map(|entity| Some((&entity.id, entity.name.as_str())))
             .collect();
         AT_TEST
-            .captures_iter(content)
+            .captures_iter(&masked.bare)
             .filter_map(|capture| {
                 let ann_offset = capture.get(0)?.start();
                 let (_, method_id) = method_spans
@@ -1045,6 +1272,7 @@ fn extract_tests(
 fn extract_jobs(
     file: &SourceFile,
     path: &str,
+    masked: &MaskedSource,
     method_spans: &[(usize, EntityId)],
     entities: &mut Vec<Entity>,
     edges: &mut Vec<Edge>,
@@ -1061,6 +1289,7 @@ fn extract_jobs(
         .join("|");
     let re = Regex::new(&format!(r"@({alternation})\b")).unwrap();
     let content = &file.content;
+    let scan_source = &masked.bare;
     // 先借 entities 收集 name 映射,提取 (method_name, method_id, line, trigger) 后释放,
     // 再 push Job + Schedules 边(mutable borrow 冲突)。
     let hits: Vec<(String, EntityId, u32, String)> = {
@@ -1069,7 +1298,7 @@ fn extract_jobs(
             .filter(|entity| entity.kind == EntityKind::Method)
             .filter_map(|entity| Some((&entity.id, entity.name.as_str())))
             .collect();
-        re.captures_iter(content)
+        re.captures_iter(scan_source)
             .filter_map(|capture| {
                 let trigger = capture.get(1)?.as_str().to_string();
                 let ann_offset = capture.get(0)?.start();
@@ -1118,18 +1347,19 @@ fn extract_jobs(
 /// Intercepts 边(Inferred)。仅处理 `execution(返回类型 包.类.方法(..))` 完全签名形式,
 /// 通配 *、组合 ||、within/bean 切点不处理(分阶段)。
 fn extract_aspects(
-    file: &SourceFile,
-    _path: &str,
+    masked: &MaskedSource,
     method_spans: &[(usize, EntityId)],
     entities: &mut Vec<Entity>,
     _edges: &mut Vec<Edge>,
 ) {
-    let content = &file.content;
-    for capture in ADVICE_ANN.captures_iter(content) {
+    for capture in ADVICE_ANN.captures_iter(&masked.code) {
         let ann_offset = capture.get(0).unwrap().start();
-        let pointcut_expr = capture.get(2).unwrap().as_str();
+        // group2 = 注解参数列表;pointcut 字面量经 annotation_path 提取(value 任意位)。
+        let Some(pointcut_expr) = capture.get(2).and_then(|m| annotation_path(m.as_str())) else {
+            continue;
+        };
         let Some(signature) = EXECUTION_SIG
-            .captures(pointcut_expr)
+            .captures(&pointcut_expr)
             .and_then(|inner| inner.get(1))
             .map(|m| m.as_str().to_string())
         else {
@@ -1396,7 +1626,7 @@ fn visit_methods(
     path: &str,
     entities: &mut Vec<Entity>,
     edges: &mut Vec<Edge>,
-    methods: &mut HashMap<String, EntityId>,
+    methods: &mut HashMap<String, Vec<EntityId>>,
     invocations: &mut Vec<Invocation>,
     method_spans: &mut Vec<(usize, EntityId)>,
     current_method: Option<&str>,
@@ -1409,17 +1639,29 @@ fn visit_methods(
         // 方法体结束行（闭合 `}` 所在行）；abstract/interface 无方法体时 == 声明行。
         // 走 metadata 而非改 end_line：后者下游（analysis 跨文件边）当声明行号用。
         let body_end_line = line_of(&file.content, node.end_byte());
+        // 参数个数入 EntityId 判别符:同名重载不再哈希碰撞(旧方案 discriminator=""
+        // 让两个重载坍缩为同一 id,store upsert 静默覆盖先声明的那个)。
+        // 局限:同名同参个数、仅类型不同的重载仍碰撞(罕见,接受)。
+        let arity = node
+            .child_by_field_name("parameters")
+            .map(|params| {
+                (0..params.named_child_count())
+                    .filter_map(|i| params.named_child(i))
+                    .filter(|p| matches!(p.kind(), "formal_parameter" | "spread_parameter"))
+                    .count()
+            })
+            .unwrap_or(0);
         let entity = Entity::new(
-            EntityId::stable("workspace", path, EntityKind::Method, &name, ""),
+            EntityId::stable("workspace", path, EntityKind::Method, &name, &format!("arity:{arity}")),
             EntityKind::Method,
             &name,
             format!("{path}#{name}"),
         )
         .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "Java method declaration")
-        .with_metadata(json!({ "body_end_line": body_end_line }));
+        .with_metadata(json!({ "body_end_line": body_end_line, "arity": arity }));
         let id = entity.id.clone();
         add_contained(file, path, entity, line, entities, edges);
-        methods.insert(name.clone(), id.clone());
+        methods.entry(name.clone()).or_default().push(id.clone());
         // Class→Method 层级边(Declares):让 relay/impact 从类型到达其方法。
         // owner id 与 extract_java 的 class/interface entity 对齐(stable path+kind+name)。
         if let Some((owner_name, owner_kind)) = enclosing_type(source, node) {

@@ -123,7 +123,15 @@ pub fn discover_with_config(root: &Path, config: &DiscoveryConfig) -> Result<Vec
         })
         .build();
     for entry in walker {
-        let entry = entry?;
+        // walker 错误(权限不足/IO 错误/损坏符号链接)降级为跳过:单个不可读目录
+        // 不应让整个 scan 中止(企业库里的受限目录/NFS 抖动是常态)。
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                eprintln!("[ri-diag] skipping unreadable path during walk: {err}");
+                continue;
+            }
+        };
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
@@ -138,12 +146,28 @@ pub fn discover_with_config(root: &Path, config: &DiscoveryConfig) -> Result<Vec
         if patterns.iter().any(|pattern| pattern.matches(fname)) {
             continue;
         }
-        let metadata = entry.metadata()?;
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                eprintln!("[ri-diag] skipping {}: stat failed: {err}", path.display());
+                continue;
+            }
+        };
         if metadata.len() > max_bytes {
             continue;
         }
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("read source file {}", path.display()))?;
+        // 非 UTF-8(如 GBK 注释的遗留 Java 文件)或 IO 错误:跳过该文件并告警,
+        // 不中止全盘扫描。目标用户是国内企业库,GBK 遗留文件常见。
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(err) => {
+                eprintln!(
+                    "[ri-diag] skipping {} (unreadable or not valid UTF-8): {err}",
+                    path.display()
+                );
+                continue;
+            }
+        };
         let relative_path = path.strip_prefix(root).unwrap_or(path).to_path_buf();
         let relative = relative_path.to_string_lossy();
         files.push(SourceFile {

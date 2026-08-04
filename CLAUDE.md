@@ -17,12 +17,16 @@ cargo run -p repo-intelligence -- scan 验证项目/ruoyi-vue-plus \
 
 # 2. 直连库查关键指标,对比改动前后
 DB=验证项目/ruoyi-vue-plus/.repo-intelligence/workspace.sqlite
-sqlite3 "$DB" "SELECT json_extract(json,'\$.confidence'), COUNT(*) FROM edge WHERE kind='calls' GROUP BY 1;"
+sqlite3 "$DB" "SELECT json_extract(json,'\$.evidence[0].confidence'), COUNT(*) FROM edge WHERE kind='calls' GROUP BY 1;"
 ```
 
 ### 必须对比的指标
 
-- **calls 置信分布**:0.7 = 静态/字段精确解析(v0.1.23 Step A/B 新增),0.5 = 裸名注入匹配。改动前只有裸名匹配。
+- **calls 置信分布**:0.7 = 静态/字段精确解析(v0.1.23 Step A/B 新增),0.5 = 裸名注入匹配。改动前只有裸名匹配。**注意 confidence 嵌在 `edge.json.evidence[].confidence`**(不是 `json.confidence`):
+  ```bash
+  sqlite3 "$DB" "SELECT json_extract(json,'\$.evidence[0].confidence'), COUNT(*) FROM edge WHERE kind='calls' GROUP BY 1;"
+  ```
+  v0.1.32+ 起 A+ 歧义防护会让跨包同名类的 calls 解析被跳过并计入 `ambiguous_skipped`(scan 摘要)与实体 `metadata.ambiguous_resolution`;calls 边数可能略降但更纯。
 - **annotation 覆盖**:`SELECT name, COUNT(*) FROM entity WHERE kind='annotation' GROUP BY name ORDER BY 2 DESC` —— 验证 @Transactional/@Cacheable/@Slf4j(项目自定义)等结构化。
 - **跨文件链路**:从 Controller outbound traverse Calls,看是否连通到 Service→Mapper(Step B 字段消歧解了同名方法歧义)。
 - **从类 trace 到表**:`WITH RECURSIVE reach(...) ... edge_kinds 含 'declares' ... WHERE kind='table'` 从 ServiceImpl 类出发应命中表(默认 trace edge_kinds 已含 declares,类→method→Mapper→表);不含 declares 时为 0(回归对照)。
@@ -33,7 +37,7 @@ sqlite3 "$DB" "SELECT json_extract(json,'\$.confidence'), COUNT(*) FROM edge WHE
 ## 构建 / 测试
 
 - `cargo test` —— 全 workspace 单元/集成测试(**不替代**上面的真实项目验证)。
-- 版本号:根 `Cargo.toml` `[workspace.package] version`(当前 0.1.25),所有 crate `version.workspace = true`。
+- 版本号:根 `Cargo.toml` `[workspace.package] version`(当前 0.1.32),所有 crate `version.workspace = true`。
 - 提交风格:`release vX.Y.Z: ...`(见 git log)。
 
 ## 项目结构

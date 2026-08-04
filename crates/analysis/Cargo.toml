@@ -15,6 +15,7 @@ repo-intelligence-model = { path = "../model" }
 repo-intelligence-parsing = { path = "../parsing" }
 repo-intelligence-semantics = { path = "../semantics" }
 repo-intelligence-source = { path = "../source" }
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

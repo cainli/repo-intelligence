@@ -2236,7 +2236,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "repo-intelligence"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "anyhow",
  "clap",
@@ -2255,7 +2255,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-analysis"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2267,12 +2267,13 @@ dependencies = [
  "repo-intelligence-parsing",
  "repo-intelligence-semantics",
  "repo-intelligence-source",
+ "serde_json",
  "tempfile",
 ]
 
 [[package]]
 name = "repo-intelligence-config"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "anyhow",
  "serde",
@@ -2282,7 +2283,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-embedding"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "anyhow",
  "fastembed",
@@ -2290,7 +2291,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-graph"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "anyhow",
  "repo-intelligence-model",
@@ -2301,7 +2302,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-mcp"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2317,7 +2318,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-model"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "blake3",
  "serde",
@@ -2326,7 +2327,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-parsing"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "anyhow",
  "quick-xml",
@@ -2339,7 +2340,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-protocol"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "repo-intelligence-model",
  "serde",
@@ -2348,7 +2349,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-semantics"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "anyhow",
  "regex",
@@ -2362,7 +2363,7 @@ dependencies = [
 
 [[package]]
 name = "repo-intelligence-source"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "anyhow",
  "blake3",

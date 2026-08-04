@@ -50,8 +50,15 @@ fn mybatis_plus_explicit_is_fact_inferred_is_low_confidence() {
     assert_eq!(ev.classification, EvidenceClass::Inferred);
     assert!((ev.confidence - 0.7).abs() < 1e-6);
 
-    // Field --MappedFrom--> Column(显式配对边)
-    let field_id = EntityId::stable("workspace", "User.java", EntityKind::Field, "userName", "");
+    // Field --MappedFrom--> Column(显式配对边)。字段 EntityId 含所属类判别符
+    // (User.userName),消除同文件跨类同名字段坍缩(本批修复)。
+    let field_id = EntityId::stable(
+        "workspace",
+        "User.java",
+        EntityKind::Field,
+        "User.userName",
+        "",
+    );
     assert!(patch.add_edges.iter().any(|e| {
         e.kind == EdgeKind::MappedFrom && e.source == field_id && e.target == explicit.id
     }));

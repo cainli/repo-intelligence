@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
@@ -10,6 +10,12 @@ use repo_intelligence_model::{
     GraphPatch, ImpactFinding, ImpactReport, TraverseQuery,
 };
 use repo_intelligence_source::{SourceFile, discover_with_config};
+use serde_json::json;
+
+/// 索引格式版本:EntityId 方案变更(方法 arity 判别符、字段所属类判别符等)必须强制
+/// 全量重提,否则增量扫描会让旧 id 实体与新方案边(id 不匹配)并存,边悬空。做法:
+/// file_state 的值带版本前缀,版本变更后首次扫描新旧哈希不等 → 全量重提,之后稳定回增量。
+const INDEX_FORMAT: u32 = 2;
 
 #[derive(Clone, Debug, Default)]
 pub struct ScanSummary {
@@ -23,6 +29,9 @@ pub struct ScanSummary {
     pub files_changed: usize,
     pub files_deleted: usize,
     pub files_unchanged: usize,
+    /// A+ 策略下因裸名歧义被跳过的跨文件解析数(已记入请求方实体的
+    /// metadata.ambiguous_resolution,消费方可据此消歧或复核)。
+    pub ambiguous_skipped: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,12 +122,14 @@ impl WorkspaceIndexer {
 
         // diff:旧 file_state(path → hash) vs 本次发现的文件。
         let old_state = store.get_file_state()?;
+        // file_state 值带 INDEX_FORMAT 前缀:EntityId 方案变更后旧快照哈希不带前缀 →
+        // 不等 → 全量重提;之后新旧都带前缀,回到正常增量。
         let new_state: HashMap<String, String> = files
             .iter()
             .map(|file| {
                 (
                     file.relative_path.to_string_lossy().to_string(),
-                    file.content_hash.clone(),
+                    format!("f{INDEX_FORMAT}:{}", file.content_hash),
                 )
             })
             .collect();
@@ -126,8 +137,10 @@ impl WorkspaceIndexer {
         let mut to_delete: Vec<String> = Vec::new(); // deleted ∪ changed 的 path(删旧子树)
         for file in &files {
             let path = file.relative_path.to_string_lossy().to_string();
+            // 比较 file_state 时用带版本前缀的值(与 new_state 同公式),保证增量语义正确。
+            let current = format!("f{INDEX_FORMAT}:{}", file.content_hash);
             match old_state.get(&path) {
-                Some(hash) if *hash == file.content_hash => summary.files_unchanged += 1,
+                Some(hash) if *hash == current => summary.files_unchanged += 1,
                 Some(_) => {
                     summary.files_changed += 1;
                     to_delete.push(path);
@@ -264,10 +277,50 @@ impl WorkspaceIndexer {
         let t = std::time::Instant::now();
         let resolution = resolve_cross_stack(&all_entities, &extract_edges);
         let t_resolve = t.elapsed();
-        let n_resolved = resolution.add_edges.len();
+        let n_resolved = resolution.patch.add_edges.len();
         summary.edges_indexed += n_resolved;
         let t = std::time::Instant::now();
-        store.replace_resolved_edges(resolution.add_edges)?;
+        store.replace_resolved_edges(resolution.patch.add_edges)?;
+        // A+ 歧义写回:被跳过的跨文件解析记录到请求方实体的 metadata.ambiguous_resolution
+        // (而非强行建一条会误导的边)。消费方既看得到"哪些连接是歧义的、候选有哪些",
+        // 又能用候选文件 + import 自行消歧;图本身保持"出现即可信"。
+        summary.ambiguous_skipped = resolution.ambiguities.len();
+        if !resolution.ambiguities.is_empty() {
+            let mut by_holder: HashMap<&EntityId, Vec<serde_json::Value>> = HashMap::new();
+            for note in &resolution.ambiguities {
+                by_holder
+                    .entry(&note.holder)
+                    .or_default()
+                    .push(json!({
+                        "kind": note.kind,
+                        "name": note.name,
+                        "candidates": note.candidates,
+                    }));
+            }
+            let mut updated: Vec<Entity> = Vec::new();
+            for entity in &all_entities {
+                if let Some(entries) = by_holder.get(&entity.id) {
+                    let mut entity = entity.clone();
+                    let mut meta = match entity.metadata.clone() {
+                        serde_json::Value::Object(map) => map,
+                        _ => serde_json::Map::new(),
+                    };
+                    meta.insert(
+                        "ambiguous_resolution".into(),
+                        serde_json::Value::Array(entries.clone()),
+                    );
+                    entity.metadata = serde_json::Value::Object(meta);
+                    updated.push(entity);
+                }
+            }
+            if !updated.is_empty() {
+                store.apply_patch(GraphPatch::add(updated, Vec::new()))?;
+            }
+            eprintln!(
+                "[ri-diag] resolve: {} ambiguous cross-file resolutions skipped (A+); recorded in metadata.ambiguous_resolution",
+                resolution.ambiguities.len()
+            );
+        }
         eprintln!(
             "[ri-diag] resolve_cross_stack: {} entities → {} edges in {:.2}s; replace_resolved in {:.2}s",
             all_entities.len(),
@@ -345,8 +398,9 @@ impl WorkspaceIndexer {
     }
 }
 
-fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch {
+fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution {
     let mut edges = Vec::new();
+    let mut ambiguities: Vec<AmbiguityNote> = Vec::new();
     let mut fields: HashMap<String, Vec<&Entity>> = HashMap::new();
     let mut endpoints = Vec::new();
     let mut calls = Vec::new();
@@ -403,6 +457,31 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
     // (同文件绑定由 extract_mybatis_plus 产;这里补跨文件,store upsert 按 (s,t,kind) 去重)。
     let entity_by_id: HashMap<&EntityId, &Entity> =
         entities.iter().map(|entity| (&entity.id, entity)).collect();
+    // 类/接口按裸名全量分组 + 计数:A+ 歧义防护的依据(裸名跨包同名 = 跨文件解析的歧义源)。
+    // 一次遍历建表,后续各处复用 len()/候选文件。
+    let mut classes_by_name_all: HashMap<&str, Vec<&Entity>> = HashMap::new();
+    let mut ifaces_by_name_all: HashMap<&str, Vec<&Entity>> = HashMap::new();
+    for entity in entities {
+        match entity.kind {
+            EntityKind::Class => {
+                classes_by_name_all.entry(entity.name.as_str()).or_default().push(entity);
+            }
+            EntityKind::Interface => {
+                ifaces_by_name_all.entry(entity.name.as_str()).or_default().push(entity);
+            }
+            _ => {}
+        }
+    }
+    // 候选文件清单(去重排序),供 A+ 歧义 note:消费方读候选文件 + import 自行消歧。
+    let candidate_files = |list: &[&Entity]| -> Vec<String> {
+        let mut out: Vec<String> = list
+            .iter()
+            .filter_map(|e| e.evidence.first().map(|ev| ev.file.clone()))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    };
     let mut class_to_table: HashMap<&str, &EntityId> = HashMap::new();
     for edge in input_edges {
         if edge.kind == EdgeKind::DependsOn
@@ -411,6 +490,13 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
             && src.kind == EntityKind::Class
             && tgt.kind == EntityKind::Table
         {
+            // A+:同名实体类跨包 → 不入表(后面 mapper 侧记录歧义),宁可不连也不乱连。
+            if classes_by_name_all
+                .get(src.name.as_str())
+                .is_some_and(|v| v.len() > 1)
+            {
+                continue;
+            }
             class_to_table.insert(src.name.as_str(), &tgt.id);
         }
     }
@@ -431,6 +517,14 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
                 );
             }
             edges.push(edge);
+        } else if let Some(cands) = classes_by_name_all.get(entity_type).filter(|v| v.len() > 1) {
+            // entity_type 是跨包同名类 → 无法确定绑哪张表,记歧义不连。
+            ambiguities.push(AmbiguityNote {
+                holder: mapper.id.clone(),
+                kind: "mapper_table",
+                name: entity_type.to_string(),
+                candidates: candidate_files(cands),
+            });
         }
     }
 
@@ -515,14 +609,13 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
     // (DependsOn→SpringBean type)→ 在注入 type 声明的 method 里按名匹配,补
     // Controller→Service→Mapper 跨文件调用链(同文件 calls 由 extract_java 产)。
     // 低保真:方法名 + 注入类型匹配;同名歧义(多个注入 type 都有该方法)则跳过。
-    let entity_by_id_cf: HashMap<&EntityId, &Entity> =
-        entities.iter().map(|entity| (&entity.id, entity)).collect();
+    // 复用上面的 entity_by_id(同源 entities slice,此前另建一份 entity_by_id_cf 是重复)。
     let mut type_methods: HashMap<&str, HashMap<&str, &EntityId>> = HashMap::new();
     let mut method_owner: HashMap<&EntityId, &str> = HashMap::new();
     for edge in input_edges {
         if edge.kind == EdgeKind::Declares
             && let (Some(owner), Some(m)) =
-                (entity_by_id_cf.get(&edge.source), entity_by_id_cf.get(&edge.target))
+                (entity_by_id.get(&edge.source), entity_by_id.get(&edge.target))
             && matches!(owner.kind, EntityKind::Class | EntityKind::Interface)
             && m.kind == EntityKind::Method
         {
@@ -537,7 +630,7 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
     for edge in input_edges {
         if edge.kind == EdgeKind::Injects
             && let (Some(owner), Some(bean)) =
-                (entity_by_id_cf.get(&edge.source), entity_by_id_cf.get(&edge.target))
+                (entity_by_id.get(&edge.source), entity_by_id.get(&edge.target))
             && matches!(owner.kind, EntityKind::Class | EntityKind::Interface)
             && bean.kind == EntityKind::SpringBean
         {
@@ -585,6 +678,25 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
         // owner 可能无注入依赖(如纯静态工具调用 JsonUtil.stringify);injected 缺省为空,
         // 静态调用路径(receiver=类型名)不依赖它,不应被此处 continue 卡掉。
         let injected: &[&str] = owner_injected.get(owner).map(Vec::as_slice).unwrap_or(&[]);
+        // A+:owner 类型名跨包歧义 → 其 type_methods/owner_injected/owner_fields 是被污染的
+        // 聚合(两个同名类的条目互相覆盖/合并)。字段/注入两条路径在 owner 歧义时跳过;
+        // 静态调用路径(priority 1)自带歧义防护,不受影响。记一条 note(按 holder+name 去重)。
+        let owner_ambiguous = type_name_owners.get(owner).copied().unwrap_or(0) > 1;
+        if owner_ambiguous {
+            let mut cands: Vec<&Entity> = Vec::new();
+            if let Some(v) = classes_by_name_all.get(owner) {
+                cands.extend(v.iter().copied());
+            }
+            if let Some(v) = ifaces_by_name_all.get(owner) {
+                cands.extend(v.iter().copied());
+            }
+            ambiguities.push(AmbiguityNote {
+                holder: entity.id.clone(),
+                kind: "call_resolution",
+                name: owner.to_string(),
+                candidates: candidate_files(&cands),
+            });
+        }
         for invoke in invokes {
             let Some(callee_name) = invoke.get("name").and_then(|v| v.as_str()) else {
                 continue;
@@ -603,10 +715,13 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
             // 覆盖两种写法:field=this.service.foo(显式 this)与 name=service.foo
             // (Java 主流省略 this——identifier receiver 先当注入字段试,再当静态类型)。
             let mut via_field = false;
+            // owner 不歧义 + 注入字段类型本身也不歧义,才走精确字段路径。
             if let Some(rv) = receiver
                 && matches!(receiver_kind, "field" | "name")
+                && !owner_ambiguous
                 && let Some(field_map) = owner_fields.get(owner)
                 && let Some(&target_type) = field_map.get(rv)
+                && type_name_owners.get(target_type).copied().unwrap_or(0) <= 1
                 && let Some(ms) = type_methods.get(target_type)
                 && let Some(&callee_id) = ms.get(callee_name)
                 && callee_id != &entity.id
@@ -630,9 +745,13 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
                 reason = "cross-file static call on named type";
             }
             // 优先级 2:裸名 / 未精确解析的 name → 注入依赖类型名匹配(低保真),唯一命中 0.5。
-            if resolved.is_none() {
+            // A+:owner 歧义时其 injected 列表被污染 → 跳过;注入类型自身歧义的不参与 hits。
+            if resolved.is_none() && !owner_ambiguous {
                 let mut hits: Vec<&EntityId> = Vec::new();
                 for type_name in injected {
+                    if type_name_owners.get(*type_name).copied().unwrap_or(0) > 1 {
+                        continue;
+                    }
                     if let Some(ms) = type_methods.get(*type_name)
                         && let Some(callee_id) = ms.get(callee_name).copied()
                     {
@@ -666,10 +785,13 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
     // implements:跨文件 class.metadata.implements → 全局 interface 实体(EntityId 是
     // path-scoped,extract 层建不了跨文件边,故 metadata 传递 + 这里按 interface 名解析)。
     // 同时建 class→interface depends_on 边 + 反向索引 interface→impl,供下面的桥接。
-    let interfaces_by_name: HashMap<&str, &EntityId> = entities
+    // A+:interface 裸名跨包同名(两个 Handler 接口)→ 只保留无歧义的;
+    // 命中歧义名的 class 记 note 不连边。原先 HashMap::collect 在重名上后写覆盖,
+    // 且 implements 边以 1.0/Fact 输出 —— 这是最严重的语义反转(最不确定拿了最高置信)。
+    let interfaces_by_name: HashMap<&str, &EntityId> = ifaces_by_name_all
         .iter()
-        .filter(|e| e.kind == EntityKind::Interface)
-        .map(|e| (e.name.as_str(), &e.id))
+        .filter(|(_, v)| v.len() == 1)
+        .map(|(name, v)| (*name, &v[0].id))
         .collect();
     let mut interface_to_impls: HashMap<&str, Vec<&str>> = HashMap::new();
     for entity in entities {
@@ -681,6 +803,15 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
         };
         for iface_val in impls {
             let Some(iface_name) = iface_val.as_str() else { continue };
+            if let Some(cands) = ifaces_by_name_all.get(iface_name).filter(|v| v.len() > 1) {
+                ambiguities.push(AmbiguityNote {
+                    holder: entity.id.clone(),
+                    kind: "implements",
+                    name: iface_name.to_string(),
+                    candidates: candidate_files(cands),
+                });
+                continue;
+            }
             let Some(&iface_id) = interfaces_by_name.get(iface_name) else { continue };
             let mut edge = Edge::new(entity.id.clone(), iface_id.clone(), EdgeKind::DependsOn);
             if let Some(ev) = entity.evidence.first() {
@@ -718,17 +849,11 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
     // 类继承:跨文件 class.metadata.superclass → 全局超类实体,建 SuperclassOf(超类→子类,
     // outbound)。让 trace 从超类(含 abstract 抽象基类)下钻到具体子类——业务逻辑常在子类,
     // abstract 类自身方法不直接调 Dao,需经此边追到子类的表依赖。与 implements 同模式。
-    let classes_by_name: HashMap<&str, &EntityId> = entities
+    let classes_by_name: HashMap<&str, &EntityId> = classes_by_name_all
         .iter()
-        .filter(|e| e.kind == EntityKind::Class)
-        .map(|e| (e.name.as_str(), &e.id))
+        .filter(|(_, v)| v.len() == 1)
+        .map(|(name, v)| (*name, &v[0].id))
         .collect();
-    let mut class_name_count: HashMap<&str, usize> = HashMap::new();
-    for e in entities {
-        if e.kind == EntityKind::Class {
-            *class_name_count.entry(e.name.as_str()).or_insert(0) += 1;
-        }
-    }
     for entity in entities {
         if entity.kind != EntityKind::Class {
             continue;
@@ -736,8 +861,19 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
         let Some(superclass) = entity.metadata.get("superclass").and_then(|v| v.as_str()) else {
             continue;
         };
-        // 同名超类跨包歧义 → 跳过(保守,避免乱连)。
-        if class_name_count.get(superclass).copied().unwrap_or(0) > 1 {
+        // A+:同名超类跨包歧义 → 记 note 不连(此前静默跳过,缺席不可见)。
+        if classes_by_name_all
+            .get(superclass)
+            .is_some_and(|v| v.len() > 1)
+        {
+            ambiguities.push(AmbiguityNote {
+                holder: entity.id.clone(),
+                kind: "superclass",
+                name: superclass.to_string(),
+                candidates: candidate_files(
+                    classes_by_name_all.get(superclass).map(Vec::as_slice).unwrap_or(&[]),
+                ),
+            });
             continue;
         }
         let Some(&super_id) = classes_by_name.get(superclass) else { continue };
@@ -757,13 +893,20 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
     for edge in input_edges {
         if edge.kind == EdgeKind::Declares
             && let (Some(iface), Some(m)) =
-                (entity_by_id_cf.get(&edge.source), entity_by_id_cf.get(&edge.target))
+                (entity_by_id.get(&edge.source), entity_by_id.get(&edge.target))
             && iface.kind == EntityKind::Interface
             && m.kind == EntityKind::Method
             && let Some(impls) = interface_to_impls.get(iface.name.as_str())
         {
             let mut hits: Vec<&EntityId> = Vec::new();
             for impl_name in impls {
+                // A+:实现类裸名跨包同名 → type_methods[impl_name] 被污染,不参与命中。
+                if classes_by_name_all
+                    .get(*impl_name)
+                    .is_some_and(|v| v.len() > 1)
+                {
+                    continue;
+                }
                 if let Some(ms) = type_methods.get(*impl_name)
                     && let Some(impl_m_id) = ms.get(m.name.as_str()).copied()
                 {
@@ -793,24 +936,9 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
     // 产 @TableName 类→Table,在 extract 边里)即 method 操作的表。建 method→Table ReadsTable,
     // 让调用链从 Mapper method 抵达 data 层。不依赖 resolve 产的跨文件 Mapper→Table 边
     // (那些不在本次 input_edges 里)。
-    let class_to_table_m2t: HashMap<&str, &EntityId> = input_edges
-        .iter()
-        .filter_map(|edge| {
-            if edge.kind != EdgeKind::DependsOn {
-                return None;
-            }
-            let (Some(cls), Some(tbl)) =
-                (entity_by_id_cf.get(&edge.source), entity_by_id_cf.get(&edge.target))
-            else {
-                return None;
-            };
-            if cls.kind == EntityKind::Class && tbl.kind == EntityKind::Table {
-                Some((cls.name.as_str(), &edge.target))
-            } else {
-                None
-            }
-        })
-        .collect();
+    // Mapper method → Table:复用上面的 class_to_table(同源 DependsOn class→table 边,
+    // 含相同 A+ 歧义过滤);不再单独构建第二份(此前与 class_to_table 重复且各自 last-writer-wins)。
+    let class_to_table_m2t = &class_to_table;
     let mapper_by_key: HashMap<(&str, &str), &Entity> = entities
         .iter()
         .filter_map(|e| {
@@ -827,7 +955,7 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
             continue;
         }
         let (Some(owner), Some(method)) =
-            (entity_by_id_cf.get(&edge.source), entity_by_id_cf.get(&edge.target))
+            (entity_by_id.get(&edge.source), entity_by_id.get(&edge.target))
         else {
             continue;
         };
@@ -842,6 +970,15 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
             continue;
         };
         let Some(table_id) = class_to_table_m2t.get(entity_type) else {
+            // A+:entity_type 是跨包同名类 → 记 note(mapper 侧;与上面 mapper 循环的 note 去重)。
+            if let Some(cands) = classes_by_name_all.get(entity_type).filter(|v| v.len() > 1) {
+                ambiguities.push(AmbiguityNote {
+                    holder: mapper.id.clone(),
+                    kind: "mapper_table",
+                    name: entity_type.to_string(),
+                    candidates: candidate_files(cands),
+                });
+            }
             continue;
         };
         let mut m2t = Edge::new(edge.target.clone(), (*table_id).clone(), EdgeKind::ReadsTable);
@@ -858,10 +995,44 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
         edges.push(m2t);
     }
 
+    // HTTP call×endpoint 配对按 method 分桶:endpoint 无显式动词(@RequestMapping 通配)
+    // 进 wildcard(与任意 call_method 配),其余按动词进桶。call 只与同动词桶 + wildcard
+    // 配对,砍掉 O(calls × 全部 endpoints) 的全配对——前端密集仓库(vue/ts axios 调用 +
+    // 端点都很多)时是 scan 的可见常数因子。
+    let mut endpoints_by_method: HashMap<&str, Vec<&Entity>> = HashMap::new();
+    let wildcard_endpoints: Vec<&Entity> = endpoints
+        .iter()
+        .copied()
+        .filter(|endpoint| {
+            endpoint
+                .metadata
+                .get("method")
+                .and_then(|value| value.as_str())
+                .map(|m| m.is_empty())
+                .unwrap_or(true)
+        })
+        .collect();
+    for endpoint in endpoints.iter().copied() {
+        if let Some(m) = endpoint
+            .metadata
+            .get("method")
+            .and_then(|value| value.as_str())
+            && !m.is_empty()
+        {
+            endpoints_by_method.entry(m).or_default().push(endpoint);
+        }
+    }
     for call in calls {
         let call_method = call.metadata.get("method").and_then(|value| value.as_str());
         let call_path = call.metadata.get("path").and_then(|value| value.as_str());
-        for endpoint in &endpoints {
+        // 候选 = wildcard 通配端点 + 同动词端点。
+        let mut candidates: Vec<&Entity> = wildcard_endpoints.clone();
+        if let Some(m) = call_method
+            && let Some(bucket) = endpoints_by_method.get(m)
+        {
+            candidates.extend_from_slice(bucket);
+        }
+        for endpoint in candidates {
             let endpoint_method = endpoint
                 .metadata
                 .get("method")
@@ -925,10 +1096,11 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
 
     // Tests 边(P1-4):命名约定 XxxTest → Xxx(被测类)。仅对以 Test 结尾的 class 建,
     // 让"这个类被哪些测试覆盖"可查(Inferred,命名约定)。
-    let class_by_name: HashMap<&str, &EntityId> = entities
+    // A+:被测类名跨包同名 → 命中靠命名约定的 Tests 边会连到任意一个,记 note 不连。
+    let class_by_name: HashMap<&str, &EntityId> = classes_by_name_all
         .iter()
-        .filter(|entity| entity.kind == EntityKind::Class)
-        .map(|entity| (entity.name.as_str(), &entity.id))
+        .filter(|(_, v)| v.len() == 1)
+        .map(|(name, v)| (*name, &v[0].id))
         .collect();
     for entity in entities {
         if entity.kind != EntityKind::Class {
@@ -937,6 +1109,20 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
         let Some(stripped) = entity.name.strip_suffix("Test").filter(|s| !s.is_empty()) else {
             continue;
         };
+        if classes_by_name_all
+            .get(stripped)
+            .is_some_and(|v| v.len() > 1)
+        {
+            ambiguities.push(AmbiguityNote {
+                holder: entity.id.clone(),
+                kind: "test_convention",
+                name: stripped.to_string(),
+                candidates: candidate_files(
+                    classes_by_name_all.get(stripped).map(Vec::as_slice).unwrap_or(&[]),
+                ),
+            });
+            continue;
+        }
         if let Some(&tested_id) = class_by_name.get(stripped) {
             let mut edge = Edge::new(entity.id.clone(), tested_id.clone(), EdgeKind::Tests);
             if let Some(ev) = entity.evidence.first() {
@@ -993,7 +1179,31 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> GraphPatch 
         }
     }
 
-    GraphPatch::add(Vec::new(), edges)
+    // A+ note 去重:同一实体同一 (kind,name) 可能被多个 invoke / 多个 method 触发,
+    // 合并成一条,避免 metadata.ambiguous_resolution 噪声膨胀。
+    let mut seen: HashSet<(String, &'static str, String)> = HashSet::new();
+    ambiguities.retain(|note| seen.insert((note.holder.0.clone(), note.kind, note.name.clone())));
+    Resolution {
+        patch: GraphPatch::add(Vec::new(), edges),
+        ambiguities,
+    }
+}
+
+/// 一条因裸名歧义被跳过的跨文件解析(A+ 策略)。`holder` = 请求方实体(边本该从它出发),
+/// 写回其 metadata.ambiguous_resolution;`candidates` = 同名候选所在的文件,供消费方读
+/// import 自行消歧。`kind` 标解析类别(implements/mapper_table/superclass/call_resolution/test_convention)。
+#[derive(Clone, Debug)]
+pub struct AmbiguityNote {
+    pub holder: EntityId,
+    pub kind: &'static str,
+    pub name: String,
+    pub candidates: Vec<String>,
+}
+
+/// resolve_cross_stack 的产物:跨文件边 patch + 因歧义被跳过的解析清单。
+pub struct Resolution {
+    pub patch: GraphPatch,
+    pub ambiguities: Vec<AmbiguityNote>,
 }
 
 fn semantic_rank(kind: EntityKind) -> u8 {
@@ -1102,6 +1312,10 @@ impl<'a> ImpactAnalyzer<'a> {
         for entity in candidates.into_iter().skip(offset).take(limit) {
             let plane = plane_for(entity.kind).to_owned();
             let mut path = vec![entity.id.clone()];
+            // path_set 与 path 同步:HashSet 做 O(1) 成员判定,避免大图上
+            // path.contains 的 O(n²)(宽图 depth=2 可达数百实体)。
+            let mut path_set: HashSet<EntityId> = HashSet::new();
+            path_set.insert(entity.id.clone());
             let mut evidence = entity.evidence.clone();
             // finding 的可达性置信度 = path 周围边上证据的最小 confidence。
             // 触及 Inferred 边(分级匹配的低置信 matches_endpoint)会拉低它,
@@ -1133,7 +1347,7 @@ impl<'a> ImpactAnalyzer<'a> {
                     evidence.extend(edge.evidence);
                 }
                 for related in traversal.entities {
-                    if !path.contains(&related.id) {
+                    if path_set.insert(related.id.clone()) {
                         path.push(related.id);
                     }
                 }
@@ -1160,7 +1374,7 @@ impl<'a> ImpactAnalyzer<'a> {
                         evidence.extend(edge.evidence);
                     }
                     for related in bridge.entities {
-                        if !path.contains(&related.id) {
+                        if path_set.insert(related.id.clone()) {
                             path.push(related.id);
                         }
                     }

@@ -7,6 +7,65 @@
 
 ## [Unreleased]
 
+## [0.1.32] - 2026-08-04
+
+### Fixed
+- **EntityId 碰撞(方法重载 + 同名字段)**:方法 EntityId 加 arity 判别符(`arity:N`),
+  字段加所属类前缀(`Outer.name`)。此前同文件内方法重载(以及跨内部类同名字段)哈希
+  碰撞,store `ON CONFLICT(id) DO UPDATE` 静默覆盖先声明的——ruoyi 上 **206 个方法实体**
+  被坍缩丢失(实测前后 2723→2929)。现各自独立。
+- **裸名跨文件解析的 A+ 歧义防护**:interfaces_by_name/class_to_table/m2t/type_methods/
+  owner_injected/owner_fields/class_by_name 一批"裸名 HashMap"原先在跨包同名类上
+  last-writer-wins,且 implements 边以 **1.0/Fact** 输出(最不确定的匹配拿了最高置信)。
+  现按 A+ 策略:歧义时拒边,把候选(同名类型所在的文件)写入请求方实体
+  `metadata.ambiguous_resolution`,并在 scan 摘要计入 `ambiguous_skipped`。消费方可读
+  候选文件 + import 自行消歧。图保持"出现即可信"。
+- **非 UTF-8 / walker 错误不再中止全盘 scan**:`fs::read_to_string` 与 walker 错误
+  降级为 stderr 警告 + 跳过该文件(此前单个 GBK 注释的 .java 或一个权限受限目录杀掉整个 scan,
+  零产出——与国内企业库目标用户冲突)。
+- **注释/字符串掩码(治幻影实体)**:正则提取统一跑在保偏移掩码源码上(双档:仅注释 /
+  注释+字符串)。Javadoc 里的 `@Transactional`、注释里的 `class Foo` 不再产幻影
+  Annotation/Class 实体(ruoyi 上 annotation 实体 113→109)。
+- **METHOD_MAPPING 支持任意位置的 value**:`@RequestMapping(method = POST, value = "/x")`
+  这类 value 不在首属性的写法此前整个 endpoint 静默丢失;改捕获括号内参数列表 +
+  `annotation_path`(value= 优先、否则首字符串字面量,兼容数组形式)。@TableName/@TableField/
+  @TableId/@Around 等 value 不在首位的写法一并修复。
+- **verify_edge 路径围堵 + 命中封顶**:canonicalize 后校验文件不越出 workspace 根
+  (此前经 workspace 参数可读 ~/.ssh 等敏感文件);命中按 50 截断,`match_count` 报真实总数。
+- **MCP 输入上限**:trace `depth` 封顶 10、分页 `limit` 封顶 500(此前无界,depth=999999
+  可遍历全图构成对单线程服务器的 DoS,limit=u32::MAX 可撑爆 LLM 上下文)。
+- **trace_full_path 的 to_kind 过滤移到分页前**:此前在分页后 retain,导致某些页过滤后为 0
+  却 `has_more=true`,客户端永远翻不到目标;现 `total_items/has_more` 反映过滤后集合。
+- **EMBEDDER 中毒容错**:`EMBEDDER.lock().unwrap()` 改为恢复 `PoisonError::into_inner`,
+  ONNX 一次 panic 不再让 semantic_search 永久失效。
+- **FTS5 / LIKE 转义**:搜索词含 `"` 时 FTS5 短语不再报错(转义为 `""`);LIKE 的 `%`/`_`
+  转义为字面量(`100%` 不再匹配任何含 100 的串)。
+- **`--database` 裸文件名**:parent() 返回 `""` 致 `create_dir_all("")` 失败且错误信息为空串;
+  现仅在 parent 非空时建目录。
+- **xml.rs 循环内编译 regex**:SQL 赋值正则提到 static(clippy 警告清除)。
+
+### Changed
+- **索引格式版本 v2**:EntityId 方案变更后,file_state 值带 `f2:` 前缀强制全量重提,
+  避免增量扫描让旧 id 实体与新方案边并存(边悬空)。首次扫描后回到正常增量。
+  **升级后首次 scan 会全量重索引**(已知、一次性)。
+- `resolve_cross_stack` 返回 `Resolution { patch, ambiguities }`;新增 `AmbiguityNote`、
+  `ScanSummary.ambiguous_skipped`、scan_workspace/CLI scan 响应均带 `ambiguous_skipped`。
+
+### Performance / Robustness (P2)
+- **FTS 漂移自愈**:open 时(fts_enabled)校验 `entity_fts` 与 `entity` 行数,不一致则
+  全量重建。修两类此前搜索返回错误结果的 bug:(1) scan 跑过 `fts_enabled=false` 期间
+  增删实体后重开 fts=true,新实体对 MATCH 不可见;(2) trigram 迁移 DROP+CREATE+回填
+  非原子,中途崩溃留空 fts 表。健康库上行数相等,无重建开销。
+- **build_relay 不再全表加载**:对端索引改用 traverse 已返回的实体 + target,不再
+  `all_entities()`(大库单次调用从 O(全图) 降到 O(可达),避免数百 MB 临时占用 + 单线程阻塞)。
+- **embedding 维度真校验**:`debug_assert` 改为运行时校验,损坏/截断 blob 跳过 + 告警,
+  不再在 release 下静默产出错维向量(会让余弦打分算错甚至越界 panic)。
+- **impact path O(1) 去重**:`path.contains` 的 O(n²) 改为 HashSet,宽图 depth=2
+  (可达数百实体)的 impact 分析常数下降。
+- **HTTP call×endpoint 按 method 分桶**:call 只与同动词端点 + 通配端点配对,砍掉
+  O(calls × 全部 endpoints) 全配对(前端密集仓库的可见常数)。
+- **entity_by_id 去重**:resolve 内两份相同的 `entity_by_id`/`entity_by_id_cf` 合并为一份。
+
 ## [0.1.29] - 2026-07-31
 
 ### Fixed

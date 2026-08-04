@@ -117,7 +117,11 @@ fn default_base() -> PathBuf {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    if let Some(parent) = cli.database.parent() {
+    // 裸文件名(如 --database my.sqlite)的 parent() 返回 Some(""),create_dir_all("")
+    // 会失败且错误信息是空串。仅当 parent 非空(确有目录成分)时才建目录。
+    if let Some(parent) = cli.database.parent()
+        && !parent.as_os_str().is_empty()
+    {
         fs::create_dir_all(parent)
             .with_context(|| format!("create data directory {}", parent.display()))?;
     }
@@ -164,7 +168,8 @@ fn run() -> Result<()> {
                     "files_deleted": summary.files_deleted,
                     "files_unchanged": summary.files_unchanged,
                     "entities_indexed": summary.entities_indexed,
-                    "edges_indexed": summary.edges_indexed
+                    "edges_indexed": summary.edges_indexed,
+                    "ambiguous_skipped": summary.ambiguous_skipped
                 }),
             )
         }

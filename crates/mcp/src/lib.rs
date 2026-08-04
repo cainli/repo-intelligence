@@ -19,6 +19,11 @@ const DEFAULT_SEARCH_LIMIT: usize = 100;
 /// `depth`. Two hops answers "who calls this, and who calls them" without
 /// flooding the result; raise it for deeper chains.
 const DEFAULT_TRACE_DEPTH: usize = 2;
+/// trace 深度上限:depth 无界时一次 trace 可遍历全图(每实体一次 SQL 往返),
+/// 在 10 万实体级图上构成对单线程服务器的 DoS。10 跳已覆盖任何真实调用链。
+const MAX_TRACE_DEPTH: usize = 10;
+/// 分页 limit 上限:无界时一次调用可把整图序列化进响应,撑爆 LLM 上下文。
+const MAX_PAGE_LIMIT: usize = 500;
 
 /// A tool advertised over `tools/list`, together with its typed contracts.
 ///
@@ -882,10 +887,10 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
                 .as_f64()
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0) as f32;
-            let limit = arguments["limit"].as_u64().unwrap_or(50) as usize;
+            let limit = (arguments["limit"].as_u64().unwrap_or(50) as usize).clamp(1, MAX_PAGE_LIMIT);
             let offset = parse_offset(arguments);
             let store = SqliteGraphStore::open(&path)?;
-            trace_graph(&store, name, depth, kinds, false, min_confidence, limit, offset)?
+            trace_graph(&store, name, depth, kinds, false, min_confidence, limit, offset, None)?
         }
         "trace_callees" => {
             let name = arguments["name"].as_str().unwrap_or_default();
@@ -895,10 +900,10 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
                 .as_f64()
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0) as f32;
-            let limit = arguments["limit"].as_u64().unwrap_or(50) as usize;
+            let limit = (arguments["limit"].as_u64().unwrap_or(50) as usize).clamp(1, MAX_PAGE_LIMIT);
             let offset = parse_offset(arguments);
             let store = SqliteGraphStore::open(&path)?;
-            trace_graph(&store, name, depth, kinds, true, min_confidence, limit, offset)?
+            trace_graph(&store, name, depth, kinds, true, min_confidence, limit, offset, None)?
         }
         "trace_table_access" => {
             let name = arguments["name"].as_str().unwrap_or_default();
@@ -923,10 +928,10 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
                     kinds.push(EdgeKind::WritesTable);
                 }
             }
-            let limit = arguments["limit"].as_u64().unwrap_or(50) as usize;
+            let limit = (arguments["limit"].as_u64().unwrap_or(50) as usize).clamp(1, MAX_PAGE_LIMIT);
             let offset = parse_offset(arguments);
             let store = SqliteGraphStore::open(&path)?;
-            trace_graph(&store, name, depth, kinds, false, min_confidence, limit, offset)?
+            trace_graph(&store, name, depth, kinds, false, min_confidence, limit, offset, None)?
         }
         "trace_full_path" => {
             let name = arguments["name"].as_str().unwrap_or_default();
@@ -957,17 +962,12 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
                 ],
                 value => serde_json::from_value(value.clone())?,
             };
-            let limit = arguments["limit"].as_u64().unwrap_or(50) as usize;
+            let limit = (arguments["limit"].as_u64().unwrap_or(50) as usize).clamp(1, MAX_PAGE_LIMIT);
             let offset = parse_offset(arguments);
             let store = SqliteGraphStore::open(&path)?;
-            let mut result = trace_graph(&store, name, depth, kinds, outbound, min_confidence, limit, offset)?;
-            if let Some(to_kind) = to_kind
-                && let Some(items) = result["items"].as_array_mut()
-            {
-                items.retain(|item| item["kind"].as_str() == Some(to_kind));
-                result["count"] = json!(items.len());
-            }
-            result
+            // to_kind 经 trace_graph 在分页前过滤(has_more/total 反映过滤后集合);
+            // 此前在分页后 retain 会产生"每页过滤后为 0 却 has_more=true"的死翻页。
+            trace_graph(&store, name, depth, kinds, outbound, min_confidence, limit, offset, to_kind)?
         }
         "verify_edge" => {
             let source = arguments["source"].as_str().unwrap_or_default();
@@ -1007,6 +1007,7 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
                 "files_unchanged": summary.files_unchanged,
                 "entities_indexed": summary.entities_indexed,
                 "edges_indexed": summary.edges_indexed,
+                "ambiguous_skipped": summary.ambiguous_skipped,
                 "entities_by_kind": entities_by_kind,
                 "excluded_dirs": config.discovery.effective_excluded_dirs(),
             })
@@ -1105,7 +1106,7 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
 fn parse_limit(arguments: &Value) -> usize {
     arguments["limit"]
         .as_u64()
-        .map(|value| value.max(1) as usize)
+        .map(|value| (value.max(1) as usize).min(MAX_PAGE_LIMIT))
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
 }
 
@@ -1168,7 +1169,12 @@ fn semantic_search(store: &SqliteGraphStore, query: &str, limit: usize) -> Resul
         }));
     }
     let qvec = {
-        let mut guard = EMBEDDER.lock().unwrap();
+        // 中毒容错:ONNX 若在持锁期间 panic,锁会中毒,此后每次 .unwrap() 都 panic,
+        // semantic_search 永久失效(直到进程重启)。取 into_inner 恢复内部数据继续服务。
+        let mut guard = match EMBEDDER.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         if guard.is_none() {
             *guard = repo_intelligence_embedding::Embedder::new().ok();
         }
@@ -1283,7 +1289,7 @@ fn entity_to_json(entity: &repo_intelligence_model::Entity, verbose: bool) -> Va
 fn parse_depth(arguments: &Value, default: usize) -> usize {
     arguments["depth"]
         .as_u64()
-        .map(|value| value as usize)
+        .map(|value| (value as usize).min(MAX_TRACE_DEPTH))
         .unwrap_or(default)
 }
 
@@ -1343,6 +1349,7 @@ fn edge_view(edge: &Edge) -> Value {
 /// `analyze_change` resolves its target and matches the "trace *this* entity"
 /// intent. Multiple same-named entities each seed the walk; results merge and
 /// dedupe so a polymorphic/overloaded name still resolves in one call.
+#[allow(clippy::too_many_arguments)]
 fn trace_graph(
     store: &SqliteGraphStore,
     name: &str,
@@ -1352,6 +1359,7 @@ fn trace_graph(
     min_confidence: f32,
     limit: usize,
     offset: usize,
+    to_kind: Option<&str>,
 ) -> Result<Value> {
     let matches = store.search(SearchQuery::new(name).with_limit(DEFAULT_SEARCH_LIMIT))?;
     let matched: Vec<Entity> = matches.into_iter().map(|m| m.entity).collect();
@@ -1411,6 +1419,11 @@ fn trace_graph(
             .cmp(&b.qualified_name)
             .then_with(|| a.id.0.cmp(&b.id.0))
     });
+    // to_kind 过滤放在分页前:此前在分页后 retain,导致 has_more/total 是未过滤的、
+    // 某些页过滤后为 0 而客户端永远翻不到目标。现在 total_items/has_more 都反映过滤后集合。
+    if let Some(kind) = to_kind {
+        items.retain(|entity| entity.kind.as_str() == kind);
+    }
     edges.sort_by(|a, b| {
         (a.source.0.as_str(), a.target.0.as_str(), a.kind.as_str()).cmp(&(
             b.source.0.as_str(),
@@ -1521,15 +1534,35 @@ fn verify_edge(
         }));
     };
     let absolute = Path::new(workspace).join(&source_file);
-    let content = std::fs::read_to_string(&absolute)
+    // 路径围堵:解析后的文件必须落在 workspace 根内。verify_edge 读任意扩展名的文件,
+    // 是本工具唯一的"任意文件读取"入口——不围堵,配合提示注入可经 workspace 参数读
+    // ~/.ssh/id_rsa 等敏感文件(workspace 变量完全由调用方控制)。
+    let canonical_root = std::fs::canonicalize(workspace)
+        .with_context(|| format!("resolve workspace root {}", workspace))?;
+    let canonical = std::fs::canonicalize(&absolute)
         .with_context(|| format!("read source file {}", absolute.display()))?;
+    if !canonical.starts_with(&canonical_root) {
+        anyhow::bail!(
+            "source file {} escapes workspace root {}; refusing to read outside the workspace",
+            canonical.display(),
+            canonical_root.display()
+        );
+    }
+    let content = std::fs::read_to_string(&canonical)?;
+    // 命中封顶:target 是高频词(如 "String")时一个万行文件会产出上万条命中,
+    // 撑爆响应。截断展示,match_count 仍报真实总数。
+    const MAX_MATCHES: usize = 50;
     let mut matches = Vec::new();
+    let mut match_count = 0usize;
     for (index, line) in content.lines().enumerate() {
         if line.contains(target) {
-            matches.push(json!({"line": index + 1, "snippet": line.trim()}));
+            match_count += 1;
+            if matches.len() < MAX_MATCHES {
+                matches.push(json!({"line": index + 1, "snippet": line.trim()}));
+            }
         }
     }
-    let verified = !matches.is_empty();
+    let verified = match_count > 0;
     let note = if verified {
         format!(
             "`{target}` appears in `{source_file}` — consistent with the edge. Substring match is \
@@ -1547,7 +1580,7 @@ fn verify_edge(
         "source_file": source_file,
         "target": target,
         "verified": verified,
-        "match_count": matches.len(),
+        "match_count": match_count,
         "matches": matches,
         "note": note
     }))
@@ -1615,13 +1648,17 @@ pub fn build_relay(
         edge_kinds: relay_kinds,
     })?;
 
-    // 一次 all_entities 建 id→entity 索引,为每条边解出对端 qn/short/kind(无批量
-    // get_entity,这是 analysis 层 ImpactAnalyzer 同款 join 模式)。
-    let index: HashMap<EntityId, Entity> = store
-        .all_entities()?
-        .into_iter()
-        .map(|entity| (entity.id.clone(), entity))
-        .collect();
+    // 对端索引只覆盖 traversal 实际到达的实体 + target 本身——不再 all_entities 全表加载
+    // (大库上单次 build_relay 会把整图 JSON 读进内存,数百 MB;且单线程服务器会阻塞)。
+    // traverse 已带回对端实体,边端点必在到达集里。
+    let mut index: HashMap<EntityId, Entity> = HashMap::new();
+    index.insert(target.id.clone(), target.clone());
+    for entity in inbound.entities {
+        index.insert(entity.id.clone(), entity);
+    }
+    for entity in outbound.entities {
+        index.insert(entity.id.clone(), entity);
+    }
 
     // inbound 的对端是调用方(edge.source);outbound 的对端是被调方(edge.target)。
     let inbound_edges: Vec<Value> = inbound
@@ -1953,7 +1990,7 @@ mod tests {
             EdgeKind::Exposes,
             EdgeKind::MatchesEndpoint,
         ];
-        let r1 = trace_graph(&store, "Svc", 5, kinds_with, true, 0.0, 50, 0).unwrap();
+        let r1 = trace_graph(&store, "Svc", 5, kinds_with, true, 0.0, 50, 0, None).unwrap();
         let qns1: Vec<&str> = r1["items"]
             .as_array()
             .unwrap()
@@ -1974,7 +2011,7 @@ mod tests {
             EdgeKind::Exposes,
             EdgeKind::MatchesEndpoint,
         ];
-        let r2 = trace_graph(&store, "Svc", 5, kinds_without, true, 0.0, 50, 0).unwrap();
+        let r2 = trace_graph(&store, "Svc", 5, kinds_without, true, 0.0, 50, 0, None).unwrap();
         let qns2: Vec<&str> = r2["items"]
             .as_array()
             .unwrap()
@@ -2031,7 +2068,7 @@ mod tests {
             EdgeKind::Exposes,
             EdgeKind::MatchesEndpoint,
         ];
-        let r1 = trace_graph(&store, "AbstractBase", 5, kinds_with, true, 0.0, 50, 0).unwrap();
+        let r1 = trace_graph(&store, "AbstractBase", 5, kinds_with, true, 0.0, 50, 0, None).unwrap();
         let qns1: Vec<&str> = r1["items"]
             .as_array()
             .unwrap()
@@ -2052,7 +2089,7 @@ mod tests {
             EdgeKind::Exposes,
             EdgeKind::MatchesEndpoint,
         ];
-        let r2 = trace_graph(&store, "AbstractBase", 5, kinds_without, true, 0.0, 50, 0).unwrap();
+        let r2 = trace_graph(&store, "AbstractBase", 5, kinds_without, true, 0.0, 50, 0, None).unwrap();
         let qns2: Vec<&str> = r2["items"]
             .as_array()
             .unwrap()

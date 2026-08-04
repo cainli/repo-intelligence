@@ -39,6 +39,9 @@ static SQL_JOIN_ON: LazyLock<Regex> = LazyLock::new(|| {
 static SQL_COLUMN_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)").unwrap()
 });
+// UPDATE-SET 赋值列:`col = `。曾写在循环里(clippy 警告),提到 static。
+static SQL_ASSIGN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"([A-Za-z_]\w*)\s*=").unwrap());
 // G1:SQL 噪声区间——MyBatis 占位符 `#{...}`/`${...}`(参数名 + jdbcType + SQL 类型)
 // 与动态标签 `<...>`(if/test/collection 等 OGNL 属性名)。落在其中的标识符不是列,
 // 必须用区间屏蔽:逐字符推断拦不住深层 `#{name,jdbcType=VARCHAR}`,也不拦 `<if test=…>`
@@ -240,9 +243,7 @@ fn extract_xml(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges:
                         // 先剥离占位符 + 动态标签:`SET status = #{status,jdbcType=VARCHAR}`
                         // 清洗后只剩 `status = `,否则 assign_re 会把 `jdbcType =` 也当写入列。
                         let cleaned = SQL_NOISE_SPAN.replace_all(set_clause, " ");
-                        let assign_re =
-                            Regex::new(r"([A-Za-z_]\w*)\s*=").unwrap();
-                        assign_re
+                        SQL_ASSIGN
                             .captures_iter(&cleaned)
                             .filter_map(|capture| {
                                 capture.get(1).map(|m| m.as_str().to_string())

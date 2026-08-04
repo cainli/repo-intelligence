@@ -79,6 +79,7 @@ impl SqliteGraphStore {
             fts_populated: false,
         };
         store.initialize()?;
+        store.reconcile_fts()?;
         store.refresh_fts_populated();
         Ok(store)
     }
@@ -95,6 +96,7 @@ impl SqliteGraphStore {
             fts_populated: false,
         };
         store.initialize()?;
+        store.reconcile_fts()?;
         store.refresh_fts_populated();
         Ok(store)
     }
@@ -113,6 +115,42 @@ impl SqliteGraphStore {
                 |row| row.get(0),
             )
             .unwrap_or(false);
+    }
+
+    /// open 后(fts_enabled 时)校验 entity_fts 与 entity 行数,不一致则全量重建。
+    /// 修两类漂移的正确性 bug(此前搜索会返回错误结果):
+    /// (1) scan 跑过 fts_enabled=false 期间增删了实体但未动 fts —— 重开 fts=true 后
+    ///     新实体对 MATCH 不可见(FTS 漏索引);
+    /// (2) trigram 迁移的 DROP+CREATE+回填非原子,中途崩溃留下空 fts 表(0 vs N)。
+    /// 正常增量扫描两边行数一致 → 直接返回,无重建开销。
+    /// 局限:增删恰好等量(±N)时行数仍相等,极少数陈旧行残留——但 JOIN `e.id IN (fts)`
+    /// 会滤掉已删实体(无误报),且下次 fts_enabled 扫描的 changed-file 增量会覆盖。
+    fn reconcile_fts(&self) -> Result<()> {
+        if !self.fts_enabled {
+            return Ok(());
+        }
+        let entity_count: i64 =
+            self.connection
+                .query_row("SELECT COUNT(*) FROM entity", [], |row| row.get(0))?;
+        let fts_count: i64 = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM entity_fts", [], |row| row.get(0))
+            .unwrap_or(0);
+        if entity_count == fts_count {
+            return Ok(());
+        }
+        let t = std::time::Instant::now();
+        self.connection.execute("DELETE FROM entity_fts", [])?;
+        let n = self.connection.execute(
+            "INSERT INTO entity_fts(entity_id, name, qualified_name) \
+             SELECT id, name, qualified_name FROM entity",
+            [],
+        )?;
+        eprintln!(
+            "[ri-diag] fts reconcile: entity={entity_count} fts={fts_count} mismatch → rebuilt {n} rows in {:.2}s",
+            t.elapsed().as_secs_f64()
+        );
+        Ok(())
     }
 
     pub fn counts(&self) -> Result<(u64, u64)> {
@@ -658,7 +696,18 @@ impl GraphStore for SqliteGraphStore {
                 .chunks_exact(4)
                 .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
-            debug_assert_eq!(vec.len(), dim as usize);
+            // 维度真校验(旧为 debug_assert,release 下静默放行):blob 字节数/4 必须等于
+            // dim 列。损坏/截断的 blob(磁盘满部分写、未来 schema 变更)会产出错维向量,
+            // 让余弦打分算错甚至越界 panic。跳过该行并告警,semantic_search 优雅降级。
+            if vec.len() != dim as usize {
+                eprintln!(
+                    "[ri-diag] embedding dim mismatch for {}: blob={} values, dim={}; skipping",
+                    id,
+                    vec.len(),
+                    dim
+                );
+                continue;
+            }
             out.push((EntityId(id), vec));
         }
         Ok(out)
@@ -710,17 +759,27 @@ impl GraphStore for SqliteGraphStore {
                 .collect();
             // 短语包裹('"word"')避免 FTS5 特殊字符(* : " 等)被当操作符解析;
             // trigram 短语仍做 3-gram 子串匹配,召回与子串 LIKE 等价。
-            let terms = raw_words.iter().map(|w| format!("\"{w}\"")).collect();
+            // 词内 " 需转义为 ""(FTS5 短语内字面引号),否则 `foo"bar` 产出
+            // `"foo"bar"` 是未闭合引号 → MATCH 报错,整个搜索失败。
+            let terms = raw_words
+                .iter()
+                .map(|w| format!("\"{}\"", w.replace('"', "\"\"")))
+                .collect();
             (clauses, terms)
         } else {
-            let terms: Vec<String> = raw_words.iter().map(|w| format!("%{w}%")).collect();
+            // LIKE 通配符 % _ 未转义会让查询过宽(如查 "100%" 匹配含 "100" 的任何串)。
+            // ESCAPE '\' 后 \\% / \\_ 当字面量。
+            let terms: Vec<String> = raw_words
+                .iter()
+                .map(|w| format!("%{}%", w.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")))
+                .collect();
             let clauses = terms
                 .iter()
                 .enumerate()
                 .map(|(i, _)| {
                     let idx = i + 1;
                     format!(
-                        "(lower(e.name) LIKE lower(?{idx}) OR lower(e.qualified_name) LIKE lower(?{idx}))"
+                        "(lower(e.name) LIKE lower(?{idx}) ESCAPE '\\' OR lower(e.qualified_name) LIKE lower(?{idx}) ESCAPE '\\')"
                     )
                 })
                 .collect();
