@@ -1,9 +1,10 @@
 name: release
 
 # 打 v* tag 自动触发,或 Actions 页手动触发(从 main)。
-# 在各平台「原生 runner」上构建 binary(避开交叉编译原生依赖 ort/fastembed/rusqlite);
-# darwin-x64 在 macos-14 上交叉编译(Apple 工具链原生支持,无需稀缺的 Intel runner)。
-# 全部平台成功后才发主包(缺一个平台就阻断——宁可晚发也不发半成品)。
+# 4 个可靠平台(linux-x64/arm64、darwin-arm64、win32-x64)原生构建,全过才发主包;
+# darwin-x64(Intel Mac)单列 best-effort:ort 对 x86_64-apple-darwin 无预编译、不能从
+# arm64 交叉编译,只能用稀缺的 macos-13 原生 runner,队列慢且可能失败——故不阻塞主包,
+# 跑成则额外覆盖 Intel Mac,跑不成其余平台照常发布(optionalDependencies 缺失仅为 warning)。
 on:
   push:
     tags:
@@ -21,27 +22,22 @@ jobs:
       matrix:
         include:
           - platform: darwin-arm64
-            runner: macos-14              # Apple Silicon,原生
+            runner: macos-14
             target: aarch64-apple-darwin
             executable: repo-intelligence
             pkg-dir: packages/npm-platforms/darwin-arm64
-          - platform: darwin-x64
-            runner: macos-14              # 在 arm64 host 上交叉编译 x64,避开稀缺的 macos-13 Intel runner
-            target: x86_64-apple-darwin
-            executable: repo-intelligence
-            pkg-dir: packages/npm-platforms/darwin-x64
           - platform: linux-x64-gnu
-            runner: ubuntu-latest         # x86_64,原生
+            runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             executable: repo-intelligence
             pkg-dir: packages/npm-platforms/linux-x64-gnu
           - platform: linux-arm64-gnu
-            runner: ubuntu-24.04-arm      # arm64(GitHub 免费 arm runner),原生
+            runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             executable: repo-intelligence
             pkg-dir: packages/npm-platforms/linux-arm64-gnu
           - platform: win32-x64
-            runner: windows-latest        # x86_64,原生
+            runner: windows-latest
             target: x86_64-pc-windows-msvc
             executable: repo-intelligence.exe
             pkg-dir: packages/npm-platforms/win32-x64
@@ -61,9 +57,9 @@ jobs:
           workspaces: '.'
           key: ${{ matrix.target }}
 
-      # embedding 模型默认 gitignore,不进仓库。build.rs 在缺模型时会调 bash 拉取,
-      # 但 Windows build.rs 子进程找不到 bash 会失败 → include_bytes! 崩。故在构建前
-      # 统一用 shell:bash 跑 fetch(git-bash 在 Windows 上提供 bash+du+curl)。
+      # embedding 模型 gitignore,不进仓库。build.rs 缺模型时调 bash,但 Windows build.rs
+      # 子进程找不到 bash 会崩 → include_bytes! 失败。故构建前统一 shell:bash 预拉取
+      # (git-bash 在 Windows 提供 bash+du+curl),模型就位后 build.rs 跳过。
       - name: Fetch embedding model
         run: bash crates/embedding/scripts/fetch-model.sh
 
@@ -90,6 +86,53 @@ jobs:
       - name: Publish platform package
         run: npm publish --access public
         working-directory: ${{ matrix.pkg-dir }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # best-effort:Intel Mac。不阻塞主包发布(continue-on-error + publish-main 不依赖它)。
+  build-darwin-x64:
+    name: build (darwin-x64) [best-effort]
+    runs-on: macos-13
+    continue-on-error: true
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '.'
+          key: x86_64-apple-darwin
+
+      - name: Fetch embedding model
+        run: bash crates/embedding/scripts/fetch-model.sh
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Smoke-test binary
+        run: ./target/release/repo-intelligence --version
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Place binary into platform package
+        run: |
+          mkdir -p packages/npm-platforms/darwin-x64/bin
+          cp target/release/repo-intelligence packages/npm-platforms/darwin-x64/bin/repo-intelligence
+
+      - name: Verify package contents
+        run: npm pack --dry-run
+        working-directory: packages/npm-platforms/darwin-x64
+
+      - name: Publish platform package
+        run: npm publish --access public
+        working-directory: packages/npm-platforms/darwin-x64
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
