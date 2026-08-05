@@ -1,8 +1,9 @@
 name: release
 
-# 打 v* tag 自动触发,或 Actions 页手动触发(从某 tag 的 ref 上跑)。
-# 在各平台「原生 runner」上构建 binary(避免交叉编译原生依赖 ort/fastembed/rusqlite),
-# 发对应平台包;全部平台成功后才发主包(缺一个平台就阻断——宁可晚发也不发半成品)。
+# 打 v* tag 自动触发,或 Actions 页手动触发(从 main)。
+# 在各平台「原生 runner」上构建 binary(避开交叉编译原生依赖 ort/fastembed/rusqlite);
+# darwin-x64 在 macos-14 上交叉编译(Apple 工具链原生支持,无需稀缺的 Intel runner)。
+# 全部平台成功后才发主包(缺一个平台就阻断——宁可晚发也不发半成品)。
 on:
   push:
     tags:
@@ -20,23 +21,28 @@ jobs:
       matrix:
         include:
           - platform: darwin-arm64
-            runner: macos-14              # Apple Silicon
+            runner: macos-14              # Apple Silicon,原生
+            target: aarch64-apple-darwin
             executable: repo-intelligence
             pkg-dir: packages/npm-platforms/darwin-arm64
           - platform: darwin-x64
-            runner: macos-13              # Intel
+            runner: macos-14              # 在 arm64 host 上交叉编译 x64,避开稀缺的 macos-13 Intel runner
+            target: x86_64-apple-darwin
             executable: repo-intelligence
             pkg-dir: packages/npm-platforms/darwin-x64
           - platform: linux-x64-gnu
-            runner: ubuntu-latest         # x86_64
+            runner: ubuntu-latest         # x86_64,原生
+            target: x86_64-unknown-linux-gnu
             executable: repo-intelligence
             pkg-dir: packages/npm-platforms/linux-x64-gnu
           - platform: linux-arm64-gnu
-            runner: ubuntu-24.04-arm      # arm64(GitHub 免费 arm runner)
+            runner: ubuntu-24.04-arm      # arm64(GitHub 免费 arm runner),原生
+            target: aarch64-unknown-linux-gnu
             executable: repo-intelligence
             pkg-dir: packages/npm-platforms/linux-arm64-gnu
           - platform: win32-x64
-            runner: windows-latest
+            runner: windows-latest        # x86_64,原生
+            target: x86_64-pc-windows-msvc
             executable: repo-intelligence.exe
             pkg-dir: packages/npm-platforms/win32-x64
     runs-on: ${{ matrix.runner }}
@@ -47,16 +53,25 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: '.'
+          key: ${{ matrix.target }}
+
+      # embedding 模型默认 gitignore,不进仓库。build.rs 在缺模型时会调 bash 拉取,
+      # 但 Windows build.rs 子进程找不到 bash 会失败 → include_bytes! 崩。故在构建前
+      # 统一用 shell:bash 跑 fetch(git-bash 在 Windows 上提供 bash+du+curl)。
+      - name: Fetch embedding model
+        run: bash crates/embedding/scripts/fetch-model.sh
 
       - name: Build release binary
-        run: cargo build --release --locked
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Smoke-test binary
-        run: ./target/release/${{ matrix.executable }} --version
+        run: ./target/${{ matrix.target }}/release/${{ matrix.executable }} --version
 
       - uses: actions/setup-node@v4
         with:
@@ -66,7 +81,7 @@ jobs:
       - name: Place binary into platform package
         run: |
           mkdir -p ${{ matrix.pkg-dir }}/bin
-          cp target/release/${{ matrix.executable }} ${{ matrix.pkg-dir }}/bin/${{ matrix.executable }}
+          cp target/${{ matrix.target }}/release/${{ matrix.executable }} ${{ matrix.pkg-dir }}/bin/${{ matrix.executable }}
 
       - name: Verify package contents
         run: npm pack --dry-run
@@ -93,6 +108,7 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
+      # 主包只发 Node shim(bin/cli.js + lib),不含 binary,无需模型或编译。
       - name: Verify package contents
         run: npm pack --dry-run
         working-directory: packages/npm
