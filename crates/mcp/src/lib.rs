@@ -159,6 +159,26 @@ fn tool_specs() -> Vec<ToolSpec> {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Restrict matches to these entity kinds, e.g. [\"class\",\"method\"] or [\"spring_bean\"]. Default: any kind. Use to filter out field/column noise when a wide identifier (an enterprise ID that names many fields of a Req/Resp class) otherwise matches dozens of low-value entities."
+            },
+            "min_complexity": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Drop methods whose cyclomatic complexity < this. Non-method entities (no complexity metadata) are dropped too. Pairs with sort_by to find hot methods within a name match."
+            },
+            "min_transitive_loop_depth": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Drop methods whose transitive_loop_depth (worst-case loop nesting along the call chain) < this. Surfaces methods that look harmless locally but reach deep loops transitively."
+            },
+            "min_loop_depth": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Drop methods whose own loop_depth < this."
+            },
+            "sort_by": {
+                "type": "string",
+                "enum": ["complexity", "transitive_loop_depth", "loop_depth"],
+                "description": "Re-rank the matched window by this complexity metric (descending), overriding the default relevance order. Use to surface the hottest method among name matches."
             }
         },
         "required": ["query"]
@@ -316,6 +336,59 @@ fn tool_specs() -> Vec<ToolSpec> {
                     "count": {"type": "integer", "minimum": 0},
                     "query": {"type": "string"},
                     "hint": {"type": "string"}
+                },
+                "required": ["items", "count"]
+            }),
+        },
+        ToolSpec {
+            name: "find_hotspots",
+            description: "Find methods with the highest complexity / loop nesting (codebase-memory Q4 equivalent). Default metric transitive_loop_depth = worst-case loop nesting along the call chain; surfaces methods that look harmless locally but reach deep loops transitively (cross-function O(n²) detector). metric=complexity for cyclomatic, loop_depth for own nesting, linear_scan_in_loop for in-loop contains/indexOf scans.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "metric": {
+                        "type": "string",
+                        "enum": ["transitive_loop_depth", "complexity", "loop_depth", "linear_scan_in_loop"],
+                        "default": "transitive_loop_depth",
+                        "description": "Which complexity metric to rank by."
+                    },
+                    "min_value": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Optional lower bound; methods scoring below are filtered out."
+                    },
+                    "limit": {"type": "integer", "minimum": 1, "default": 10, "description": "Max methods to return (top-k)."}
+                }
+            }),
+            output_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "items": {"type": "array", "description": "Top-k methods, each {entity, score}; entity includes metadata with all complexity fields."},
+                    "count": {"type": "integer", "minimum": 0},
+                    "metric": {"type": "string"}
+                },
+                "required": ["items", "count"]
+            }),
+        },
+        ToolSpec {
+            name: "get_clusters",
+            description: "Architecture clusters (label-propagation communities over calls/injects/declares/superclass_of/implements) — codebase-memory Leiden equivalent. Reveals de-facto modules that often cut across the folder layout. No cluster_id: list clusters by size with representative entities. With cluster_id: list that cluster's members.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "cluster_id": {"type": "integer", "minimum": 0, "description": "Optional: return members of this cluster. Omit to list all clusters by size."},
+                    "limit": {"type": "integer", "minimum": 1, "default": 20, "description": "Max clusters (or members) to return."}
+                }
+            }),
+            output_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "items": {"type": "array", "description": "When no cluster_id: clusters {cluster_id, count, representatives}. When cluster_id given: members {qualified_name, kind, name}."},
+                    "count": {"type": "integer", "minimum": 0}
                 },
                 "required": ["items", "count"]
             }),
@@ -850,6 +923,19 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
             let limit = parse_limit(arguments);
             semantic_search(&store, query, limit)?
         }
+        "find_hotspots" => {
+            let store = SqliteGraphStore::open(&path)?;
+            let metric = arguments["metric"].as_str().unwrap_or("transitive_loop_depth");
+            let min_value = arguments["min_value"].as_u64().map(|v| v as u32);
+            let limit = parse_limit(arguments).clamp(1, MAX_PAGE_LIMIT);
+            find_hotspots(&store, metric, min_value, limit)?
+        }
+        "get_clusters" => {
+            let store = SqliteGraphStore::open(&path)?;
+            let cluster_id = arguments["cluster_id"].as_u64();
+            let limit = parse_limit(arguments).clamp(1, MAX_PAGE_LIMIT);
+            get_clusters(&store, cluster_id, limit)?
+        }
         "analyze_requirement" => {
             let store = SqliteGraphStore::open(&path)?;
             let mut result = run_search(&store, arguments, None)?;
@@ -1103,6 +1189,37 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
     }))
 }
 
+/// 复杂度维度过滤/排序参数(对标 codebase-memory 的属性组合查询)。
+/// None = 不过滤;sort_by=None 保持原 relevance 排序。
+#[derive(Default, Clone)]
+struct ComplexityFilter {
+    min_complexity: Option<u32>,
+    min_transitive_loop_depth: Option<u32>,
+    min_loop_depth: Option<u32>,
+    /// "complexity" / "transitive_loop_depth" / "loop_depth";非法值当 None(不排序)。
+    sort_by: Option<String>,
+}
+
+impl ComplexityFilter {
+    fn any(&self) -> bool {
+        self.min_complexity.is_some()
+            || self.min_transitive_loop_depth.is_some()
+            || self.min_loop_depth.is_some()
+            || self.sort_by.is_some()
+    }
+}
+
+fn metadata_u32(entity: &repo_intelligence_model::Entity, key: &str) -> Option<u32> {
+    entity.metadata.get(key).and_then(|v| v.as_u64()).map(|v| v as u32)
+}
+
+fn passes_min(entity: &repo_intelligence_model::Entity, key: &str, min: Option<u32>) -> bool {
+    match min {
+        None => true,
+        Some(m) => metadata_u32(entity, key).is_some_and(|v| v >= m),
+    }
+}
+
 fn parse_limit(arguments: &Value) -> usize {
     arguments["limit"]
         .as_u64()
@@ -1129,18 +1246,38 @@ fn search_with_filter(
     limit: usize,
     offset: usize,
     filter: Option<&[EntityKind]>,
+    cx: &ComplexityFilter,
 ) -> Result<(Vec<repo_intelligence_model::Entity>, usize, bool)> {
-    let peek = limit.saturating_add(1);
+    // 复杂度过滤/排序时放大候选窗口:FTS 按 relevance 排序会把高复杂度方法截断在
+    // peek 窗口外(它文本相关性可能靠后)。放大到 min(1000, limit*10) 保证筛排样本充足。
+    let window = if cx.any() {
+        (limit.max(50) * 10).min(1000)
+    } else {
+        limit.saturating_add(1)
+    };
     let matches = store.search(
         SearchQuery::new(query)
-            .with_limit(peek)
+            .with_limit(window)
             .with_offset(offset),
     )?;
     let mut entities: Vec<_> = matches
         .into_iter()
         .map(|matched| matched.entity)
         .filter(|entity| filter.is_none_or(|kinds| kinds.contains(&entity.kind)))
+        .filter(|e| passes_min(e, "complexity", cx.min_complexity))
+        .filter(|e| passes_min(e, "transitive_loop_depth", cx.min_transitive_loop_depth))
+        .filter(|e| passes_min(e, "loop_depth", cx.min_loop_depth))
         .collect();
+    // sort_by 覆盖原 relevance 排序(用户明确要按复杂度排);非法值忽略保持原序。
+    if let Some(metric) = &cx.sort_by
+        && matches!(metric.as_str(), "complexity" | "transitive_loop_depth" | "loop_depth")
+    {
+        entities.sort_by(|a, b| {
+            metadata_u32(b, metric)
+                .unwrap_or(0)
+                .cmp(&metadata_u32(a, metric).unwrap_or(0))
+        });
+    }
     let has_more = entities.len() > limit;
     if has_more {
         entities.truncate(limit);
@@ -1229,8 +1366,20 @@ fn run_search(
     // 外部硬编码 filter(find_endpoint 的 endpoint kinds)优先;否则读调用方传入的 `kind`,
     // 让 search_entities 能按 kind 过滤,切掉宽标识符(如企业交易码)命中的 field/column 噪声。
     let parsed_kinds = parse_entity_kinds(arguments)?;
-    let (entities, count, has_more) =
-        search_with_filter(store, query, limit, offset, filter.or(parsed_kinds.as_deref()))?;
+    let cx = ComplexityFilter {
+        min_complexity: arguments["min_complexity"].as_u64().map(|v| v as u32),
+        min_transitive_loop_depth: arguments["min_transitive_loop_depth"].as_u64().map(|v| v as u32),
+        min_loop_depth: arguments["min_loop_depth"].as_u64().map(|v| v as u32),
+        sort_by: arguments["sort_by"].as_str().map(|s| s.to_string()),
+    };
+    let (entities, count, has_more) = search_with_filter(
+        store,
+        query,
+        limit,
+        offset,
+        filter.or(parsed_kinds.as_deref()),
+        &cx,
+    )?;
     let items: Vec<Value> = entities
         .iter()
         .map(|entity| entity_to_json(entity, verbose))
@@ -1284,6 +1433,83 @@ fn entity_to_json(entity: &repo_intelligence_model::Entity, verbose: bool) -> Va
             "evidence_count": entity.evidence.len(),
         })
     }
+}
+
+/// 按复杂度指标找热点方法(对标 codebase-memory Q4:揪出高 transitive_loop_depth 的方法)。
+/// metric 默认 transitive_loop_depth(调用链最坏嵌套度,跨函数 O(n²) 探测器)。
+/// 全图 method 内存排序;万级实体毫秒内完成,后续可下推 SQL(json_extract ORDER BY)优化。
+fn find_hotspots(
+    store: &SqliteGraphStore,
+    metric: &str,
+    min_value: Option<u32>,
+    limit: usize,
+) -> Result<Value> {
+    let entities = store.all_entities()?;
+    let mut items: Vec<(Entity, u64)> = entities
+        .iter()
+        .filter(|e| e.kind == EntityKind::Method)
+        .filter_map(|e| {
+            let v = e.metadata.get(metric)?.as_u64()?;
+            if let Some(m) = min_value
+                && v < m as u64
+            {
+                return None;
+            }
+            Some((e.clone(), v))
+        })
+        .collect();
+    items.sort_by(|a, b| b.1.cmp(&a.1));
+    let count = items.len() as u64;
+    let top: Vec<Value> = items
+        .into_iter()
+        .take(limit)
+        .map(|(e, v)| {
+            json!({
+                "entity": entity_to_json(&e, true),
+                "score": v,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "items": top,
+        "count": count,
+        "metric": metric,
+        "min_value": min_value,
+    }))
+}
+
+/// 架构聚类查询(对标 codebase-memory get_clusters)。cluster_id=None 返回 cluster 列表
+/// (按规模降序,带代表节点);cluster_id=Some 返回该 cluster 的成员列表。
+fn get_clusters(store: &SqliteGraphStore, cluster_id: Option<u64>, limit: usize) -> Result<Value> {
+    let entities = store.all_entities()?;
+    if let Some(cid) = cluster_id {
+        let members: Vec<Value> = entities
+            .iter()
+            .filter(|e| metadata_u32(e, "cluster_id") == Some(cid as u32))
+            .take(limit)
+            .map(|e| {
+                json!({"qualified_name": e.qualified_name, "kind": e.kind.as_str(), "name": e.name})
+            })
+            .collect();
+        return Ok(json!({"cluster_id": cid, "members": members, "count": members.len()}));
+    }
+    let mut groups: HashMap<u64, Vec<&Entity>> = HashMap::new();
+    for e in &entities {
+        if let Some(c) = metadata_u32(e, "cluster_id") {
+            groups.entry(c as u64).or_default().push(e);
+        }
+    }
+    let mut list: Vec<(u64, Vec<&Entity>)> = groups.into_iter().collect();
+    list.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    let items: Vec<Value> = list
+        .into_iter()
+        .take(limit)
+        .map(|(cid, members)| {
+            let reps: Vec<&str> = members.iter().take(3).map(|m| m.name.as_str()).collect();
+            json!({"cluster_id": cid, "count": members.len(), "representatives": reps})
+        })
+        .collect();
+    Ok(json!({"items": items, "count": items.len()}))
 }
 
 fn parse_depth(arguments: &Value, default: usize) -> usize {

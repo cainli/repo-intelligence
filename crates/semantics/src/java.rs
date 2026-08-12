@@ -1617,6 +1617,84 @@ fn classify_receiver(source: &[u8], inv_node: Node<'_>) -> (&'static str, Option
     }
 }
 
+/// 单函数复杂度统计(对标 codebase-memory Method 节点的复杂度属性)。
+/// 全部从方法体 AST 静态计算,单遍递归,无副作用。
+#[derive(Default, Debug, Clone)]
+struct ComplexityStats {
+    /// 圈复杂度(cyclomatic):决策点数,基线 1。if/for/while/do/switch/catch/ternary/&&/|| 各 +1。
+    complexity: u32,
+    /// 循环语句总数(for / enhanced-for / while / do)。
+    loop_count: u32,
+    /// 方法体内最深的循环嵌套层数(自身循环 = 1 层)。
+    loop_depth: u32,
+    /// 循环内的线性扫描调用数(contains/indexOf/find/containsKey 等,潜在 O(n²))。
+    linear_scan_in_loop: u32,
+}
+
+impl ComplexityStats {
+    /// 从方法体 block 节点统计。无方法体时调用方应改用 `Default`(complexity=0)。
+    fn for_body(body: Node<'_>, source: &[u8]) -> Self {
+        let mut stats = Self {
+            complexity: 1,
+            ..Default::default()
+        };
+        walk_complexity(body, source, &mut stats, 0);
+        stats
+    }
+}
+
+/// 递归统计方法体子树。`loop_nesting` = 当前所处循环嵌套深度(0 = 不在循环内)。
+fn walk_complexity(node: Node<'_>, source: &[u8], stats: &mut ComplexityStats, loop_nesting: u32) {
+    let kind = node.kind();
+    let mut child_loop_nesting = loop_nesting;
+    match kind {
+        "if_statement" | "for_statement" | "enhanced_for_statement" | "while_statement"
+        | "do_statement" | "switch_expression" | "switch_statement" | "catch_clause"
+        | "ternary_expression" => stats.complexity += 1,
+        // && / ||:tree-sitter-java 的 binary_expression,文本含操作符即一个布尔决策点。
+        "binary_expression" => {
+            let text = node_text(source, node);
+            if text.contains("&&") || text.contains("||") {
+                stats.complexity += 1;
+            }
+        }
+        _ => {}
+    }
+    if matches!(
+        kind,
+        "for_statement" | "enhanced_for_statement" | "while_statement" | "do_statement"
+    ) {
+        stats.loop_count += 1;
+        child_loop_nesting = loop_nesting + 1;
+        if child_loop_nesting > stats.loop_depth {
+            stats.loop_depth = child_loop_nesting;
+        }
+    }
+    // 循环内的线性扫描调用(集合/串查找,循环内即潜在 O(n²))。
+    if loop_nesting > 0
+        && kind == "method_invocation"
+        && let Some(name_node) = node.child_by_field_name("name")
+    {
+        let callee = node_text(source, name_node);
+        if is_linear_scan(&callee) {
+            stats.linear_scan_in_loop += 1;
+        }
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            walk_complexity(child, source, stats, child_loop_nesting);
+        }
+    }
+}
+
+/// 集合/串线性扫描方法名。循环内出现即潜在 O(n²);equals 不含(常量比较居多)。
+fn is_linear_scan(name: &str) -> bool {
+    matches!(
+        name,
+        "contains" | "indexOf" | "lastIndexOf" | "find" | "containsKey" | "containsValue"
+    )
+}
+
 /// caller/callee 按方法名同文件匹配(低保真:跨类同名混淆、跨文件调用留后续)。
 #[allow(clippy::too_many_arguments)]
 fn visit_methods(
@@ -1651,6 +1729,12 @@ fn visit_methods(
                     .count()
             })
             .unwrap_or(0);
+        // 单函数复杂度(对标 codebase-memory Method 属性):从方法体 AST 静态计算。
+        // abstract/interface/native 无 body → complexity=0,标记"无可分析体",不参与热点排序。
+        let complexity = node
+            .child_by_field_name("body")
+            .map(|body| ComplexityStats::for_body(body, source))
+            .unwrap_or_default();
         let entity = Entity::new(
             EntityId::stable("workspace", path, EntityKind::Method, &name, &format!("arity:{arity}")),
             EntityKind::Method,
@@ -1658,7 +1742,14 @@ fn visit_methods(
             format!("{path}#{name}"),
         )
         .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "Java method declaration")
-        .with_metadata(json!({ "body_end_line": body_end_line, "arity": arity }));
+        .with_metadata(json!({
+            "body_end_line": body_end_line,
+            "arity": arity,
+            "complexity": complexity.complexity,
+            "loop_count": complexity.loop_count,
+            "loop_depth": complexity.loop_depth,
+            "linear_scan_in_loop": complexity.linear_scan_in_loop,
+        }));
         let id = entity.id.clone();
         add_contained(file, path, entity, line, entities, edges);
         methods.entry(name.clone()).or_default().push(id.clone());

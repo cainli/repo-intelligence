@@ -8,7 +8,7 @@ use repo_intelligence_config::IndexerConfig;
 use repo_intelligence_analysis::{ImpactAnalyzer, ScanPhase, ScanProgress, WorkspaceIndexer};
 use repo_intelligence_graph::{GraphStore, SqliteGraphStore};
 use repo_intelligence_mcp::build_relay;
-use repo_intelligence_model::{ChangeRequest, EntityId, SearchQuery};
+use repo_intelligence_model::{ChangeRequest, Entity, EntityId, EntityKind, SearchQuery};
 use repo_intelligence_protocol::Envelope;
 
 #[derive(Parser)]
@@ -90,6 +90,18 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         limit: usize,
         #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
+    /// 找复杂度热点(对标 codebase-memory Q4):按 metric 排序的 top-N 方法。
+    /// metric 默认 transitive_loop_depth(调用链最坏嵌套度,跨函数 O(n²) 探测器)。
+    Hotspots {
+        /// 排序指标:transitive_loop_depth(默认)/ complexity / loop_depth / linear_scan_in_loop。
+        metric: Option<String>,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long)]
+        min_value: Option<u64>,
+        #[arg(long, value_enum, default_value = "json")]
         format: OutputFormat,
     },
     Mcp,
@@ -182,6 +194,17 @@ fn run() -> Result<()> {
             let matches = store.search(SearchQuery::new(query).with_limit(limit))?;
             let entities: Vec<_> = matches.into_iter().map(|matched| matched.entity).collect();
             emit(format, entities)
+        }
+        Command::Hotspots {
+            metric,
+            limit,
+            min_value,
+            format,
+        } => {
+            let store = SqliteGraphStore::open(&cli.database)?;
+            let metric = metric.as_deref().unwrap_or("transitive_loop_depth");
+            let hits = hotspots_items(&store, metric, min_value, limit)?;
+            emit(format, hits)
         }
         Command::Impact { request, format } => {
             let change: ChangeRequest = serde_json::from_slice(
@@ -341,4 +364,59 @@ fn semantic_search_items(
         }
     }
     Ok(hits)
+}
+
+#[derive(serde::Serialize)]
+struct HotspotHit {
+    qualified_name: String,
+    name: String,
+    metric: String,
+    score: u64,
+    complexity: u64,
+    loop_depth: u64,
+    transitive_loop_depth: u64,
+    linear_scan_in_loop: u64,
+}
+
+/// 找复杂度热点(对标 codebase-memory Q4):全图 method 按 metric 降序取 top-N。
+/// 复刻 mcp find_hotspots 的核心;cli 一次性进程,直接 all_entities 内存排序。
+fn hotspots_items(
+    store: &SqliteGraphStore,
+    metric: &str,
+    min_value: Option<u64>,
+    limit: usize,
+) -> Result<Vec<HotspotHit>> {
+    let entities = store.all_entities()?;
+    let pick = |e: &Entity, key: &str| e.metadata.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+    let mut items: Vec<(Entity, u64)> = entities
+        .iter()
+        .filter(|e| e.kind == EntityKind::Method)
+        .filter_map(|e| {
+            let v = pick(e, metric);
+            if v == 0 {
+                return None;
+            }
+            if let Some(m) = min_value
+                && v < m
+            {
+                return None;
+            }
+            Some((e.clone(), v))
+        })
+        .collect();
+    items.sort_by(|a, b| b.1.cmp(&a.1));
+    Ok(items
+        .into_iter()
+        .take(limit)
+        .map(|(e, v)| HotspotHit {
+            qualified_name: e.qualified_name.clone(),
+            name: e.name.clone(),
+            metric: metric.to_string(),
+            score: v,
+            complexity: pick(&e, "complexity"),
+            loop_depth: pick(&e, "loop_depth"),
+            transitive_loop_depth: pick(&e, "transitive_loop_depth"),
+            linear_scan_in_loop: pick(&e, "linear_scan_in_loop"),
+        })
+        .collect())
 }

@@ -279,6 +279,15 @@ impl WorkspaceIndexer {
         let t_resolve = t.elapsed();
         let n_resolved = resolution.patch.add_edges.len();
         summary.edges_indexed += n_resolved;
+        // 克隆跨文件结构边(resolved=1)供 transitive_loop_depth 传播 + 架构聚类用;
+        // replace_resolved_edges 会 move 原始 Vec,后续分析需独立持有副本。
+        let resolved_structural: Vec<Edge> = resolution
+            .patch
+            .add_edges
+            .iter()
+            .filter(|e| matches!(e.kind, EdgeKind::Calls | EdgeKind::Injects | EdgeKind::Declares | EdgeKind::SuperclassOf | EdgeKind::Implements))
+            .cloned()
+            .collect();
         let t = std::time::Instant::now();
         store.replace_resolved_edges(resolution.patch.add_edges)?;
         // A+ 歧义写回:被跳过的跨文件解析记录到请求方实体的 metadata.ambiguous_resolution
@@ -326,6 +335,76 @@ impl WorkspaceIndexer {
             all_entities.len(),
             n_resolved,
             t_resolve.as_secs_f64(),
+            t.elapsed().as_secs_f64()
+        );
+
+        // transitive_loop_depth 沿 CALLS 传播(对标 codebase-memory):把单函数 loop_depth
+        // 升级为调用链最坏嵌套度,跨函数发现 O(n²) 热点。resolved=0(同文件)+ resolved=1
+        // (跨文件/桥接)的 calls 边都参与。复用 clone-as-map metadata 回填模式。
+        let t = Instant::now();
+        let all_calls: Vec<&Edge> = extract_edges
+            .iter()
+            .chain(resolved_structural.iter())
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect();
+        let tld = compute_transitive_loop_depth(&all_entities, &all_calls);
+        let mut tld_updated: Vec<Entity> = Vec::new();
+        for entity in &all_entities {
+            if entity.kind != EntityKind::Method {
+                continue;
+            }
+            let Some(&depth) = tld.get(&entity.id) else { continue };
+            let mut entity = entity.clone();
+            let mut meta = match entity.metadata.clone() {
+                serde_json::Value::Object(map) => map,
+                _ => serde_json::Map::new(),
+            };
+            meta.insert("transitive_loop_depth".into(), json!(depth));
+            entity.metadata = serde_json::Value::Object(meta);
+            tld_updated.push(entity);
+        }
+        let n_tld = tld_updated.len();
+        if !tld_updated.is_empty() {
+            store.apply_patch(GraphPatch::add(tld_updated, Vec::new()))?;
+        }
+        eprintln!(
+            "[ri-diag] transitive_loop_depth: {} methods, {} calls, in {:.2}s",
+            n_tld,
+            all_calls.len(),
+            t.elapsed().as_secs_f64()
+        );
+
+        // 架构聚类(label propagation):在代码结构依赖图(calls/injects/declares/
+        // superclass_of/implements)上识别"事实模块"(对标 codebase-memory Leiden)。
+        // 同文件 + 跨文件结构边都参与。cluster_id 写回 metadata 供 get_clusters 消费。
+        let t = Instant::now();
+        let structural: Vec<&Edge> = extract_edges
+            .iter()
+            .chain(resolved_structural.iter())
+            .filter(|e| matches!(e.kind, EdgeKind::Calls | EdgeKind::Injects | EdgeKind::Declares | EdgeKind::SuperclassOf | EdgeKind::Implements))
+            .collect();
+        let clusters = compute_clusters(&structural);
+        let n_clusters_distinct = clusters.values().collect::<std::collections::HashSet<_>>().len();
+        let mut cluster_updated: Vec<Entity> = Vec::new();
+        for entity in &all_entities {
+            let Some(&cid) = clusters.get(&entity.id) else { continue };
+            let mut entity = entity.clone();
+            let mut meta = match entity.metadata.clone() {
+                serde_json::Value::Object(map) => map,
+                _ => serde_json::Map::new(),
+            };
+            meta.insert("cluster_id".into(), json!(cid));
+            entity.metadata = serde_json::Value::Object(meta);
+            cluster_updated.push(entity);
+        }
+        let n_cluster_assigned = cluster_updated.len();
+        if !cluster_updated.is_empty() {
+            store.apply_patch(GraphPatch::add(cluster_updated, Vec::new()))?;
+        }
+        eprintln!(
+            "[ri-diag] clusters: {} entities → {} clusters, in {:.2}s",
+            n_cluster_assigned,
+            n_clusters_distinct,
             t.elapsed().as_secs_f64()
         );
 
@@ -396,6 +475,122 @@ impl WorkspaceIndexer {
         });
         Ok(summary)
     }
+}
+
+/// 沿 CALLS 边传播 transitive_loop_depth(调用链最坏循环嵌套度),对标 codebase-memory。
+/// `tld(node) = own_loop_depth + max(tld(callee))`;固定点迭代到收敛,上限 32 轮防止
+/// 互递归环无限累加(环上节点过估,反映递归风险,对热点发现可接受)。
+fn compute_transitive_loop_depth<'a>(
+    entities: &'a [Entity],
+    calls_edges: &[&Edge],
+) -> HashMap<&'a EntityId, u32> {
+    let own: HashMap<&EntityId, u32> =
+        entities.iter().map(|e| (&e.id, own_loop_depth(e))).collect();
+    // 邻接:caller -> [callee],只保留两端都在 own 里的边(防悬空)。
+    let mut out: HashMap<&EntityId, Vec<&EntityId>> = HashMap::new();
+    for &e in calls_edges {
+        if e.kind == EdgeKind::Calls
+            && own.contains_key(&e.source)
+            && own.contains_key(&e.target)
+        {
+            out.entry(&e.source).or_default().push(&e.target);
+        }
+    }
+    let mut tld: HashMap<&EntityId, u32> = own.clone();
+    for _ in 0..32 {
+        let mut changed = false;
+        let next: Vec<(&EntityId, u32)> = tld
+            .keys()
+            .map(|&node| {
+                let o = own[node];
+                let max_callee = out
+                    .get(node)
+                    .map(|cs| cs.iter().filter_map(|c| tld.get(c).copied()).max().unwrap_or(0))
+                    .unwrap_or(0);
+                let prev = *tld.get(node).unwrap_or(&0);
+                (node, o.saturating_add(max_callee).max(prev))
+            })
+            .collect();
+        for (k, v) in &next {
+            if tld.get(k).copied().unwrap_or(0) != *v {
+                changed = true;
+                break;
+            }
+        }
+        for (k, v) in next {
+            tld.insert(k, v);
+        }
+        if !changed {
+            break;
+        }
+    }
+    tld
+}
+
+/// 实体的自身循环嵌套深度(从 metadata.loop_depth 读;非方法或缺失 = 0)。
+fn own_loop_depth(e: &Entity) -> u32 {
+    if e.kind != EntityKind::Method {
+        return 0;
+    }
+    e.metadata
+        .get("loop_depth")
+        .and_then(|v| v.as_u64())
+        .map(|v| v.min(u32::MAX as u64) as u32)
+        .unwrap_or(0)
+}
+
+/// 在代码结构依赖图(calls/injects/declares/superclass_of/implements)上跑 label
+/// propagation 社区发现,识别跨文件夹的"事实模块"(对标 codebase-memory 的 Leiden,
+/// 用更简单的 LPA 近似)。确定性同步迭代:每轮基于上一轮标签计数,tie-break 取最小
+/// label;固定 20 轮兜底震荡。返回规整化后的连续 cluster 序号(0..K)。
+fn compute_clusters(edges: &[&Edge]) -> HashMap<EntityId, u64> {
+    use EdgeKind::*;
+    let selected = [Calls, Injects, Declares, SuperclassOf, Implements];
+    let mut nodes: HashSet<EntityId> = HashSet::new();
+    let mut adj: HashMap<EntityId, Vec<EntityId>> = HashMap::new();
+    for &e in edges {
+        if selected.contains(&e.kind) {
+            nodes.insert(e.source.clone());
+            nodes.insert(e.target.clone());
+            adj.entry(e.source.clone()).or_default().push(e.target.clone());
+            adj.entry(e.target.clone()).or_default().push(e.source.clone());
+        }
+    }
+    // 确定序:按 EntityId 字符串排序,初始 label = 序号。
+    let mut order: Vec<EntityId> = nodes.iter().cloned().collect();
+    order.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut label: HashMap<EntityId, u64> = HashMap::new();
+    for (i, id) in order.iter().enumerate() {
+        label.insert(id.clone(), i as u64);
+    }
+    for _ in 0..20 {
+        let prev = label.clone();
+        for node in &order {
+            let mut counts: HashMap<u64, usize> = HashMap::new();
+            *counts.entry(prev[node]).or_default() += 1; // 含自己
+            if let Some(ns) = adj.get(node) {
+                for n in ns {
+                    *counts.entry(prev[n]).or_default() += 1;
+                }
+            }
+            // 最高频;tie-break:count 降序,同 count 取 label 升序(min,确定)。
+            if let Some((best, _)) = counts
+                .into_iter()
+                .max_by(|(l1, c1), (l2, c2)| c1.cmp(c2).then(l2.cmp(l1)))
+            {
+                label.insert(node.clone(), best);
+            }
+        }
+        if label == prev {
+            break;
+        }
+    }
+    // 规整化:原始 label → 连续 cluster 序号(0..K),便于 get_clusters 输出。
+    let mut ids: Vec<u64> = label.values().copied().collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let remap: HashMap<u64, u64> = ids.into_iter().enumerate().map(|(i, v)| (v, i as u64)).collect();
+    label.into_iter().map(|(k, v)| (k, remap[&v])).collect()
 }
 
 fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution {
