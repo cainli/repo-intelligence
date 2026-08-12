@@ -35,11 +35,12 @@ sqlite3 "$DB" "SELECT json_extract(json,'\$.evidence[0].confidence'), COUNT(*) F
 - **body_end_line**:`SELECT json_extract(json,'\$.metadata.body_end_line') FROM entity WHERE kind='method' AND qualified_name LIKE '%#%' LIMIT 5`。
 - **节点复杂度属性(v0.1.34)**:`SELECT name, json_extract(json,'\$.metadata.complexity') cx, json_extract(json,'\$.metadata.loop_depth') ld, json_extract(json,'\$.metadata.transitive_loop_depth') tld FROM entity WHERE kind='method' ORDER BY json_extract(json,'\$.metadata.complexity') DESC LIMIT 10;` —— complexity(cyclomatic)/loop_count/loop_depth(单函数)+ transitive_loop_depth(沿 CALLS 固定点传播,跨函数 O(n²) 探测器)。对标 codebase-memory Q4 热点;tld > own loop_depth 的方法是"局部无害但调用链深"的 cb 杀手锏信号。
 - **架构聚类(v0.1.34)**:`SELECT json_extract(json,'\$.metadata.cluster_id') cid, COUNT(*) n FROM entity WHERE json_extract(json,'\$.metadata.cluster_id') IS NOT NULL GROUP BY cid ORDER BY n DESC LIMIT 10;` —— label propagation 在 calls/injects/declares/superclass_of/implements 图上跑(对标 cb Leiden),识别跨文件夹的"事实模块"。大 cluster 应对应 module(ruoyi 验证:cluster 2=ruoyi-demo、cluster 4=ruoyi-workflow 全内聚)。
+- **异常流边(v0.1.35)**:`SELECT kind, COUNT(*) FROM edge WHERE kind IN ('throws','handles') GROUP BY kind;` —— method throws/catch 解析到 class/interface 实体;`SELECT COUNT(*) FROM entity WHERE json_extract(json,'\$.metadata.exception_flow') IS NOT NULL;` 看提取覆盖。**注意**:catch JDK 异常(Exception/IllegalStateException)的项目 throws/handles 边为 0(异常类型非项目 class),需项目自定义异常链(mes/mos 金融项目)才能端到端验证连通;提取层(metadata.exception_flow 覆盖)仍可查。
 
 ## 构建 / 测试
 
 - `cargo test` —— 全 workspace 单元/集成测试(**不替代**上面的真实项目验证)。
-- 版本号:根 `Cargo.toml` `[workspace.package] version`(当前 0.1.34),所有 crate `version.workspace = true`。
+- 版本号:根 `Cargo.toml` `[workspace.package] version`(当前 0.1.35),所有 crate `version.workspace = true`。
 - 提交风格:`release vX.Y.Z: ...`(见 git log)。
 
 ## 项目结构

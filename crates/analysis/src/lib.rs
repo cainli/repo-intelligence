@@ -408,6 +408,62 @@ impl WorkspaceIndexer {
             t.elapsed().as_secs_f64()
         );
 
+        // 异常流解析(对标 codebase-memory THROWS/HANDLES):method.metadata.exception_flow
+        // 的 type name → class/interface 实体,建 throws/handles 边。同名唯一命中建边,
+        // 歧义(多个同名类)跳过——同 calls A+ 策略,保证"出现即可信"。
+        let t = Instant::now();
+        let mut class_by_name: HashMap<&str, Vec<&EntityId>> = HashMap::new();
+        for e in &all_entities {
+            if matches!(e.kind, EntityKind::Class | EntityKind::Interface) {
+                class_by_name.entry(e.name.as_str()).or_default().push(&e.id);
+            }
+        }
+        let mut exc_edges: Vec<Edge> = Vec::new();
+        for entity in &all_entities {
+            if entity.kind != EntityKind::Method {
+                continue;
+            }
+            let Some(flows) = entity.metadata.get("exception_flow").and_then(|v| v.as_array())
+            else {
+                continue;
+            };
+            let Some(file) = entity.evidence.first().map(|ev| ev.file.as_str()) else {
+                continue;
+            };
+            for flow in flows {
+                let Some(type_name) = flow.get("type").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Some(candidates) = class_by_name.get(type_name) else { continue };
+                let [cid] = candidates.as_slice() else { continue }; // 歧义跳过
+                let kind = if flow.get("flow").and_then(|v| v.as_str()) == Some("throws") {
+                    EdgeKind::Throws
+                } else {
+                    EdgeKind::Handles
+                };
+                let line = flow.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                exc_edges.push(
+                    Edge::new(entity.id.clone(), (*cid).clone(), kind).with_evidence(
+                        file,
+                        line,
+                        line,
+                        EvidenceClass::Inferred,
+                        0.7,
+                        "exception flow resolve",
+                    ),
+                );
+            }
+        }
+        let n_exc = exc_edges.len();
+        if !exc_edges.is_empty() {
+            store.apply_patch(GraphPatch::add(Vec::new(), exc_edges))?;
+        }
+        eprintln!(
+            "[ri-diag] exception_flow: {} throws/handles edges, in {:.2}s",
+            n_exc,
+            t.elapsed().as_secs_f64()
+        );
+
         // 向量层:对本次变更实体生成 embedding(增量——仅 text_hash 变化才重新生成)。
         if config.index.embedding && !embed_inputs.is_empty() {
             let t = Instant::now();

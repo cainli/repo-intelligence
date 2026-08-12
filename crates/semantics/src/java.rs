@@ -311,6 +311,7 @@ fn extract_java(
     let mut invocations: Vec<Invocation> = Vec::new();
     // 每个 method 的 (name 节点 offset, id),供 endpoint 注解 offset 配对到所在 method。
     let mut method_spans: Vec<(usize, EntityId)> = Vec::new();
+    let mut exception_refs: Vec<ExceptionRef> = Vec::new();
     if let Some(tree) = parsed.tree.as_ref() {
         visit_spring(
             tree.root_node(),
@@ -333,6 +334,13 @@ fn extract_java(
             &mut invocations,
             &mut method_spans,
             None,
+        );
+        walk_exceptions(
+            tree.root_node(),
+            file.content.as_bytes(),
+            None,
+            &mut exception_refs,
+            &file.content,
         );
     }
     // 同文件 method 调用 → Calls 边。A+ 策略:caller/callee 名字对应多个方法
@@ -389,6 +397,32 @@ fn extract_java(
         };
         meta.insert("invokes".into(), serde_json::Value::Array(calls.clone()));
         entity.metadata = serde_json::Value::Object(meta);
+    }
+    // 异常流引用回填到 method.metadata.exception_flow(analysis 后处理按 type name
+    // resolve 到 class 实体,建 throws/handles 边)。按 method 分组,重载同名共享。
+    if !exception_refs.is_empty() {
+        let mut exc_by_method: HashMap<&str, Vec<serde_json::Value>> = HashMap::new();
+        for r in &exception_refs {
+            exc_by_method.entry(r.method.as_str()).or_default().push(json!({
+                "type": r.type_name,
+                "line": r.line,
+                "flow": r.kind,
+            }));
+        }
+        for entity in entities.iter_mut() {
+            if entity.kind != EntityKind::Method {
+                continue;
+            }
+            let Some(flows) = exc_by_method.get(entity.name.as_str()) else {
+                continue;
+            };
+            let mut meta = match entity.metadata.clone() {
+                serde_json::Value::Object(map) => map,
+                _ => serde_json::Map::new(),
+            };
+            meta.insert("exception_flow".into(), serde_json::Value::Array(flows.clone()));
+            entity.metadata = serde_json::Value::Object(meta);
+        }
     }
     // 类型声明统一采集一次(掩码后源码,注释里的 "class Foo" 不再产幻影实体),
     // 供实体创建、class_offsets、字段所属类判定三处复用。
@@ -1693,6 +1727,100 @@ fn is_linear_scan(name: &str) -> bool {
         name,
         "contains" | "indexOf" | "lastIndexOf" | "find" | "containsKey" | "containsValue"
     )
+}
+
+/// 异常流引用:method throws/catch 的异常类型名(analysis 后处理按名 resolve 到 class 实体)。
+#[derive(Clone)]
+struct ExceptionRef {
+    method: String,
+    type_name: String,
+    line: u32,
+    kind: String, // "throws" / "handles"
+}
+
+/// 取类型节点的简单名(Exception / BusinessException),去 scoped/generic 后缀。
+fn simple_type_name(node: &Node, source: &[u8]) -> Option<String> {
+    if !matches!(node.kind(), "type_identifier" | "scoped_type_identifier" | "generic_type") {
+        return None;
+    }
+    let text = node_text(source, *node);
+    Some(
+        text.split('<')
+            .next()
+            .unwrap_or("")
+            .split('.')
+            .next_back()
+            .unwrap_or("")
+            .to_string(),
+    )
+}
+
+/// 找节点子树第一个类型名(供 catch_clause 定位异常类型)。
+fn first_type_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    if let Some(n) = simple_type_name(&node, source) {
+        return Some(n);
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(c) = node.named_child(i)
+            && let Some(n) = first_type_name(c, source)
+        {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// 遍历收集异常流引用:method_declaration 的 throws 子句 → throws;
+/// 方法体内的 catch_clause → handles。current_method 由 method 声明下推。
+fn walk_exceptions(
+    node: Node<'_>,
+    source: &[u8],
+    current_method: Option<&str>,
+    refs: &mut Vec<ExceptionRef>,
+    file_content: &str,
+) {
+    if matches!(node.kind(), "method_declaration" | "constructor_declaration")
+        && let Some(name_node) = node.child_by_field_name("name")
+    {
+        let mname = node_text(source, name_node);
+        for i in 0..node.named_child_count() {
+            if let Some(child) = node.named_child(i) {
+                if child.kind() == "throws_clause" {
+                    for j in 0..child.named_child_count() {
+                        if let Some(t) = child.named_child(j)
+                            && let Some(tn) = simple_type_name(&t, source)
+                        {
+                            refs.push(ExceptionRef {
+                                method: mname.clone(),
+                                type_name: tn,
+                                line: line_of(file_content, t.start_byte()),
+                                kind: "throws".into(),
+                            });
+                        }
+                    }
+                } else {
+                    walk_exceptions(child, source, Some(&mname), refs, file_content);
+                }
+            }
+        }
+        return;
+    }
+    if node.kind() == "catch_clause"
+        && let Some(m) = current_method
+        && let Some(tn) = first_type_name(node, source)
+    {
+        refs.push(ExceptionRef {
+            method: m.to_string(),
+            type_name: tn,
+            line: line_of(file_content, node.start_byte()),
+            kind: "handles".into(),
+        });
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            walk_exceptions(child, source, current_method, refs, file_content);
+        }
+    }
 }
 
 /// caller/callee 按方法名同文件匹配(低保真:跨类同名混淆、跨文件调用留后续)。

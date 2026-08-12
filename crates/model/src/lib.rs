@@ -232,6 +232,10 @@ pub enum EdgeKind {
     /// 让 trace 从超类(含 abstract 抽象基类)下钻到具体子类——业务逻辑常在子类,abstract
     /// 类自身方法不直接调 Dao,需经此边追到子类的表依赖。
     SuperclassOf,
+    /// method -[Throws]-> exception_class:方法 throws 声明抛出的异常类型(Fact,throws 子句)。
+    Throws,
+    /// method -[Handles]-> exception_class:方法 try-catch 处理的异常类型(Inferred,catch 子句)。
+    Handles,
 }
 
 impl EdgeKind {
@@ -260,6 +264,8 @@ impl EdgeKind {
             Self::Implements => "implements",
             Self::Schedules => "schedules",
             Self::SuperclassOf => "superclass_of",
+            Self::Throws => "throws",
+            Self::Handles => "handles",
         }
     }
 }
