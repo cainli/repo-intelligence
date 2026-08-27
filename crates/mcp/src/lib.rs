@@ -84,6 +84,37 @@ fn entity_schema() -> Value {
     })
 }
 
+/// trace 工具的实体条目 schema(trace_entity_view 的形状)。紧凑档(默认)
+/// 只含定位四元组 + evidence_count(+ 首条证据 anchor);verbose=true 才补
+/// metadata 与全量 evidence[](两者声明为可选,required 只锁紧凑档字段)。
+/// kind 刻意声明为普通 string:实体 kind 枚举很长,不必在 trace_output 里
+/// 重复一份(tools/list 是会话级 token 税)。
+fn trace_entity_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "id": {"type": "string"},
+            "kind": {"type": "string"},
+            "name": {"type": "string"},
+            "qualified_name": {"type": "string"},
+            "evidence_count": {"type": "integer", "minimum": 0},
+            "anchor": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "file": {"type": "string"},
+                    "start_line": {"type": "integer", "minimum": 0}
+                },
+                "required": ["file", "start_line"]
+            },
+            "metadata": {},
+            "evidence": {"type": "array", "items": evidence_schema()}
+        },
+        "required": ["id", "kind", "name", "qualified_name", "evidence_count"]
+    })
+}
+
 fn finding_schema() -> Value {
     json!({
         "type": "object",
@@ -293,7 +324,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "items": {"type": "array", "items": entity_schema()},
+            "items": {"type": "array", "items": trace_entity_schema()},
             "edges": {"type": "array", "items": edge_schema()},
             "count": {"type": "integer", "minimum": 0, "description": "Items in this page."},
             "total_items": {"type": "integer", "minimum": 0, "description": "Total reachable entities (across all pages)."},
@@ -1627,6 +1658,31 @@ fn edge_view(edge: &Edge, verbose: bool) -> Value {
     view
 }
 
+/// trace 实体的协议视图。与 edge_view 同策略:紧凑档(默认)不带 metadata
+/// blob 与全量 evidence[](trace 大响应的实体侧主因),只留定位四元组 +
+/// `evidence_count` + 首条证据的 file:start_line 锚点;verbose=true 才展开
+/// 完整实体(serde 全量序列化)。
+fn trace_entity_view(entity: &Entity, verbose: bool) -> Value {
+    if verbose {
+        serde_json::to_value(entity).unwrap_or(Value::Null)
+    } else {
+        let mut view = json!({
+            "id": entity.id,
+            "kind": entity.kind.as_str(),
+            "name": entity.name,
+            "qualified_name": entity.qualified_name,
+            "evidence_count": entity.evidence.len(),
+        });
+        if let Some(first) = entity.evidence.first() {
+            view["anchor"] = json!({
+                "file": first.file,
+                "start_line": first.start_line,
+            });
+        }
+        view
+    }
+}
+
 /// finding 上的证据紧凑视图:count + 首条锚点。与 edge_view 同策略。
 fn compact_evidence(evidence: &[Evidence]) -> Value {
     match evidence.first() {
@@ -1748,11 +1804,16 @@ fn trace_graph(
     // 分页(治 trace 爆炸):edges/items 各自按 limit/offset 截断,peek 法判 has_more。
     let total_items = items.len();
     let total_edges = edge_views.len();
-    let items_page: Vec<Entity> = items.into_iter().skip(offset).take(limit).collect();
+    let items_page: Vec<Value> = items
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|entity| trace_entity_view(&entity, verbose))
+        .collect();
     let edges_page: Vec<Value> = edge_views.into_iter().skip(offset).take(limit).collect();
     let has_more = total_items > offset + limit || total_edges > offset + limit;
     let mut result = json!({
-        "items": serde_json::to_value(&items_page)?,
+        "items": items_page,
         "edges": edges_page,
         "count": items_page.len(),
         "total_items": total_items,
@@ -2241,6 +2302,38 @@ mod tests {
 
         let verbose = edge_view(&edge, true);
         assert_eq!(verbose["evidence"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn trace_entity_view_compact_omits_metadata_and_evidence_array() {
+        let mut entity = Entity::new(
+            EntityId("a".into()),
+            EntityKind::Method,
+            "doIt",
+            "Svc#doIt",
+        );
+        for i in 0..2 {
+            entity = entity.with_evidence(
+                format!("f{i}.java"),
+                i + 1,
+                i + 1,
+                EvidenceClass::Fact,
+                1.0,
+                "long reason text",
+            );
+        }
+        let compact = trace_entity_view(&entity, false);
+        assert_eq!(compact["evidence_count"], 2);
+        // 紧凑档不携带 metadata blob 与全量 evidence[]。
+        assert!(compact["metadata"].is_null(), "compact view must not carry metadata");
+        assert!(compact["evidence"].is_null(), "compact view must not carry evidence[]");
+        // 首条证据锚点保留"这可信吗、来自哪"的最小依据。
+        assert_eq!(compact["anchor"]["file"], "f0.java");
+        assert_eq!(compact["anchor"]["start_line"], 1);
+
+        let verbose = trace_entity_view(&entity, true);
+        assert_eq!(verbose["evidence"].as_array().unwrap().len(), 2);
+        assert_eq!(verbose["qualified_name"], "Svc#doIt");
     }
 
     #[test]
