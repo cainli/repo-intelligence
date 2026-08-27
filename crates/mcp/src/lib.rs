@@ -94,9 +94,31 @@ fn finding_schema() -> Value {
             "severity": {"type": "string"},
             "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
             "path": {"type": "array", "items": {"type": "string"}},
-            "evidence": {"type": "array", "items": evidence_schema()}
+            // 证据紧凑视图(compact_evidence):count + 首条 file:line 锚点,
+            // 不再序列化完整 evidence[]。
+            "evidence": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "count": {"type": "integer", "minimum": 0},
+                    "first": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "file": {"type": "string"},
+                            "start_line": {"type": "integer", "minimum": 0}
+                        },
+                        "required": ["file", "start_line"]
+                    }
+                },
+                "required": ["count"]
+            },
+            "evidence_count": {"type": "integer", "minimum": 0}
         },
-        "required": ["entity", "plane", "severity", "confidence", "path", "evidence"]
+        "required": [
+            "entity", "plane", "severity", "confidence", "path",
+            "evidence", "evidence_count"
+        ]
     })
 }
 
@@ -119,9 +141,21 @@ fn edge_schema() -> Value {
             },
             "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
             "tentative": {"type": "boolean"},
-            "evidence": {"type": "array", "items": evidence_schema()}
+            // 紧凑档(默认)只带 evidence_count + 首条证据锚点;完整 evidence[]
+            // 仅在 trace 工具 verbose=true 时出现(故从 required 移除)。
+            "evidence": {"type": "array", "items": evidence_schema()},
+            "evidence_count": {"type": "integer", "minimum": 0},
+            "evidence_first": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "file": {"type": "string"},
+                    "start_line": {"type": "integer", "minimum": 0}
+                },
+                "required": ["file", "start_line"]
+            }
         },
-        "required": ["source", "target", "kind", "confidence", "tentative", "evidence"]
+        "required": ["source", "target", "kind", "confidence", "tentative", "evidence_count"]
     })
 }
 
@@ -239,6 +273,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                 "default": 0.0,
                 "description": "Drop edges whose confidence is below this. Default 0 returns all edges (low-confidence ones still returned but marked `tentative`). Use e.g. 0.8 to keep only well-evidenced edges."
             },
+            "verbose": {"type": "boolean", "default": false, "description": "Include full evidence[] per edge."},
             "limit": {
                 "type": "integer",
                 "minimum": 1,
@@ -481,7 +516,8 @@ fn tool_specs() -> Vec<ToolSpec> {
                     "name": {"type": "string", "description": "Exact table or mapper-method name to trace access to."},
                     "direction": {"type": "string", "enum": ["read", "write", "both"], "default": "both", "description": "read = reads_table only; write = writes_table only; both = either."},
                     "depth": {"type": "integer", "minimum": 0, "default": 2},
-                    "min_confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.0}
+                    "min_confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.0},
+                    "verbose": {"type": "boolean", "default": false, "description": "Include full evidence[] per edge."}
                 },
                 "required": ["name"]
             }),
@@ -503,7 +539,8 @@ fn tool_specs() -> Vec<ToolSpec> {
                     },
                     "direction": {"type": "string", "enum": ["outbound", "inbound"], "default": "outbound"},
                     "depth": {"type": "integer", "minimum": 0, "default": 2},
-                    "min_confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.0}
+                    "min_confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.0},
+                    "verbose": {"type": "boolean", "default": false, "description": "Include full evidence[] per edge."}
                 },
                 "required": ["name"]
             }),
@@ -963,7 +1000,16 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
                         .into(),
                 );
             }
-            serde_json::to_value(report)?
+            // 证据紧凑化(与 edge_view 同策略):finding 的全量 evidence[](reason 长文本)
+            // 是大响应主因,紧凑档只留 count + 首条 file:line 锚点。
+            let mut value = serde_json::to_value(&report)?;
+            if let Some(findings) = value.get_mut("findings").and_then(Value::as_array_mut) {
+                for (finding, view) in report.findings.iter().zip(findings.iter_mut()) {
+                    view["evidence"] = compact_evidence(&finding.evidence);
+                    view["evidence_count"] = json!(finding.evidence.len());
+                }
+            }
+            value
         }
         "trace_callers" => {
             let name = arguments["name"].as_str().unwrap_or_default();
@@ -975,8 +1021,9 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
                 .clamp(0.0, 1.0) as f32;
             let limit = (arguments["limit"].as_u64().unwrap_or(50) as usize).clamp(1, MAX_PAGE_LIMIT);
             let offset = parse_offset(arguments);
+            let verbose = arguments["verbose"].as_bool().unwrap_or(false);
             let store = SqliteGraphStore::open(&path)?;
-            trace_graph(&store, name, depth, kinds, false, min_confidence, limit, offset, None)?
+            trace_graph(&store, name, depth, kinds, false, min_confidence, limit, offset, None, verbose)?
         }
         "trace_callees" => {
             let name = arguments["name"].as_str().unwrap_or_default();
@@ -988,8 +1035,9 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
                 .clamp(0.0, 1.0) as f32;
             let limit = (arguments["limit"].as_u64().unwrap_or(50) as usize).clamp(1, MAX_PAGE_LIMIT);
             let offset = parse_offset(arguments);
+            let verbose = arguments["verbose"].as_bool().unwrap_or(false);
             let store = SqliteGraphStore::open(&path)?;
-            trace_graph(&store, name, depth, kinds, true, min_confidence, limit, offset, None)?
+            trace_graph(&store, name, depth, kinds, true, min_confidence, limit, offset, None, verbose)?
         }
         "trace_table_access" => {
             let name = arguments["name"].as_str().unwrap_or_default();
@@ -1016,8 +1064,9 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
             }
             let limit = (arguments["limit"].as_u64().unwrap_or(50) as usize).clamp(1, MAX_PAGE_LIMIT);
             let offset = parse_offset(arguments);
+            let verbose = arguments["verbose"].as_bool().unwrap_or(false);
             let store = SqliteGraphStore::open(&path)?;
-            trace_graph(&store, name, depth, kinds, false, min_confidence, limit, offset, None)?
+            trace_graph(&store, name, depth, kinds, false, min_confidence, limit, offset, None, verbose)?
         }
         "trace_full_path" => {
             let name = arguments["name"].as_str().unwrap_or_default();
@@ -1050,10 +1099,11 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
             };
             let limit = (arguments["limit"].as_u64().unwrap_or(50) as usize).clamp(1, MAX_PAGE_LIMIT);
             let offset = parse_offset(arguments);
+            let verbose = arguments["verbose"].as_bool().unwrap_or(false);
             let store = SqliteGraphStore::open(&path)?;
             // to_kind 经 trace_graph 在分页前过滤(has_more/total 反映过滤后集合);
             // 此前在分页后 retain 会产生"每页过滤后为 0 却 has_more=true"的死翻页。
-            trace_graph(&store, name, depth, kinds, outbound, min_confidence, limit, offset, to_kind)?
+            trace_graph(&store, name, depth, kinds, outbound, min_confidence, limit, offset, to_kind, verbose)?
         }
         "verify_edge" => {
             let source = arguments["source"].as_str().unwrap_or_default();
@@ -1542,11 +1592,10 @@ fn kinds_label(kinds: &[EdgeKind]) -> String {
     }
 }
 
-/// Edge view with top-level `confidence` + `tentative` so an agent can tell Fact
-/// edges (trust) from inferred ones at a glance, without digging into `evidence[]`.
-/// `tentative` = not Fact, and (confidence < 0.8 or classification is
-/// Inferred/RuntimeUnknown/missing). Full `evidence[]` is still preserved.
-fn edge_view(edge: &Edge) -> Value {
+/// 边的协议视图。verbose=false(默认)为紧凑档:不带完整 `evidence[]`
+/// (reason 长文本是 trace 大响应的主因),仅给 `evidence_count` +
+/// 第一条证据的 file:line 锚点;verbose=true 才展开全部证据。
+fn edge_view(edge: &Edge, verbose: bool) -> Value {
     let evidence = edge.evidence.first();
     let confidence = evidence.map(|item| item.confidence).unwrap_or(1.0);
     let tentative = match evidence.map(|item| item.classification) {
@@ -1554,15 +1603,39 @@ fn edge_view(edge: &Edge) -> Value {
         Some(EvidenceClass::Resolved) => confidence < 0.8,
         Some(_) | None => true,
     };
-    json!({
+    let mut view = json!({
         "source": edge.source.0,
         "target": edge.target.0,
         "kind": edge.kind.as_str(),
         "edge_kind": edge.kind.as_str(),
         "confidence": confidence,
         "tentative": tentative,
-        "evidence": serde_json::to_value(&edge.evidence).unwrap_or_default(),
-    })
+        "evidence_count": edge.evidence.len(),
+    });
+    match verbose {
+        true => view["evidence"] =
+            serde_json::to_value(&edge.evidence).unwrap_or_default(),
+        false => {
+            if let Some(first) = edge.evidence.first() {
+                view["evidence_first"] = json!({
+                    "file": first.file,
+                    "start_line": first.start_line,
+                });
+            }
+        }
+    }
+    view
+}
+
+/// finding 上的证据紧凑视图:count + 首条锚点。与 edge_view 同策略。
+fn compact_evidence(evidence: &[Evidence]) -> Value {
+    match evidence.first() {
+        None => json!({"count": 0}),
+        Some(first) => json!({
+            "count": evidence.len(),
+            "first": {"file": first.file, "start_line": first.start_line},
+        }),
+    }
 }
 
 /// Shared engine for `trace_callers`/`trace_callees`: resolve every entity
@@ -1586,6 +1659,7 @@ fn trace_graph(
     limit: usize,
     offset: usize,
     to_kind: Option<&str>,
+    verbose: bool,
 ) -> Result<Value> {
     let matches = store.search(SearchQuery::new(name).with_limit(DEFAULT_SEARCH_LIMIT))?;
     let matched: Vec<Entity> = matches.into_iter().map(|m| m.entity).collect();
@@ -1662,7 +1736,7 @@ fn trace_graph(
     // edges are marked `tentative` rather than silently hidden.
     let edge_views: Vec<Value> = edges
         .iter()
-        .map(edge_view)
+        .map(|edge| edge_view(edge, verbose))
         .filter(|view| view["confidence"].as_f64().unwrap_or(1.0) >= min_confidence as f64)
         .collect();
     let edges_empty = edge_views.is_empty();
@@ -2128,23 +2202,45 @@ mod tests {
         // Fact → 不 tentative
         let fact = Edge::new(id("a"), id("b"), EdgeKind::Calls)
             .with_evidence("F.java", 1, 1, EvidenceClass::Fact, 1.0, "fact");
-        assert_eq!(edge_view(&fact)["tentative"], false);
-        assert_eq!(edge_view(&fact)["confidence"], 1.0);
+        assert_eq!(edge_view(&fact, true)["tentative"], false);
+        assert_eq!(edge_view(&fact, true)["confidence"], 1.0);
         // Inferred → 无论置信度都 tentative
         let inferred = Edge::new(id("a"), id("b"), EdgeKind::MappedFrom)
             .with_evidence("F.java", 1, 1, EvidenceClass::Inferred, 0.9, "inferred");
-        assert_eq!(edge_view(&inferred)["tentative"], true);
+        assert_eq!(edge_view(&inferred, true)["tentative"], true);
         // Resolved 高置信 → 不 tentative
         let resolved_hi = Edge::new(id("a"), id("b"), EdgeKind::MatchesEndpoint)
             .with_evidence("F.java", 1, 1, EvidenceClass::Resolved, 0.95, "resolved");
-        assert_eq!(edge_view(&resolved_hi)["tentative"], false);
+        assert_eq!(edge_view(&resolved_hi, true)["tentative"], false);
         // Resolved 低置信 → tentative
         let resolved_lo = Edge::new(id("a"), id("b"), EdgeKind::MatchesEndpoint)
             .with_evidence("F.java", 1, 1, EvidenceClass::Resolved, 0.6, "low");
-        assert_eq!(edge_view(&resolved_lo)["tentative"], true);
+        assert_eq!(edge_view(&resolved_lo, true)["tentative"], true);
         // 无证据 → tentative
         let no_evidence = Edge::new(id("a"), id("b"), EdgeKind::Calls);
-        assert_eq!(edge_view(&no_evidence)["tentative"], true);
+        assert_eq!(edge_view(&no_evidence, true)["tentative"], true);
+    }
+
+    #[test]
+    fn edge_view_compact_mode_omits_full_evidence_array() {
+        let mut edge = Edge::new(
+            EntityId("a".into()),
+            EntityId("b".into()),
+            EdgeKind::Calls,
+        );
+        for i in 0..3 {
+            edge = edge.with_evidence(format!("f{i}.java"), i + 1, i + 1, EvidenceClass::Fact, 1.0, "long reason text");
+        }
+        let compact = edge_view(&edge, false);
+        // 紧凑模式:evidence_count 表示总量,不再序列化完整数组
+        assert_eq!(compact["evidence_count"], 3);
+        assert!(compact["evidence"].is_null(), "compact view must not carry full evidence[]");
+        let first = &compact["evidence_first"];
+        assert_eq!(first["file"], "f0.java");
+        assert_eq!(first["start_line"], 1);
+
+        let verbose = edge_view(&edge, true);
+        assert_eq!(verbose["evidence"].as_array().unwrap().len(), 3);
     }
 
     #[test]
@@ -2216,7 +2312,7 @@ mod tests {
             EdgeKind::Exposes,
             EdgeKind::MatchesEndpoint,
         ];
-        let r1 = trace_graph(&store, "Svc", 5, kinds_with, true, 0.0, 50, 0, None).unwrap();
+        let r1 = trace_graph(&store, "Svc", 5, kinds_with, true, 0.0, 50, 0, None, false).unwrap();
         let qns1: Vec<&str> = r1["items"]
             .as_array()
             .unwrap()
@@ -2237,7 +2333,7 @@ mod tests {
             EdgeKind::Exposes,
             EdgeKind::MatchesEndpoint,
         ];
-        let r2 = trace_graph(&store, "Svc", 5, kinds_without, true, 0.0, 50, 0, None).unwrap();
+        let r2 = trace_graph(&store, "Svc", 5, kinds_without, true, 0.0, 50, 0, None, false).unwrap();
         let qns2: Vec<&str> = r2["items"]
             .as_array()
             .unwrap()
@@ -2294,7 +2390,7 @@ mod tests {
             EdgeKind::Exposes,
             EdgeKind::MatchesEndpoint,
         ];
-        let r1 = trace_graph(&store, "AbstractBase", 5, kinds_with, true, 0.0, 50, 0, None).unwrap();
+        let r1 = trace_graph(&store, "AbstractBase", 5, kinds_with, true, 0.0, 50, 0, None, false).unwrap();
         let qns1: Vec<&str> = r1["items"]
             .as_array()
             .unwrap()
@@ -2315,7 +2411,7 @@ mod tests {
             EdgeKind::Exposes,
             EdgeKind::MatchesEndpoint,
         ];
-        let r2 = trace_graph(&store, "AbstractBase", 5, kinds_without, true, 0.0, 50, 0, None).unwrap();
+        let r2 = trace_graph(&store, "AbstractBase", 5, kinds_without, true, 0.0, 50, 0, None, false).unwrap();
         let qns2: Vec<&str> = r2["items"]
             .as_array()
             .unwrap()
