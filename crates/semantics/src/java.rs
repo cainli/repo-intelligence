@@ -1266,7 +1266,7 @@ fn extract_tests(
         let name_by_id: HashMap<&EntityId, &str> = entities
             .iter()
             .filter(|entity| entity.kind == EntityKind::Method)
-            .filter_map(|entity| Some((&entity.id, entity.name.as_str())))
+            .map(|entity| (&entity.id, entity.name.as_str()))
             .collect();
         AT_TEST
             .captures_iter(&masked.bare)
@@ -1330,7 +1330,7 @@ fn extract_jobs(
         let name_by_id: HashMap<&EntityId, &str> = entities
             .iter()
             .filter(|entity| entity.kind == EntityKind::Method)
-            .filter_map(|entity| Some((&entity.id, entity.name.as_str())))
+            .map(|entity| (&entity.id, entity.name.as_str()))
             .collect();
         re.captures_iter(scan_source)
             .filter_map(|capture| {
@@ -1383,7 +1383,7 @@ fn extract_jobs(
 fn extract_aspects(
     masked: &MaskedSource,
     method_spans: &[(usize, EntityId)],
-    entities: &mut Vec<Entity>,
+    entities: &mut [Entity],
     _edges: &mut Vec<Edge>,
 ) {
     for capture in ADVICE_ANN.captures_iter(&masked.code) {

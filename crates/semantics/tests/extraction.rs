@@ -194,9 +194,11 @@ fn default_whitelist_covers_jpa_and_conditions_annotations() {
 fn blacklist_suppresses_annotation_even_when_whitelisted() {
     // 白名单同时含 Override,但黑名单也含 → blacklist 兜底必须挡住;
     // Transactional 仅在白名单 → 正常产出。证明 annotation_blacklist 已生效。
-    let mut cfg = SemanticsConfig::default();
-    cfg.annotation_whitelist = vec!["Transactional".into(), "Override".into()];
-    cfg.annotation_blacklist = vec!["Override".into()];
+    let cfg = SemanticsConfig {
+        annotation_whitelist: vec!["Transactional".into(), "Override".into()],
+        annotation_blacklist: vec!["Override".into()],
+        ..SemanticsConfig::default()
+    };
     let sf = java_file(
         "B.java",
         r#"
