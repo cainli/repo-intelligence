@@ -59,6 +59,13 @@ static AT_ANNOTATION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"@([A-Za-z_]\w*)").unwrap());
 // @Test 方法定位(P1-4)。
 static AT_TEST: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@Test\b").unwrap());
+
+// import 全限定名(含 static,剔通配符由提取侧做):写入每个 class 的 metadata.imports,
+// analysis 层借其简单名末段做 Tests 边的第二推断路径(P0②)。跑在 bare 掩码上——
+// Javadoc / 示例代码里的 "import x.y;" 字样不会误收。
+static JAVA_IMPORT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*import\s+(?:static\s+)?([\w.]+(?:\.\*)?)\s*;").unwrap()
+});
 // AOP advice 注解 + 其 pointcut 字面量(P1-2)。group2 = 参数列表,pointcut 经
 // annotation_path 提取(兼容 value 不在首位)。
 static ADVICE_ANN: LazyLock<Regex> = LazyLock::new(|| {
@@ -592,6 +599,7 @@ fn extract_java(
     extract_mybatis_plus(file, path, &masked, entities, edges);
     extract_implements(&masked, entities);
     extract_extends(&masked, entities);
+    extract_imports(&masked, entities);
     extract_interface_endpoints(file, path, entities, edges, config);
     extract_annotations(file, path, &masked, &method_spans, entities, edges, config);
     extract_tests(file, path, &masked, &method_spans, entities, edges);
@@ -1067,6 +1075,37 @@ fn extract_extends(masked: &MaskedSource, entities: &mut [Entity]) {
                 entity.metadata = serde_json::Value::Object(meta);
             }
         }
+    }
+}
+
+/// 文件级 imports → 同文件每个 class 的 metadata.imports(全限定名数组,剔通配符)。
+/// 所有 class 统一记录、不做"仅测试类"特判:哪些信号可用由 analysis 层决定,
+/// 提取层保持信号完整。static import 末段是成员名而非类名,匹配时天然落空,无害。
+fn extract_imports(masked: &MaskedSource, entities: &mut [Entity]) {
+    let imports: Vec<String> = JAVA_IMPORT
+        .captures_iter(&masked.bare)
+        .filter_map(|cap| cap.get(1))
+        .map(|m| m.as_str().to_string())
+        .filter(|fq| !fq.ends_with('*'))
+        .collect();
+    if imports.is_empty() {
+        return;
+    }
+    for entity in entities.iter_mut() {
+        if entity.kind != EntityKind::Class {
+            continue;
+        }
+        let mut meta = match entity.metadata.clone() {
+            serde_json::Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        meta.insert(
+            "imports".into(),
+            serde_json::Value::Array(
+                imports.iter().map(|fq| serde_json::Value::String(fq.clone())).collect(),
+            ),
+        );
+        entity.metadata = serde_json::Value::Object(meta);
     }
 }
 

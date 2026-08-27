@@ -302,3 +302,51 @@ fn extract_extends_and_abstract_metadata() {
         "Concrete 非 abstract,不应有 abstract metadata"
     );
 }
+
+#[test]
+fn java_class_records_file_level_imports() {
+    // T4:每个 class 记录文件级 imports(metadata.imports,去通配符)。
+    // 通配符 import 不进数组(末段 * 无法做类名匹配);signals 供 analysis 层
+    // 做 Tests 边的 import 推断。无 import 的类不得塞空数组噪声。
+    let sf = java_file(
+        "Svc.java",
+        r#"
+        package com.demo;
+        import com.demo.biz.DemoService;
+        import static com.demo.biz.Util.AID;
+        import org.junit.jupiter.api.*;
+        class Svc {
+          void run() {}
+        }
+        "#,
+    );
+    let patch = extract(&sf).unwrap();
+    let svc = patch
+        .add_entities
+        .iter()
+        .find(|e| e.kind == EntityKind::Class && e.name == "Svc")
+        .expect("Svc");
+    let imports = svc
+        .metadata
+        .get("imports")
+        .and_then(|v| v.as_array())
+        .expect("Svc 应带 metadata.imports");
+    assert_eq!(
+        imports,
+        &[
+            serde_json::json!("com.demo.biz.DemoService"),
+            serde_json::json!("com.demo.biz.Util.AID")
+        ],
+        "通配符 org.junit.jupiter.api.* 应被剔除"
+    );
+
+    // 无 import 的文件不产生 metadata.imports 键。
+    let bare = java_file("Bare.java", "class Bare { void run() {} }");
+    let patch = extract(&bare).unwrap();
+    let cls = patch
+        .add_entities
+        .iter()
+        .find(|e| e.kind == EntityKind::Class && e.name == "Bare")
+        .expect("Bare");
+    assert!(cls.metadata.get("imports").is_none());
+}

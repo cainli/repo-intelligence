@@ -1190,7 +1190,7 @@ fn test_case_and_tests_edge() {
         .entity;
     let t = store
         .traverse(
-            TraverseQuery::outbound(test_class.id)
+            TraverseQuery::outbound(test_class.id.clone())
                 .with_depth(1)
                 .with_kinds(vec![EdgeKind::Tests]),
         )
@@ -1202,6 +1202,138 @@ fn test_case_and_tests_edge() {
         "FooTest 应经 Tests 连到 Foo: {:?}",
         t.entities
     );
+}
+
+#[test]
+fn tests_edge_inferred_from_test_class_imports() {
+    // P0②:测试类不遵循 XxxTest→Xxx 命名约定时,借 metadata.imports 的简单名在项目内
+    // 唯一命中一个 class 来建 Tests 边(Inferred 0.6)。DemoUnitTest 没有被测类同名类,
+    // 只能靠 import com.demo.biz.DemoService 推断。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("DemoService.java"),
+        r#"
+        package com.demo.biz;
+        class DemoService { void handle() {} }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("DemoUnitTest.java"),
+        r#"
+        package com.demo;
+        import com.demo.biz.DemoService;
+        import org.junit.jupiter.api.Test;
+        class DemoUnitTest {
+          @Test
+          void handles() {}
+        }
+        "#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    let test_class = store
+        .search(SearchQuery::new("DemoUnitTest").with_limit(20))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::Class && m.entity.name == "DemoUnitTest")
+        .expect("DemoUnitTest class")
+        .entity;
+    let t = store
+        .traverse(
+            TraverseQuery::outbound(test_class.id.clone())
+                .with_depth(1)
+                .with_kinds(vec![EdgeKind::Tests]),
+        )
+        .unwrap();
+    let edge = t.edges.iter().find(|e| {
+        e.source == test_class.id
+            && t.entities
+                .iter()
+                .any(|n| n.id == e.target && n.name == "DemoService")
+    });
+    let Some(edge) = edge else {
+        panic!("DemoUnitTest 应经 Tests(import 推断)连到 DemoService: {:?}", t.edges);
+    };
+    let ev = edge.evidence.first().expect("import 推断 Tests 边带 evidence");
+    assert_eq!(ev.classification, EvidenceClass::Inferred);
+    assert!(
+        (ev.confidence - 0.6).abs() < f32::EPSILON,
+        "confidence 应为 0.6, got {}",
+        ev.confidence
+    );
+}
+
+#[test]
+fn tests_edge_import_ambiguous_across_packages_is_skipped() {
+    // A+:两个包各有一个 DemoService,import 简单名跨包同名 → 拒边,记 kind=test_import 歧义。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("PkgA.java"),
+        r#"package com.a;
+        class DemoService { void handle() {} }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("PkgB.java"),
+        r#"package com.b;
+        class DemoService { void handle() {} }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("SmokeTest.java"),
+        r#"import com.a.DemoService;
+        class SmokeTest {
+          @Test
+          void smoke() {}
+        }
+        "#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+    let test_class = store
+        .search(SearchQuery::new("SmokeTest").with_limit(20))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::Class && m.entity.name == "SmokeTest")
+        .expect("SmokeTest class")
+        .entity;
+    let t = store
+        .traverse(
+            TraverseQuery::outbound(test_class.id.clone())
+                .with_depth(1)
+                .with_kinds(vec![EdgeKind::Tests]),
+        )
+        .unwrap();
+    assert!(
+        t.edges.is_empty(),
+        "import 简单名多命中必须拒边, got {:?}",
+        t.edges
+    );
+    // 歧义写回实体 metadata.ambiguous_resolution(kind=test_import),消费方可凭全限定名自行消歧。
+    let meta_note = store
+        .search(SearchQuery::new("SmokeTest").with_limit(20))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.id == test_class.id)
+        .expect("SmokeTest 仍在索引")
+        .entity
+        .metadata
+        .get("ambiguous_resolution")
+        .and_then(|v| v.as_array())
+        .and_then(|entries| entries.first())
+        .cloned();
+    let Some(note) = meta_note else {
+        panic!("SmokeTest 应记 metadata.ambiguous_resolution");
+    };
+    assert_eq!(note["kind"], "test_import");
+    assert_eq!(note["name"], "DemoService");
+    let candidates = note["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2, "两个同名候选文件: {:?}", candidates);
 }
 
 #[test]

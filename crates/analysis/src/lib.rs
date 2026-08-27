@@ -290,11 +290,11 @@ impl WorkspaceIndexer {
             .collect();
         let t = std::time::Instant::now();
         store.replace_resolved_edges(resolution.patch.add_edges)?;
-        // A+ 歧义写回:被跳过的跨文件解析记录到请求方实体的 metadata.ambiguous_resolution
+        // A+ 歧义:被跳过的跨文件解析记录到请求方实体的 metadata.ambiguous_resolution
         // (而非强行建一条会误导的边)。消费方既看得到"哪些连接是歧义的、候选有哪些",
         // 又能用候选文件 + import 自行消歧;图本身保持"出现即可信"。
         summary.ambiguous_skipped = resolution.ambiguities.len();
-        if !resolution.ambiguities.is_empty() {
+        let amb_by_holder: HashMap<&EntityId, Vec<serde_json::Value>> = {
             let mut by_holder: HashMap<&EntityId, Vec<serde_json::Value>> = HashMap::new();
             for note in &resolution.ambiguities {
                 by_holder
@@ -306,30 +306,8 @@ impl WorkspaceIndexer {
                         "candidates": note.candidates,
                     }));
             }
-            let mut updated: Vec<Entity> = Vec::new();
-            for entity in &all_entities {
-                if let Some(entries) = by_holder.get(&entity.id) {
-                    let mut entity = entity.clone();
-                    let mut meta = match entity.metadata.clone() {
-                        serde_json::Value::Object(map) => map,
-                        _ => serde_json::Map::new(),
-                    };
-                    meta.insert(
-                        "ambiguous_resolution".into(),
-                        serde_json::Value::Array(entries.clone()),
-                    );
-                    entity.metadata = serde_json::Value::Object(meta);
-                    updated.push(entity);
-                }
-            }
-            if !updated.is_empty() {
-                store.apply_patch(GraphPatch::add(updated, Vec::new()))?;
-            }
-            eprintln!(
-                "[ri-diag] resolve: {} ambiguous cross-file resolutions skipped (A+); recorded in metadata.ambiguous_resolution",
-                resolution.ambiguities.len()
-            );
-        }
+            by_holder
+        };
         eprintln!(
             "[ri-diag] resolve_cross_stack: {} entities → {} edges in {:.2}s; replace_resolved in {:.2}s",
             all_entities.len(),
@@ -348,28 +326,9 @@ impl WorkspaceIndexer {
             .filter(|e| e.kind == EdgeKind::Calls)
             .collect();
         let tld = compute_transitive_loop_depth(&all_entities, &all_calls);
-        let mut tld_updated: Vec<Entity> = Vec::new();
-        for entity in &all_entities {
-            if entity.kind != EntityKind::Method {
-                continue;
-            }
-            let Some(&depth) = tld.get(&entity.id) else { continue };
-            let mut entity = entity.clone();
-            let mut meta = match entity.metadata.clone() {
-                serde_json::Value::Object(map) => map,
-                _ => serde_json::Map::new(),
-            };
-            meta.insert("transitive_loop_depth".into(), json!(depth));
-            entity.metadata = serde_json::Value::Object(meta);
-            tld_updated.push(entity);
-        }
-        let n_tld = tld_updated.len();
-        if !tld_updated.is_empty() {
-            store.apply_patch(GraphPatch::add(tld_updated, Vec::new()))?;
-        }
         eprintln!(
             "[ri-diag] transitive_loop_depth: {} methods, {} calls, in {:.2}s",
-            n_tld,
+            tld.len(),
             all_calls.len(),
             t.elapsed().as_secs_f64()
         );
@@ -385,26 +344,55 @@ impl WorkspaceIndexer {
             .collect();
         let clusters = compute_clusters(&structural);
         let n_clusters_distinct = clusters.values().collect::<std::collections::HashSet<_>>().len();
-        let mut cluster_updated: Vec<Entity> = Vec::new();
+        // 元数据统一合并回填:transitive_loop_depth / cluster_id / ambiguous_resolution
+        // 三路信号一次写入。此前各阶段各自从 resolve 前的快照整行覆盖实体,互相冲键
+        // (如方法既有 tld 又入 cluster 时 tld 被后写阶段抹掉、ambiguous_resolution 被
+        // cluster 阶段整体覆盖),改为单遍合并彻底消除该类丢失。
+        let t_meta = std::time::Instant::now();
+        let mut n_tld = 0;
+        let mut n_cluster = 0;
+        let mut updated: Vec<Entity> = Vec::new();
         for entity in &all_entities {
-            let Some(&cid) = clusters.get(&entity.id) else { continue };
-            let mut entity = entity.clone();
+            let is_method_with_tld =
+                entity.kind == EntityKind::Method && tld.contains_key(&entity.id);
+            if !is_method_with_tld && !clusters.contains_key(&entity.id)
+                && !amb_by_holder.contains_key(&entity.id)
+            {
+                continue;
+            }
             let mut meta = match entity.metadata.clone() {
                 serde_json::Value::Object(map) => map,
                 _ => serde_json::Map::new(),
             };
-            meta.insert("cluster_id".into(), json!(cid));
+            if is_method_with_tld {
+                meta.insert("transitive_loop_depth".into(), json!(tld[&entity.id]));
+                n_tld += 1;
+            }
+            if let Some(&cid) = clusters.get(&entity.id) {
+                meta.insert("cluster_id".into(), json!(cid));
+                n_cluster += 1;
+            }
+            if let Some(entries) = amb_by_holder.get(&entity.id) {
+                meta.insert(
+                    "ambiguous_resolution".into(),
+                    serde_json::Value::Array(entries.clone()),
+                );
+            }
+            let mut entity = entity.clone();
             entity.metadata = serde_json::Value::Object(meta);
-            cluster_updated.push(entity);
+            updated.push(entity);
         }
-        let n_cluster_assigned = cluster_updated.len();
-        if !cluster_updated.is_empty() {
-            store.apply_patch(GraphPatch::add(cluster_updated, Vec::new()))?;
+        let n_meta_rows = updated.len();
+        if !updated.is_empty() {
+            store.apply_patch(GraphPatch::add(updated, Vec::new()))?;
         }
         eprintln!(
-            "[ri-diag] clusters: {} entities → {} clusters, in {:.2}s",
-            n_cluster_assigned,
-            n_clusters_distinct,
+            "[ri-diag] metadata merge-back: {n_meta_rows} rows (tld {n_tld}, cluster {n_cluster}, ambiguous {}) in {:.2}s",
+            resolution.ambiguities.len(),
+            t_meta.elapsed().as_secs_f64()
+        );
+        eprintln!(
+            "[ri-diag] clusters: {n_cluster} entities → {n_clusters_distinct} clusters, in {:.2}s",
             t.elapsed().as_secs_f64()
         );
 
@@ -1384,6 +1372,70 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
                     EvidenceClass::Inferred,
                     0.7,
                     "test class covers target (naming convention)",
+                );
+            }
+            edges.push(edge);
+        }
+    }
+
+    // Tests 边第二推断(P0②):测试类 metadata.imports 的简单名末段若在项目内唯一命中一个
+    // class(排除自身、且不与命名约定路径重复),Inferred 0.6 建立 测试类→被测类。
+    // 简单名多命中 = 跨包同名 → A+ 拒边,记 kind=test_import 歧义注记,消费方可结合
+    // import 全限定名自行消歧(与 calls/implements/superclass 的 A+ 策略同款)。
+    // 仅对测试文件里的 class 生效(判定:@Test 产出的 TestCase 与类同文件)——
+    // metadata.imports 是全类记录的文件级信号,不筛会把普通业务类的 import 图误当覆盖关系。
+    let test_case_files: HashSet<&str> = entities
+        .iter()
+        .filter(|e| e.kind == EntityKind::TestCase)
+        .filter_map(|e| e.evidence.first().map(|ev| ev.file.as_str()))
+        .collect();
+    for entity in entities {
+        if entity.kind != EntityKind::Class {
+            continue;
+        }
+        if !entity
+            .evidence
+            .first()
+            .is_some_and(|ev| test_case_files.contains(ev.file.as_str()))
+        {
+            continue;
+        }
+        let Some(imports) = entity.metadata.get("imports").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let mut candidates: Vec<&str> = imports
+            .iter()
+            .filter_map(|value| value.as_str())
+            .map(|fq| fq.rsplit('.').next().unwrap_or(fq))
+            .collect();
+        candidates.sort_unstable();
+        candidates.dedup();
+        for simple_name in candidates {
+            if entity.name.strip_suffix("Test") == Some(simple_name) {
+                continue; // 命名约定路径已覆盖(XxxTest → Xxx)
+            }
+            let Some(hits) = classes_by_name_all.get(simple_name) else { continue };
+            if hits.len() > 1 {
+                ambiguities.push(AmbiguityNote {
+                    holder: entity.id.clone(),
+                    kind: "test_import",
+                    name: simple_name.to_string(),
+                    candidates: candidate_files(hits),
+                });
+                continue;
+            }
+            if hits[0].id == entity.id {
+                continue;
+            }
+            let mut edge = Edge::new(entity.id.clone(), hits[0].id.clone(), EdgeKind::Tests);
+            if let Some(ev) = entity.evidence.first() {
+                edge = edge.with_evidence(
+                    &ev.file,
+                    ev.start_line,
+                    ev.end_line,
+                    EvidenceClass::Inferred,
+                    0.6,
+                    "test class imports target",
                 );
             }
             edges.push(edge);
