@@ -220,14 +220,14 @@ impl WorkspaceIndexer {
                 .add_entities
                 .iter()
                 .filter(|e| e.kind == EntityKind::Annotation)
-                .filter_map(|e| Some((&e.id, e.name.as_str())))
+                .map(|e| (&e.id, e.name.as_str()))
                 .collect();
             let mut anns_by_owner: HashMap<&EntityId, Vec<&str>> = HashMap::new();
             for edge in &combined.add_edges {
-                if edge.kind == EdgeKind::Annotated {
-                    if let Some(name) = ann_name_by_id.get(&edge.target) {
-                        anns_by_owner.entry(&edge.source).or_default().push(*name);
-                    }
+                if edge.kind == EdgeKind::Annotated
+                    && let Some(name) = ann_name_by_id.get(&edge.target)
+                {
+                    anns_by_owner.entry(&edge.source).or_default().push(*name);
                 }
             }
             let mut embed_seen = std::collections::HashSet::new();
@@ -238,14 +238,14 @@ impl WorkspaceIndexer {
                 .map(|e| {
                     let mut text =
                         format!("{} {} {}", e.kind.as_str(), e.qualified_name, e.name);
-                    if let Some(anns) = anns_by_owner.get(&e.id) {
-                        if !anns.is_empty() {
-                            // 带 @ 前缀,贴近 Java 源码与用户查询习惯。
-                            text.push(' ');
-                            text.push_str(
-                                &anns.iter().map(|a| format!("@{a}")).collect::<Vec<_>>().join(" "),
-                            );
-                        }
+                    if let Some(anns) = anns_by_owner.get(&e.id)
+                        && !anns.is_empty()
+                    {
+                        // 带 @ 前缀,贴近 Java 源码与用户查询习惯。
+                        text.push(' ');
+                        text.push_str(
+                            &anns.iter().map(|a| format!("@{a}")).collect::<Vec<_>>().join(" "),
+                        );
                     }
                     (e.id.clone(), text)
                 })

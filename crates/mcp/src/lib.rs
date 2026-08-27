@@ -1429,7 +1429,7 @@ fn find_hotspots(
             Some((e.clone(), v))
         })
         .collect();
-    items.sort_by(|a, b| b.1.cmp(&a.1));
+    items.sort_by_key(|b| std::cmp::Reverse(b.1));
     let count = items.len() as u64;
     let top: Vec<Value> = items
         .into_iter()
@@ -1471,7 +1471,7 @@ fn get_clusters(store: &SqliteGraphStore, cluster_id: Option<u64>, limit: usize)
         }
     }
     let mut list: Vec<(u64, Vec<&Entity>)> = groups.into_iter().collect();
-    list.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    list.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
     let items: Vec<Value> = list
         .into_iter()
         .take(limit)
