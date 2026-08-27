@@ -7,6 +7,80 @@
 
 ## [Unreleased]
 
+## [0.1.36] - 2026-08-27
+
+对标 codebase-memory 的 P0 四件套收口:①工具响应 token 瘦身 ②只读 SQL 直通查询
+③前端对象参数形式 HTTP 调用识别 ④tests 边真仓库失灵修复。基准项目
+`验证项目/ruoyi-vue-plus`(790 文件全量重提)实测数字见文末快照表。
+
+### Added
+
+- **新工具 `query_sql`**:对索引 SQLite(entity/edge 表)的只读 SQL 直通——SELECT/WITH
+  全自由度(join / 聚合 / CTE),SQL 自由度对标 cb 的 Cypher 查询。安全三重防线:
+  仅 SELECT/WITH 前缀 + 整语句禁止分号(拒堆叠)+ ATTACH/PRAGMA/写关键词黑名单,
+  并以 `PRAGMA query_only` 兜底物理阻断写语义。行数封顶 500(默认 200)、单元格超
+  400 字符截断。
+- **前端对象参数形式 HTTP 调用识别**:`request({url:'/x',method:'get'})`(plus-ui /
+  vue-element-admin 系标准封装)此前漏检(HTTP_CALL 正则只认 `verb('/url')` 位置参数
+  形态)。现 URL 为源码字面量记 Fact 0.9,method 在调用点窗口内匹配、缺省 GET。
+  `/tmp/vue-mini` 端到端链路打通(见 Fixed 下 tests 条目旁的链路证据)。
+- **tests 边双路径**:原命名约定(XxxTest→Xxx)外新增 import 推断路径——测试类
+  `metadata.imports` 末段在项目内唯一命中一个 class 时建立 测试类→被测类 边(Inferred
+  0.6)。import 推断仅对"文件内存在 @Test TestCase 实体"的类生效(**该判定挡掉了朴素
+  实现会产生的 ~1296 条误报**,对照实验数据);多命中跨包同名拒边并记歧义注记
+  kind=test_import(A+ 同策略)。ruoyi 实测 0→1:`DemoUnitTest → CaptchaProperties`
+  (true positive)。
+
+### Fixed
+
+- **存量缺陷:metadata 三阶段回填整行互相覆盖**(重要)。transitive_loop_depth /
+  cluster_id / ambiguous_resolution 此前分三个阶段各写一次实体 metadata,后写阶段整行
+  覆盖前写结果——真库上 transitive_loop_depth 覆盖曾为 **0**(v0.1.34 指标静默失效)、
+  ambiguous_resolution 被 cluster 阶段抹除、Method 同时有 tld 与 cluster_id 时 tld 必丢。
+  现改为单遍合并回填:tld 恢复 **2929/2929**,ambiguous_resolution 存活 **10** 条;新增
+  `[ri-diag] metadata merge-back` 日志行用于诊断。
+
+### Changed
+
+- **MCP 协议变化(消费方可感知)**:trace_* 工具与查询响应默认切换为紧凑视图——边不再
+  携带完整 `evidence[]` 长文本(大响应主因),改 `evidence_count` + 首条证据 file:line
+  锚点(`{confidence,tentative,evidence_count,evidence_first}`);实体默认
+  `{id,kind,name,qualified_name,anchor}` + evidence_count,完整 metadata/evidence 仅
+  在请求带 `verbose=true` 时展开。**默认响应变小是行为变化**:老消费者如需更多细节请传
+  `verbose=true`(全量恢复),或改用新工具 `query_sql` 自由直查;analyze_change 等
+  finding 的证据字段同步走 `compact_evidence` 紧凑策略。
+- **工具描述瘦身**:全部 18 个工具的 description/inputSchema/outputSchema 文案按新基准
+  重写(单工具 description ≤260 字符、property 说明 ≤60 字符)。tools/list 是会话级注入
+  的固定 token 税,新增 `scripts/measure_mcp_tokens.sh` 测量脚本 +
+  守卫测试 `tools_list_stays_under_token_budget`(预算 24576 B)防回涨。
+
+### Performance
+
+- **tools/list**:49845 B(18 工具)→ **22837 B**(**−54%**)。
+- **trace_callees 真库探针**(ruoyi,SysUserServiceImpl depth=2):168269 → **80331 B**
+  (**−52%**),其中 items 部分 57995 → 19591 B。
+
+### ruoyi-vue-plus 指标快照(v0.1.36 全量重提后实测)
+
+| 指标 | 数值 | 口径 |
+|---|---|---|
+| calls 边置信分布 | 2973 @0.7 + 28 @0.5 | 与 v0.1.35 基线完全一致(瘦身/HTTP/tests 改动零回归) |
+| calls 总数 / injects | 3001 / 349 | 0.7=静态或字段精确解析,0.5=裸名注入匹配 |
+| tests 边 | 1(DemoUnitTest→CaptchaProperties) | v0.1.35 为 0;import 推断新增 |
+| superclass_of / implements | 74 / 67 | 继承与实现建模健康 |
+| reads_table / binds_to_statement | 47 / 2 | MyBatis Plus 项目走 reads_table 主径 |
+| annotation 结构化覆盖 | Transactional 40,CacheEvict 16,ConditionalOnProperty 15,Cacheable 12,EventListener 10 | 共 109 个注解实体 |
+| transitive_loop_depth 覆盖 | 2929/2929 methods | 回填修复前曾为 0 |
+| ambiguous_resolution 存活 | 10 entities | 回填修复前被抹除 |
+| 复杂度热点 top | setColumnFeatureContext cx31/tld33,initColumnField cx29 | 热点信号可用 |
+| 架构聚类 | 最大 cluster 88 成员;聚类实体共 582 | label propagation |
+| 类→表可达 | 45 类经调用/注入/继承链抵达表;27/31 张表可从类侧触达 | 含 declares+superclass_of |
+| 基类下钻 | BaseController 经 superclass_of 连通 30 子类,BFS 触达 928 方法 | trace_callees 自动下钻口径 |
+| exception_flow 提取覆盖 | 104 entities(metadata) | throws/handles 边 0 为已知限制(catch JDK 异常) |
+| body_end_line | 正常(76/37/53/68/81 抽样) | 行号冗余列随 json 走 |
+| entity 平均 json 大小 | 751.8 → 798.3 B(+6.2%) | class/interface 记录 imports 所致,信号换成本 |
+| /tmp/vue-mini 端到端 | http_client_call GET /api/users/list → matches_endpoint → http_endpoint → method list → listUsers → queryUsers → xml_statement → table sys_user | matches_endpoint 打通前端第一跳 |
+
 ## [0.1.33] - 2026-08-04
 
 ### Added

@@ -36,11 +36,22 @@ sqlite3 "$DB" "SELECT json_extract(json,'\$.evidence[0].confidence'), COUNT(*) F
 - **节点复杂度属性(v0.1.34)**:`SELECT name, json_extract(json,'\$.metadata.complexity') cx, json_extract(json,'\$.metadata.loop_depth') ld, json_extract(json,'\$.metadata.transitive_loop_depth') tld FROM entity WHERE kind='method' ORDER BY json_extract(json,'\$.metadata.complexity') DESC LIMIT 10;` —— complexity(cyclomatic)/loop_count/loop_depth(单函数)+ transitive_loop_depth(沿 CALLS 固定点传播,跨函数 O(n²) 探测器)。对标 codebase-memory Q4 热点;tld > own loop_depth 的方法是"局部无害但调用链深"的 cb 杀手锏信号。
 - **架构聚类(v0.1.34)**:`SELECT json_extract(json,'\$.metadata.cluster_id') cid, COUNT(*) n FROM entity WHERE json_extract(json,'\$.metadata.cluster_id') IS NOT NULL GROUP BY cid ORDER BY n DESC LIMIT 10;` —— label propagation 在 calls/injects/declares/superclass_of/implements 图上跑(对标 cb Leiden),识别跨文件夹的"事实模块"。大 cluster 应对应 module(ruoyi 验证:cluster 2=ruoyi-demo、cluster 4=ruoyi-workflow 全内聚)。
 - **异常流边(v0.1.35)**:`SELECT kind, COUNT(*) FROM edge WHERE kind IN ('throws','handles') GROUP BY kind;` —— method throws/catch 解析到 class/interface 实体;`SELECT COUNT(*) FROM entity WHERE json_extract(json,'\$.metadata.exception_flow') IS NOT NULL;` 看提取覆盖。**注意**:catch JDK 异常(Exception/IllegalStateException)的项目 throws/handles 边为 0(异常类型非项目 class),需项目自定义异常链(mes/mos 金融项目)才能端到端验证连通;提取层(metadata.exception_flow 覆盖)仍可查。
+- **tests 边(v0.1.36 双路径)**:`SELECT COUNT(*) FROM edge WHERE kind='tests';` + 成对名单(见下方模板)。两条推断路径:命名约定 0.7 / import 推断 0.6(Inferred)。import 推断**仅对"文件内存在 @Test TestCase 实体"的类**做,多命中跨包同名记歧义注记 kind=test_import 并拒边(A+ 同策略)。朴素全类 import 推断会产生 ~1296 条误报,判定必须保留。
+  ```bash
+  sqlite3 "$DB" "SELECT s.name, t.name FROM edge e JOIN entity s ON s.id=e.source_id JOIN entity t ON t.id=e.target_id WHERE e.kind='tests';"
+  ```
+- **MCP token 预算(v0.1.36)**:`./scripts/measure_mcp_tokens.sh` 测量 tools/list 字节,**预算 ≤24576**(守卫测试 `tools_list_stays_under_token_budget` 防回涨;v0.1.36 实测 22837/18 工具)。工具描述是会话级注入的固定 token 税——加新工具时文案守基准(单工具 description 短句,inputSchema/outputSchema property 说明 ≤60 字符),发现超预算先砍 outputSchema 文案。
+- **trace/query 默认紧凑视图(v0.1.36)**:trace_* 与 query 边/实体默认紧凑档——边 `{confidence,tentative,evidence_count,evidence_first}`,实体 `{id,kind,name,qualified_name,anchor}` + evidence_count,**完整 metadata/evidence[] 仅 `verbose=true` 展开**。旧口径的大响应字节数与新口径不可直接对比;对比性能指标时必须同版本对测。ruoyi 实测 trace_callees(SysUserServiceImpl depth=2):168269 → 80331 B。
+- **对象形态 HTTP(v0.1.36)**:`request({url:'/x',method:'get'})`(plus-ui 标准封装)语义层已识别(Fact 0.9);fixture 口令提示:HTTP_CALL 正则变更后增量扫描不会重提旧文件,需换库强制全量重提才反映:
+  ```bash
+  rm -rf /tmp/vue-mini/.repo-intelligence && cargo run -q -p repo-intelligence -- scan /tmp/vue-mini --database /tmp/vue-mini/.repo-intelligence/workspace.sqlite
+  # 验收:http_client_call 存在 GET /api/users/list + matches_endpoint 边到 http_endpoint
+  ```
 
 ## 构建 / 测试
 
 - `cargo test` —— 全 workspace 单元/集成测试(**不替代**上面的真实项目验证)。
-- 版本号:根 `Cargo.toml` `[workspace.package] version`(当前 0.1.35),所有 crate `version.workspace = true`。
+- 版本号:根 `Cargo.toml` `[workspace.package] version`(当前 0.1.36),所有 crate `version.workspace = true`。
 - 提交风格:`release vX.Y.Z: ...`(见 git log)。
 
 ## 项目结构
