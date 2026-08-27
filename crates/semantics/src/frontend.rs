@@ -39,6 +39,15 @@ static HTTP_CALL_VAR: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
+// 对象参数形式:request({ url: '/x', method: 'get' })(plus-ui/vue-element-admin 主流封装)。
+// 只负责找 url:,谓词部分(动词缺省 GET)在提取循环里对该调用点的局部窗口二次匹配,
+// 避免"method 出现在 url 前"或中间隔字段时一条正则抓不全。
+static OBJECT_URL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\b[\w$][\w$.]*\(\s*\{[^{}]{0,400}?url\s*:\s*["'`]([^"'`]+)["'`]"#).unwrap()
+});
+static METHOD_IN_WINDOW: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\bmethod\s*:\s*["'`](get|post|put|delete|patch)["'`]"#).unwrap()
+});
 
 pub struct FrontendExtractor;
 
@@ -58,6 +67,15 @@ impl SemanticExtractor for FrontendExtractor {
         extract_frontend(file, path, entities, edges, ctx.config);
         Ok(())
     }
+}
+
+/// 下取整到最近的 UTF-8 字符边界(Rust stable 无 floor_char_boundary)。
+/// 正则给出的偏移本应是边界,此处对 +200 的窗口截断点兜底,防多字节字符劈半 panic。
+fn floor_boundary(content: &str, mut idx: usize) -> usize {
+    while idx > 0 && !content.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
 }
 
 /// 判断前端属性访问 `a.b` 的 b 是否「像业务字段」而非工具方法/常量。
@@ -189,5 +207,90 @@ fn extract_frontend(
             "frontend HTTP call via constant URL",
         );
         add_contained(file, path, call, line, entities, edges);
+    }
+    // 对象参数形式(P0①):url 为字面量(Fact 0.9),method 在调用点窗口内找,缺省 GET。
+    for capture in OBJECT_URL.captures_iter(&file.content) {
+        let matched = capture.get(0).unwrap();
+        let window_end =
+            floor_boundary(&file.content, (matched.end() + 200).min(file.content.len()));
+        let window = &file.content[floor_boundary(&file.content, matched.end())..window_end];
+        let verb = METHOD_IN_WINDOW
+            .captures(window)
+            .map(|m| m[1].to_uppercase())
+            .unwrap_or_else(|| "GET".into());
+        let url = normalize_path(&capture[1]);
+        let name = format!("{verb} {url}");
+        let line = line_of(&file.content, matched.start());
+        let call = Entity::new(
+            EntityId::stable("workspace", path, EntityKind::HttpClientCall, &name, ""),
+            EntityKind::HttpClientCall,
+            &name,
+            format!("{path}#{name}"),
+        )
+        .with_metadata(json!({"method": verb, "path": url}))
+        .with_evidence(
+            path,
+            line,
+            line,
+            EvidenceClass::Fact,
+            0.9,
+            "frontend HTTP call (object-literal URL)",
+        );
+        add_contained(file, path, call, line, entities, edges);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn js_file(name: &str, body: &str) -> SourceFile {
+        SourceFile {
+            id: EntityId::stable("workspace", name, EntityKind::File, name, ""),
+            relative_path: PathBuf::from(name),
+            kind: FileKind::JavaScript,
+            content_hash: "test".into(),
+            content: body.to_string(),
+        }
+    }
+
+    fn extract_calls(file: &SourceFile) -> Vec<Entity> {
+        let config = SemanticsConfig::default();
+        let mut entities = Vec::new();
+        let mut edges = Vec::new();
+        extract_frontend(file, "src/api/user.js", &mut entities, &mut edges, &config);
+        entities
+            .into_iter()
+            .filter(|e| e.kind == EntityKind::HttpClientCall)
+            .collect()
+    }
+
+    #[test]
+    fn object_form_http_call_is_extracted() {
+        // plus-ui/vue-element-admin 标准封装形态:对象参数携带 url + method。
+        let src = r#"
+import request from '@/utils/request'
+export function fetchUsers(params) {
+  return request({ url: '/api/users/list', method: 'get', params })
+}
+"#;
+        let file = js_file("src/api/user.js", src);
+        let calls = extract_calls(&file);
+        assert_eq!(calls.len(), 1, "{:#?}", calls);
+        assert_eq!(calls[0].name, "GET /api/users/list");
+        let ev = calls[0].evidence.first().unwrap();
+        assert_eq!(ev.classification, EvidenceClass::Fact);
+        assert!((ev.confidence - 0.9).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn object_form_defaults_to_get_when_method_absent() {
+        // method 缺省时按 GET 处理(GET 是 axios 默认方法)。
+        let src = r#"request({ url: "/a/b" });"#;
+        let file = js_file("src/api/user.js", src);
+        let calls = extract_calls(&file);
+        assert_eq!(calls.len(), 1, "{:#?}", calls);
+        assert_eq!(calls[0].name, "GET /a/b");
     }
 }
