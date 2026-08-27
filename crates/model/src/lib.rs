@@ -451,6 +451,14 @@ pub struct ImpactFinding {
     pub evidence: Vec<Evidence>,
 }
 
+/// query_sql 的返回:列名 + 已序列化为 JSON 的行 + 是否截断。
+#[derive(Debug, Clone)]
+pub struct QueryResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<serde_json::Value>>,
+    pub truncated: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ImpactReport {
     pub findings: Vec<ImpactFinding>,

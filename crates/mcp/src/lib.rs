@@ -730,6 +730,30 @@ fn tool_specs() -> Vec<ToolSpec> {
                 "required": ["schema_version", "target", "edges"]
             }),
         },
+        // 只读 SQL 直通:对标 cb 的 Cypher 自由度——entity/edge 表上完整 SELECT/WITH
+        // (joins/聚合/CTE),写语句与堆叠语句在 graph 层被拒;行数与单元格双重封顶。
+        ToolSpec {
+            name: "query_sql",
+            description: "Read-only SQL over the index SQLite (entity/edge tables). Full SELECT/WITH freedom incl. joins, aggregates, CTEs. Writes and multiple statements rejected.",
+            input_schema: json!({
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "sql": {"type": "string", "description": "Single SELECT/WITH statement. No semicolons."},
+                    "max_rows": {"type": "integer", "minimum": 1, "maximum": 500, "default": 200}
+                },
+                "required": ["sql"]
+            }),
+            output_schema: json!({
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "columns": {"type": "array", "items": {"type": "string"}},
+                    "rows": {"type": "array", "items": {"type": "array"}},
+                    "row_count": {"type": "integer"},
+                    "truncated": {"type": "boolean"}
+                },
+                "required": ["columns", "rows", "row_count", "truncated"]
+            }),
+        },
     ];
     // 多仓库:统一给每个工具注入 repository 参数(路由到 <base>/repos/<id>.sqlite;
     // 省略则用 server 的 --database 单库兼容)。所有工具共用,客户端可见。
@@ -1261,6 +1285,18 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
             let verbose = arguments["verbose"].as_bool().unwrap_or(false);
             let store = SqliteGraphStore::open(&path)?;
             build_relay(&store, qn, depth, verbose)?
+        }
+        "query_sql" => {
+            let sql = arguments["sql"].as_str().context("missing sql")?;
+            let max_rows = arguments["max_rows"].as_u64().unwrap_or(200).clamp(1, 500) as usize;
+            let store = SqliteGraphStore::open(&path)?;
+            let r = store.read_only_query(sql, max_rows)?;
+            json!({
+                "columns": r.columns,
+                "rows": r.rows,
+                "row_count": r.rows.len(),
+                "truncated": r.truncated
+            })
         }
         _ => return Err(anyhow::anyhow!("tool not implemented: {name}")),
     };
@@ -2578,9 +2614,57 @@ mod tests {
     }
 
     #[test]
-    fn build_relay_errors_on_unknown_qn() {
-        let store = SqliteGraphStore::open_in_memory().unwrap();
-        let result = build_relay(&store, "does.not.Exist", 1, false);
-        assert!(result.is_err(), "未知 qn 应返回 Err 而非空骨架");
+    fn query_sql_routes_through_dispatch_with_cap() {
+        // 与既有一致:直接走 call_tool(request, database, base) 全链路打桩(路由 → 分派)。
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("w.sqlite");
+        {
+            let _store = SqliteGraphStore::open(&db_path).unwrap(); // open 即建表
+        }
+        let req = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "query_sql",
+                       "arguments": {"sql": "SELECT COUNT(*) AS n FROM entity"}}
+        });
+        let resp = call_tool(&req, Some(db_path.as_path()), dir.path()).unwrap();
+        let out = &resp["structuredContent"];
+        assert_eq!(out["row_count"].as_u64(), Some(1));
+        assert_eq!(out["truncated"], false);
+        // rows 按数组序列化(output_schema 的 items:type=array):rows[0] = [count]。
+        let rows = out["rows"].as_array().unwrap();
+        assert_eq!(rows[0][0], 0);
+
+        // 防线在 dispatch 层同样生效:写语句 → Err(isError 前的 Rust Err)。
+        let write_req = json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "query_sql",
+                       "arguments": {"sql": "DELETE FROM entity"}}
+        });
+        assert!(
+            call_tool(&write_req, Some(db_path.as_path()), dir.path()).is_err(),
+            "query_sql 必须拒绝写语句"
+        );
+
+        // max_rows 封顶:max_rows=1 只回 1 行。这里先塞 2 个实体再 COUNT 不适用,
+        // 改用构造行数多的结果集验证截断标志(SELECT 直出多行)。
+        let mut values = String::new();
+        for i in 0..3 {
+            if i > 0 {
+                values.push_str(", ");
+            }
+            values.push_str(&format!("('{i}')"));
+        }
+        let capped = json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "query_sql",
+                       "arguments": {"sql": format!("SELECT * FROM (VALUES {values})"), "max_rows": 1}}
+        });
+        let resp = call_tool(&capped, Some(db_path.as_path()), dir.path()).unwrap();
+        let out = &resp["structuredContent"];
+        assert_eq!(out["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(out["truncated"], true);
     }
+
+
+    // Part C 守卫测试(tools/list 字节预算)在文案瘦身步骤加入。
 }

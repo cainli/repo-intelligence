@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use repo_intelligence_model::{Edge, Entity, EntityId, GraphPatch, SearchQuery, TraverseQuery};
+use repo_intelligence_model::{
+    Edge, Entity, EntityId, GraphPatch, QueryResult, SearchQuery, TraverseQuery,
+};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 #[derive(Clone, Debug)]
@@ -179,6 +181,77 @@ impl SqliteGraphStore {
             counts.insert(kind, count);
         }
         Ok(counts)
+    }
+
+    /// 只读 SQL 直通(query_sql 工具的后端)。语句级防线:
+    /// ① trim 后必须以 select/with 开头(大小写不敏感);
+    /// ② 整条语句不允许出现分号(拒绝堆叠语句;子查询不需要分号);
+    /// ③ 写入关键词黑名单双保险(insert/update/delete/drop/alter/attach/pragma/create/…);
+    /// ④ 行数超 max_rows 截断并把 truncated=true,单元格文本超 400 字符截断。
+    /// query_only PRAGMA 兜底:仅本次调用期间打开,物理阻断任何写语义。
+    pub fn read_only_query(&self, sql: &str, max_rows: usize) -> Result<QueryResult> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        let lower = trimmed.to_ascii_lowercase();
+        anyhow::ensure!(
+            lower.starts_with("select") || lower.starts_with("with"),
+            "only SELECT/WITH statements are allowed"
+        );
+        anyhow::ensure!(
+            !trimmed.contains(';'),
+            "multiple statements are not allowed"
+        );
+        for banned in [
+            "insert ", "update ", "delete ", "drop ", "alter ", "attach ", "pragma ", "create ",
+            "vacuum ", "reindex ",
+        ] {
+            anyhow::ensure!(
+                !lower.contains(banned),
+                "keyword {banned:?} is not allowed in read-only queries"
+            );
+        }
+        // SqliteGraphStore 持单 Connection 且无锁:PRAGMA query_only ON → 查询 → OFF
+        // 必须同一次调用内完成,query_only 只在本方法执行窗口内生效。
+        self.connection.execute_batch("PRAGMA query_only = ON")?;
+        let result = self.run_select(trimmed, max_rows);
+        self.connection.execute_batch("PRAGMA query_only = OFF")?;
+        result
+    }
+
+    fn run_select(&self, sql: &str, max_rows: usize) -> Result<QueryResult> {
+        use rusqlite::types::ValueRef;
+        let mut stmt = self.connection.prepare(sql)?;
+        let columns: Vec<String> =
+            stmt.column_names().iter().map(|c| c.to_string()).collect();
+        let mut rows = Vec::new();
+        let mut truncated = false;
+        let mut rows_iter = stmt.query([])?;
+        while let Some(row) = rows_iter.next()? {
+            if rows.len() >= max_rows {
+                truncated = true;
+                break;
+            }
+            let mut out = Vec::with_capacity(columns.len());
+            for idx in 0..columns.len() {
+                out.push(match row.get_ref(idx)? {
+                    ValueRef::Null => serde_json::Value::Null,
+                    ValueRef::Integer(v) => serde_json::json!(v),
+                    ValueRef::Real(v) => serde_json::json!(v),
+                    ValueRef::Text(t) => {
+                        let mut s = String::from_utf8_lossy(t).to_string();
+                        if s.chars().count() > 400 {
+                            // 字符边界安全截断:先按 chars 取前 200(直接 &s[..200] 字节切片
+                            // 会在多字节字符中间 panic —— json/evidence 里中文注释很常见)。
+                            let head: String = s.chars().take(200).collect();
+                            s = format!("{}…({} chars)", head, s.chars().count());
+                        }
+                        serde_json::json!(s)
+                    }
+                    ValueRef::Blob(b) => serde_json::json!(format!("<blob {} bytes>", b.len())),
+                });
+            }
+            rows.push(out);
+        }
+        Ok(QueryResult { columns, rows, truncated })
     }
 
     fn initialize(&self) -> Result<()> {
