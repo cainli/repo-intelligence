@@ -39,46 +39,22 @@ struct ToolSpec {
     output_schema: Value,
 }
 
-fn evidence_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-            "file": {"type": "string"},
-            "start_line": {"type": "integer", "minimum": 0},
-            "end_line": {"type": "integer", "minimum": 0},
-            "classification": {
-                "type": "string",
-                "enum": ["fact", "resolved", "inferred", "runtime_unknown"]
-            },
-            "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-            "reason": {"type": "string"}
-        },
-        "required": ["file", "start_line", "end_line", "classification", "confidence", "reason"]
-    })
-}
-
 fn entity_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
             "id": {"type": "string"},
-            "kind": {
-                "type": "string",
-                "enum": [
-                    "workspace", "repository", "submodule", "file", "package",
-                    "class", "interface", "method", "field", "vue_page", "vue_component",
-                    "frontend_field", "http_client_call", "http_endpoint", "api_field",
-                    "spring_bean", "mapper", "mapper_method", "xml_statement", "result_map",
-                    "sql_field", "datasource", "database", "table", "column", "test_case",
-                    "config_file"
-                ]
-            },
+            // kind 声明为普通 string(同 edge_schema):枚举全集见 EntityKind::as_str,
+            // 内联展开会让 tools/list 重复缴 token 税。
+            "kind": {"type": "string"},
             "name": {"type": "string"},
             "qualified_name": {"type": "string"},
             "metadata": {},
-            "evidence": {"type": "array", "items": evidence_schema()}
+            // evidence 的字段结构不再全量内联(预算);结构见
+            // repo-intelligence-model::Evidence(file/start_line/end_line/
+            // classification/confidence/reason/snippet)。
+            "evidence": {"type": "array", "items": {"type": "object"}}
         },
         "required": ["id", "kind", "name", "qualified_name", "metadata", "evidence"]
     })
@@ -98,18 +74,18 @@ fn trace_entity_schema() -> Value {
             "kind": {"type": "string"},
             "name": {"type": "string"},
             "qualified_name": {"type": "string"},
-            "evidence_count": {"type": "integer", "minimum": 0},
+            "evidence_count": {"type": "integer"},
             "anchor": {
                 "type": "object",
-                "additionalProperties": false,
                 "properties": {
                     "file": {"type": "string"},
-                    "start_line": {"type": "integer", "minimum": 0}
-                },
-                "required": ["file", "start_line"]
+                    "start_line": {"type": "integer"}
+                }
             },
             "metadata": {},
-            "evidence": {"type": "array", "items": evidence_schema()}
+            // 预算:items 收敛为 object(evidence 的字段结构只在 entity_schema 一处
+            // 全量声明;此 schema 随 4 个 trace 工具重复序列化,内联展开代价 ×4)。
+            "evidence": {"type": "array", "items": {"type": "object"}}
         },
         "required": ["id", "kind", "name", "qualified_name", "evidence_count"]
     })
@@ -160,30 +136,23 @@ fn edge_schema() -> Value {
         "properties": {
             "source": {"type": "string"},
             "target": {"type": "string"},
-            "kind": {
-                "type": "string",
-                "enum": [
-                    "contains", "declares", "calls", "exposes", "sends_http_request",
-                    "matches_endpoint", "has_response_field", "serialized_from", "mapped_from",
-                    "binds_to_statement", "reads_table", "writes_table",
-                    "reads_column", "writes_column", "depends_on", "injects", "submodule_of",
-                    "annotated", "intercepts", "tests", "implements", "schedules", "superclass_of"
-                ]
-            },
-            "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            // kind 声明为普通 string(与 trace_entity_schema 的实体 kind 同理):
+            // 此 schema 随 4 个 trace 工具重复序列化,23 项枚举展开是 tools/list 税,
+            // 实际取值集合见 repo-intelligence-model::EdgeKind::as_str。
+            "kind": {"type": "string"},
+            "confidence": {"type": "number"},
             "tentative": {"type": "boolean"},
             // 紧凑档(默认)只带 evidence_count + 首条证据锚点;完整 evidence[]
-            // 仅在 trace 工具 verbose=true 时出现(故从 required 移除)。
-            "evidence": {"type": "array", "items": evidence_schema()},
-            "evidence_count": {"type": "integer", "minimum": 0},
+            // 仅在 trace 工具 verbose=true 时出现(故从 required 移除)。items 收敛
+            // 为 object(同 trace_entity_schema 的预算理由;字段结构见 entity_schema)。
+            "evidence": {"type": "array", "items": {"type": "object"}},
+            "evidence_count": {"type": "integer"},
             "evidence_first": {
                 "type": "object",
-                "additionalProperties": false,
                 "properties": {
                     "file": {"type": "string"},
-                    "start_line": {"type": "integer", "minimum": 0}
-                },
-                "required": ["file", "start_line"]
+                    "start_line": {"type": "integer"}
+                }
             }
         },
         "required": ["source", "target", "kind", "confidence", "tentative", "evidence_count"]
@@ -199,52 +168,19 @@ fn tool_specs() -> Vec<ToolSpec> {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "query": {
-                "type": "string",
-                "description": "Search text: an entity name, qualified name, or substring. Matches indexed entity names/qualified names (case-insensitive substring); not annotations, comments, or natural language."
-            },
-            "limit": {
-                "type": "integer",
-                "minimum": 1,
-                "default": 100,
-                "description": "Maximum number of entities to return in this page."
-            },
-            "offset": {
-                "type": "integer",
-                "minimum": 0,
-                "default": 0,
-                "description": "Number of matches to skip before the first returned row. Page through wide matches (e.g. an enterprise ID naming dozens of entities) with limit/offset instead of one huge batch."
-            },
+            "query": {"type": "string"},
+            "limit": {"type": "integer", "minimum": 1, "default": 100},
+            "offset": {"type": "integer", "minimum": 0, "default": 0},
             "verbose": {
                 "type": "boolean",
                 "default": false,
-                "description": "When true, return full entities (metadata + evidence[] with reason strings). Default false returns a compact {id, kind, name, qualified_name, evidence_count} view so a wide match stays small; pass verbose=true only for the few items you want to inspect."
+                "description": "Compact views by default; verbose=true expands metadata+evidence."
             },
-            "kind": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Restrict matches to these entity kinds, e.g. [\"class\",\"method\"] or [\"spring_bean\"]. Default: any kind. Use to filter out field/column noise when a wide identifier (an enterprise ID that names many fields of a Req/Resp class) otherwise matches dozens of low-value entities."
-            },
-            "min_complexity": {
-                "type": "integer",
-                "minimum": 0,
-                "description": "Drop methods whose cyclomatic complexity < this. Non-method entities (no complexity metadata) are dropped too. Pairs with sort_by to find hot methods within a name match."
-            },
-            "min_transitive_loop_depth": {
-                "type": "integer",
-                "minimum": 0,
-                "description": "Drop methods whose transitive_loop_depth (worst-case loop nesting along the call chain) < this. Surfaces methods that look harmless locally but reach deep loops transitively."
-            },
-            "min_loop_depth": {
-                "type": "integer",
-                "minimum": 0,
-                "description": "Drop methods whose own loop_depth < this."
-            },
-            "sort_by": {
-                "type": "string",
-                "enum": ["complexity", "transitive_loop_depth", "loop_depth"],
-                "description": "Re-rank the matched window by this complexity metric (descending), overriding the default relevance order. Use to surface the hottest method among name matches."
-            }
+            "kind": {"type": "array", "items": {"type": "string"}},
+            "min_complexity": {"type": "integer", "minimum": 0},
+            "min_transitive_loop_depth": {"type": "integer", "minimum": 0},
+            "min_loop_depth": {"type": "integer", "minimum": 0},
+            "sort_by": {"type": "string", "enum": ["complexity", "transitive_loop_depth", "loop_depth"]}
         },
         "required": ["query"]
     });
@@ -252,11 +188,11 @@ fn tool_specs() -> Vec<ToolSpec> {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "items": {"type": "array", "description": "Compact entity views by default; full entities when verbose=true."},
-            "count": {"type": "integer", "minimum": 0, "description": "Number of items in this page (not the total match count)."},
+            "items": {"type": "array"},
+            "count": {"type": "integer", "minimum": 0, "description": "Items in this page."},
             "limit": {"type": "integer", "minimum": 0},
             "offset": {"type": "integer", "minimum": 0},
-            "has_more": {"type": "boolean", "description": "true if another page likely exists at offset+limit."},
+            "has_more": {"type": "boolean"},
             "hint": {"type": "string"}
         },
         "required": ["items", "count", "limit", "offset", "has_more"]
@@ -272,51 +208,24 @@ fn tool_specs() -> Vec<ToolSpec> {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "name": {
-                "type": "string",
-                "description": "Exact entity name to trace from (e.g. a class or method name). The start point is resolved by exact name match, not substring; use search_entities first if unsure of the exact name."
-            },
-            "depth": {
-                "type": "integer",
-                "minimum": 0,
-                "default": 2,
-                "description": "How many edge hops to follow. 0 returns only the start entity itself."
-            },
+            "name": {"type": "string"},
+            "depth": {"type": "integer", "minimum": 0, "default": 2},
             "edge_kinds": {
                 "type": "array",
-                "items": {
-                    "type": "string",
-                    "enum": [
-                        "contains", "declares", "calls", "exposes", "sends_http_request",
-                        "matches_endpoint", "has_response_field", "serialized_from", "mapped_from",
-                        "binds_to_statement", "reads_table", "writes_table",
-                        "reads_column", "writes_column", "depends_on", "injects", "submodule_of",
-                        "annotated", "intercepts", "tests", "implements", "schedules", "superclass_of"
-                    ]
-                },
+                "items": {"type": "string"},
                 "default": ["calls", "injects", "declares", "superclass_of"],
-                "description": "Edge kinds to follow. Defaults to [\"calls\",\"injects\",\"declares\",\"superclass_of\"]: calls+injects for the call chain, declares so a trace starting from a class drills into its methods, superclass_of so a trace from a base/abstract class reaches concrete subclasses (business logic is usually in the subclass). Pass e.g. [\"depends_on\"] for table deps or [\"reads_table\",\"writes_table\"] for data flow."
+                "description": "Edge kinds to follow (see trace defaults)."
             },
             "min_confidence": {
                 "type": "number",
                 "minimum": 0.0,
                 "maximum": 1.0,
                 "default": 0.0,
-                "description": "Drop edges whose confidence is below this. Default 0 returns all edges (low-confidence ones still returned but marked `tentative`). Use e.g. 0.8 to keep only well-evidenced edges."
+                "description": "Drop edges below this confidence. Default 0 keeps all."
             },
             "verbose": {"type": "boolean", "default": false, "description": "Include full evidence[] per edge."},
-            "limit": {
-                "type": "integer",
-                "minimum": 1,
-                "default": 50,
-                "description": "Pagination cap: max entities AND edges returned per page (each truncated independently at offset..offset+limit). Prevents the context explosion that depth-large traces cause. Page with offset."
-            },
-            "offset": {
-                "type": "integer",
-                "minimum": 0,
-                "default": 0,
-                "description": "Number of entities/edges to skip before the first returned row (pagination)."
-            }
+            "limit": {"type": "integer", "minimum": 1, "default": 50},
+            "offset": {"type": "integer", "minimum": 0, "default": 0}
         },
         "required": ["name"]
     });
@@ -326,10 +235,10 @@ fn tool_specs() -> Vec<ToolSpec> {
         "properties": {
             "items": {"type": "array", "items": trace_entity_schema()},
             "edges": {"type": "array", "items": edge_schema()},
-            "count": {"type": "integer", "minimum": 0, "description": "Items in this page."},
-            "total_items": {"type": "integer", "minimum": 0, "description": "Total reachable entities (across all pages)."},
-            "total_edges": {"type": "integer", "minimum": 0, "description": "Total reachable edges (across all pages)."},
-            "has_more": {"type": "boolean", "description": "true if another page likely exists at offset+limit."},
+            "count": {"type": "integer", "minimum": 0},
+            "total_items": {"type": "integer", "minimum": 0},
+            "total_edges": {"type": "integer", "minimum": 0},
+            "has_more": {"type": "boolean"},
             "limit": {"type": "integer"},
             "offset": {"type": "integer"},
             "start_count": {"type": "integer", "minimum": 0},
@@ -341,11 +250,12 @@ fn tool_specs() -> Vec<ToolSpec> {
     let mut specs = vec![
         ToolSpec {
             name: "scan_workspace",
-            description: "Index a workspace into the local system graph. Returns a health report (entity counts by kind and the excluded-directory list).",
+            description: "Index a workspace. Returns counts by kind + excluded dirs.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
+                    // 短句保留(scan 的根路径语义;v0.1.36 预算规则:>100 字符才必砍)。
                     "workspace": {
                         "type": "string",
                         "default": ".",
@@ -372,25 +282,25 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "search_entities",
-            description: "Search indexed entities by name or qualified name (case-insensitive substring). For concept/meaning matches (e.g. find login methods when searching 'authenticate') use semantic_search instead. Returns matches of any kind.",
+            description: "Substring search across indexed entities. Semantic/concept matching: use semantic_search instead.",
             input_schema: search_input.clone(),
             output_schema: search_output.clone(),
         },
         ToolSpec {
             name: "find_endpoint",
-            description: "Find HTTP/RPC endpoints by path or name. Only returns endpoint kinds (http_endpoint, http_client_call, api_field). Recognizes Spring MVC mappings and configured RPC annotations (@RmbMap, @DubboService).",
+            description: "Find HTTP endpoints/client-calls/api-fields by path or name. Spring MVC mappings recognized.",
             input_schema: search_input.clone(),
             output_schema: search_output.clone(),
         },
         ToolSpec {
             name: "semantic_search",
-            description: "Semantic search over entities by MEANING (not substring) — find login/auth entities when you search 'authenticate'. Uses a bundled local ONNX model (384-dim cosine). For substring/exact-name matches use search_entities instead. Requires embedding enabled (default on) + prior scan_workspace.",
+            description: "Meaning-based search (bundled local ONNX embeddings, cosine top-k). Needs embedding enabled + prior scan.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "query": {"type": "string", "description": "Natural-language or concept query; embedded and matched by cosine similarity."},
-                    "limit": {"type": "integer", "minimum": 1, "default": 20, "description": "Max entities (top-k by similarity) to return."}
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "default": 20}
                 },
                 "required": ["query"]
             }),
@@ -398,7 +308,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "items": {"type": "array", "description": "Top-k entities, each {entity, score}."},
+                    "items": {"type": "array"},
                     "count": {"type": "integer", "minimum": 0},
                     "query": {"type": "string"},
                     "hint": {"type": "string"}
@@ -408,7 +318,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "find_hotspots",
-            description: "Find methods with the highest complexity / loop nesting (codebase-memory Q4 equivalent). Default metric transitive_loop_depth = worst-case loop nesting along the call chain; surfaces methods that look harmless locally but reach deep loops transitively (cross-function O(n²) detector). metric=complexity for cyclomatic, loop_depth for own nesting, linear_scan_in_loop for in-loop contains/indexOf scans.",
+            description: "Rank methods by complexity metrics. Default transitive_loop_depth catches cross-function O(n^2) drivers.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -416,22 +326,17 @@ fn tool_specs() -> Vec<ToolSpec> {
                     "metric": {
                         "type": "string",
                         "enum": ["transitive_loop_depth", "complexity", "loop_depth", "linear_scan_in_loop"],
-                        "default": "transitive_loop_depth",
-                        "description": "Which complexity metric to rank by."
+                        "default": "transitive_loop_depth"
                     },
-                    "min_value": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "Optional lower bound; methods scoring below are filtered out."
-                    },
-                    "limit": {"type": "integer", "minimum": 1, "default": 10, "description": "Max methods to return (top-k)."}
+                    "min_value": {"type": "integer", "minimum": 0},
+                    "limit": {"type": "integer", "minimum": 1, "default": 10}
                 }
             }),
             output_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "items": {"type": "array", "description": "Top-k methods, each {entity, score}; entity includes metadata with all complexity fields."},
+                    "items": {"type": "array"},
                     "count": {"type": "integer", "minimum": 0},
                     "metric": {"type": "string"}
                 },
@@ -440,20 +345,20 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "get_clusters",
-            description: "Architecture clusters (label-propagation communities over calls/injects/declares/superclass_of/implements) — codebase-memory Leiden equivalent. Reveals de-facto modules that often cut across the folder layout. No cluster_id: list clusters by size with representative entities. With cluster_id: list that cluster's members.",
+            description: "Architecture communities (label propagation over calls/injects/declares/superclass_of/implements). Omit cluster_id to list clusters; else list members.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "cluster_id": {"type": "integer", "minimum": 0, "description": "Optional: return members of this cluster. Omit to list all clusters by size."},
-                    "limit": {"type": "integer", "minimum": 1, "default": 20, "description": "Max clusters (or members) to return."}
+                    "cluster_id": {"type": "integer", "minimum": 0},
+                    "limit": {"type": "integer", "minimum": 1, "default": 20}
                 }
             }),
             output_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "items": {"type": "array", "description": "When no cluster_id: clusters {cluster_id, count, representatives}. When cluster_id given: members {qualified_name, kind, name}."},
+                    "items": {"type": "array"},
                     "count": {"type": "integer", "minimum": 0}
                 },
                 "required": ["items", "count"]
@@ -461,15 +366,12 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "analyze_change",
-            description: "Analyze the impact of a structured change. Returns a paginated window of findings (use limit/offset) with bounded traversal depth; total + has_more indicate whether more findings exist.",
+            description: "Structured change impact (field rename/type/nullability...). Paginated findings with bounded traversal.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "target_kind": {
-                        "type": "string",
-                        "description": "Kind of entity being changed (e.g. \"field\")."
-                    },
+                    "target_kind": {"type": "string"},
                     "operation": {
                         "type": "string",
                         "enum": [
@@ -477,31 +379,11 @@ fn tool_specs() -> Vec<ToolSpec> {
                             "change_nullable", "change_format", "change_semantics"
                         ]
                     },
-                    "from": {
-                        "type": "string",
-                        "description": "Current name of the target entity (required to resolve impact)."
-                    },
-                    "to": {
-                        "type": "string",
-                        "description": "New name for a rename, or target for an add."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "default": 100,
-                        "description": "Maximum findings to return."
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "default": 0,
-                        "description": "Number of findings to skip (pagination)."
-                    },
-                    "depth": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "Graph traversal depth around each finding. Defaults to an operation-appropriate value (destructive ops stay shallow) when omitted."
-                    }
+                    "from": {"type": "string"},
+                    "to": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "default": 100},
+                    "offset": {"type": "integer", "minimum": 0, "default": 0},
+                    "depth": {"type": "integer", "minimum": 0}
                 },
                 "required": ["target_kind", "operation", "from"]
             }),
@@ -521,31 +403,31 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "analyze_requirement",
-            description: "Find candidate code entities for a requirement keyword by matching indexed entity names/qualified names. Substring match only — not semantic or free-text search.",
+            description: "Requirement-keyword to candidate entities (substring). Not semantic search.",
             input_schema: search_input,
             output_schema: search_output,
         },
         ToolSpec {
             name: "trace_callers",
-            description: "Trace who calls an entity (inbound edges). Defaults to `calls` + `injects` + `declares` + `superclass_of` (calls+injects for the call/injection chain, `declares` so a trace from a method reaches its declaring class, `superclass_of` so a trace from a subclass reaches its base/abstract class) — the dominant cross-file links in Java business code. Resolves the start point by exact entity name, then BFS inward up to `depth`. Cross-file calls/injections are low-confidence inferences; use verify_edge to ground a `tentative` edge in source before trusting it. Set edge_kinds to follow other dependencies (depends_on, reads_table, ...).",
+            description: "Inbound BFS (who reaches X). Default kinds: calls/injects/declares/superclass_of. Cross-file links are inferred; ground with verify_edge.",
             input_schema: trace_input.clone(),
             output_schema: trace_output.clone(),
         },
         ToolSpec {
             name: "trace_callees",
-            description: "Trace what an entity calls (outbound edges). Defaults to `calls` + `injects` + `declares` + `superclass_of` (calls+injects for the call/injection chain, `declares` so a trace from a class drills into its methods, `superclass_of` so a trace from a base/abstract class reaches concrete subclasses) — the dominant cross-file links in Java business code. Resolves the start point by exact entity name, then BFS outward up to `depth`. Cross-file calls/injections are low-confidence inferences; use verify_edge to ground a `tentative` edge in source before trusting it. Set edge_kinds to follow other dependencies (depends_on, reads_table, ...).",
+            description: "Outbound BFS (what X reaches). Default kinds: calls/injects/declares/superclass_of. Abstract base auto-drills into subclasses via superclass_of.",
             input_schema: trace_input,
             output_schema: trace_output.clone(),
         },
         ToolSpec {
             name: "trace_table_access",
-            description: "One-shot: who reads/writes a table and the upstream call chain. Resolves a table (or mapper method) by exact name, then BFS inward (inbound) along reads_table/writes_table + calls + injects, so a single call pulls mapper_method → service → … for that table. `direction` selects read/write/both. Equivalent to trace_callers with the data-flow edge kinds preset.",
+            description: "One-shot: readers/writers of a table + upstream chain. BFS along reads/writes_table + calls + injects.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "name": {"type": "string", "description": "Exact table or mapper-method name to trace access to."},
-                    "direction": {"type": "string", "enum": ["read", "write", "both"], "default": "both", "description": "read = reads_table only; write = writes_table only; both = either."},
+                    "name": {"type": "string"},
+                    "direction": {"type": "string", "enum": ["read", "write", "both"], "default": "both"},
                     "depth": {"type": "integer", "minimum": 0, "default": 2},
                     "min_confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.0},
                     "verbose": {"type": "boolean", "default": false, "description": "Include full evidence[] per edge."}
@@ -556,18 +438,14 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "trace_full_path",
-            description: "One-shot generic end-to-end BFS: resolve an entity by exact name, walk `edge_kinds` in `direction`, optionally filter results to a target `to_kind`. Defaults to a broad edge set (calls/injects/declares/superclass_of/binds_to_statement/reads_table/writes_table/exposes/matches_endpoint) — `declares` lets a class start reach its methods, `superclass_of` lets an abstract base class reach its concrete subclasses, so a Service class → injected Mapper method → table chain resolves in one call. One call spans front-end → HTTP → back-end → DB as far as a single direction reaches. Mixed-direction paths (e.g. endpoint → its controller via inbound exposes, then → table via outbound) need two calls — single-direction by design.",
+            description: "Generic end-to-end BFS with chosen edge_kinds/direction, optional to_kind filter. Frontend→HTTP→backend→DB reach in one direction per call.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "name": {"type": "string", "description": "Exact entity name to start from."},
-                    "to_kind": {"type": "string", "description": "Optional: keep only reached entities of this kind (e.g. \"table\", \"http_endpoint\"). Default keeps all."},
-                    "edge_kinds": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Edge kinds to follow. Default spans calls/injects/reads_table/writes_table/exposes/matches_endpoint for cross-stack reach."
-                    },
+                    "name": {"type": "string"},
+                    "to_kind": {"type": "string"},
+                    "edge_kinds": {"type": "array", "items": {"type": "string"}},
                     "direction": {"type": "string", "enum": ["outbound", "inbound"], "default": "outbound"},
                     "depth": {"type": "integer", "minimum": 0, "default": 2},
                     "min_confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.0},
@@ -579,24 +457,14 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "verify_edge",
-            description: "Verify a graph edge against source code: read the source entity's file and grep for the target name. Returns matched lines (verified=true) or reports the edge is likely a cross-file inference (verified=false). Use to independently check a `tentative` edge from trace_callers/trace_callees before trusting it — graph edges are inferred; this grounds one in source.",
+            description: "Ground an inferred edge in source: greps the source entity's file for the target name. verified=false means cross-file inference only.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "source": {
-                        "type": "string",
-                        "description": "Exact name of the edge's source entity. The file that gets grep'd is this entity's declared (evidence) file."
-                    },
-                    "target": {
-                        "type": "string",
-                        "description": "Name (or substring) of the target entity; matched literally inside the source file."
-                    },
-                    "workspace": {
-                        "type": "string",
-                        "default": ".",
-                        "description": "Workspace root to resolve the source entity's file path. Same as scan_workspace."
-                    }
+                    "source": {"type": "string"},
+                    "target": {"type": "string"},
+                    "workspace": {"type": "string", "default": "."}
                 },
                 "required": ["source", "target"]
             }),
@@ -626,7 +494,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "show_system_view",
-            description: "Show a repository, API, or data system view as bounded counts grouped by entity kind (never full entities).",
+            description: "Bounded counts grouped by kind for repositories/api/data views. Never returns full entities.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -634,8 +502,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                     "view": {
                         "type": "string",
                         "enum": ["repositories", "api", "data"],
-                        "default": "repositories",
-                        "description": "repositories: full overview. api: http_endpoint/api_field/http_client_call only. data: table/column/sql_field/xml_statement/result_map/mapper/mapper_method/datasource/database only."
+                        "default": "repositories"
                     }
                 }
             }),
@@ -657,7 +524,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "get_index_status",
-            description: "Read local index status.",
+            description: "Local index status: database path + entity/edge counts.",
             input_schema: json!({"type": "object", "additionalProperties": false, "properties": {}}),
             output_schema: json!({
                 "type": "object",
@@ -674,7 +541,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_repositories",
-            description: "List all indexed repositories in multi-repo mode. Reads <base>/manifest.json + each repo's counts. Returns repo_path, repo_id, entity_count, edge_count. Use to discover which repositories are indexed and pick the right `repository` argument for other tools.",
+            description: "Multi-repo mode: manifest + per-repo counts under --base.",
             input_schema: json!({"type": "object", "additionalProperties": false, "properties": {}}),
             output_schema: json!({
                 "type": "object",
@@ -688,26 +555,14 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "build_relay_doc",
-            description: "Build a structured 'relay doc' skeleton (relay-schema v1) around a target entity, resolved by exact qualified name. Collects inbound (who points at it) and outbound (what it points at) edges, each with a call-site anchor and a machine-mapped edge_type. Fills the structure layer (qn, file:line anchors, tool edge_kind → edge_type); semantic fields are marked `custom:needs-review` for the consuming agent. Known limit: Java `calls` edges are extracted only within the same file, so cross-file inbound callers may be missing.",
+            description: "Relay-doc skeleton (relay-schema v1) around a qn: inbound/outbound edges with anchors. Structure filled; semantic fields marked custom:needs-review.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "qn": {
-                        "type": "string",
-                        "description": "Exact qualified name of the target entity. Resolved by exact qualified_name match (not substring); use search_entities first if unsure of the precise qn."
-                    },
-                    "depth": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "default": 1,
-                        "description": "Edge hops to follow. 1 = direct neighbors only (the relay default)."
-                    },
-                    "verbose": {
-                        "type": "boolean",
-                        "default": false,
-                        "description": "When true, include full evidence[] on each edge. Default false keeps the skeleton small."
-                    }
+                    "qn": {"type": "string"},
+                    "depth": {"type": "integer", "minimum": 0, "default": 1},
+                    "verbose": {"type": "boolean", "default": false}
                 },
                 "required": ["qn"]
             }),
@@ -769,10 +624,9 @@ fn tool_specs() -> Vec<ToolSpec> {
         {
             props.insert(
                 "repository".to_string(),
-                json!({
-                    "type": "string",
-                    "description": "仓库根路径。多仓库模式下路由到 <base>/repos/<id>.sqlite;省略则用 server 的 --database(单库兼容)。scan_workspace 用它作扫描根。"
-                }),
+                // 不带 description(参数名自释;route 规则见 list_repositories 工具描述):
+                // 此项注入全部工具,文案逐份重复是 tools/list 固定税。
+                json!({ "type": "string" }),
             );
         }
     }
@@ -2666,5 +2520,25 @@ mod tests {
     }
 
 
-    // Part C 守卫测试(tools/list 字节预算)在文案瘦身步骤加入。
+    #[test]
+    fn tools_list_stays_under_token_budget() {
+        // 与 serve 的 tools/list 装配同形(name/description/inputSchema/outputSchema)。
+        let total: usize = tool_specs()
+            .iter()
+            .map(|spec| {
+                serde_json::to_string(&json!({
+                    "name": spec.name,
+                    "description": spec.description,
+                    "inputSchema": spec.input_schema,
+                    "outputSchema": spec.output_schema,
+                }))
+                .unwrap()
+                .len()
+            })
+            .sum();
+        assert!(
+            total <= 24_576,
+            "tools/list payload regressed: {total} bytes (budget 24576)"
+        );
+    }
 }
