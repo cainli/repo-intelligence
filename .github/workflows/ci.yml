@@ -15,6 +15,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      # embedding 模型 gitignore 不进仓库;Windows 的 build.rs 找不到 bash 无法按需
+      # 下载(include_bytes! 直接编译失败),与 release.yml 同款预拉步骤。
+      - name: Fetch embedding model
+        run: bash crates/embedding/scripts/fetch-model.sh
+        shell: bash
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
