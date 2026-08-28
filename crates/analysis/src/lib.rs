@@ -855,9 +855,12 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
         let Some(ev) = iface.evidence.first() else {
             continue;
         };
+        // Windows 路径分隔符归一:ev.file 在 Windows 上是反斜杠,namespace 后缀是
+        // '/' 形式,不归一则 binds_to_statement 在 Windows 全空(CI 实测)。
+        let file_norm = ev.file.replace('\\', "/");
         let matched: Vec<&Entity> = xml_by_ns_suffix
             .iter()
-            .filter(|(suffix, _)| ev.file.ends_with(suffix.as_str()))
+            .filter(|(suffix, _)| file_norm.ends_with(suffix.as_str()))
             .flat_map(|(_, xs)| xs.iter().copied())
             .collect();
         iface_to_xmls.insert(&iface.id, matched);
