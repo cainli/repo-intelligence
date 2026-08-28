@@ -81,6 +81,19 @@
 | entity 平均 json 大小 | 751.8 → 798.3 B(+6.2%) | class/interface 记录 imports 所致,信号换成本 |
 | /tmp/vue-mini 端到端 | http_client_call GET /api/users/list → matches_endpoint → http_endpoint → method list → listUsers → queryUsers → xml_statement → table sys_user | matches_endpoint 打通前端第一跳 |
 
+## [0.1.35] - 2026-08-12
+
+### Added
+- **异常流边(P1④)**:`EdgeKind::Throws`(method `throws` 子句声明抛出)/`Handles`(catch 子句处理)——method 解析到 class/interface 实体。semantics `walk_exceptions` 提取 `metadata.exception_flow`,analysis `resolve_exception_flow` 按异常类型名匹配建边(A+ 歧义跳过)。
+- 已知限制:catch JDK 异常(Exception/IllegalStateException)的项目 throws/handles 边为 0(异常类型非项目 class,ruoyi 实测如此),端到端连通需项目自定义异常链(mes/mos 金融项目);提取层覆盖(`metadata.exception_flow` 实体数)始终可查(ruoyi 104)。
+
+## [0.1.34] - 2026-08-12
+
+### Added
+- **复杂度属性(对标 codebase-memory Q4 热点)**:method metadata 新增 `complexity`(cyclomatic)/`loop_count`/`loop_depth`(单函数)/`linear_scan_in_loop`(循环内线性扫描)+ `transitive_loop_depth`(沿 CALLS 固定点传播的跨函数最坏循环嵌套,32 轮上限防环)。新增 `find_hotspots` 工具,tld>自身 loop_depth 的方法是"局部无害但调用链深"的 O(n²) 探测信号。
+- **灵活查询**:`search_entities` 新增 `min_complexity`/`min_transitive_loop_depth`/`min_loop_depth` 过滤与 `sort_by`。
+- **架构聚类(对标 Leiden)**:label propagation 在 calls/injects/declares/superclass_of/implements 图上跑 → `metadata.cluster_id`;新增 `get_clusters` 工具。识别跨文件夹"事实模块"(ruoyi 验证:cluster 与 module 全内聚对应)。
+
 ## [0.1.33] - 2026-08-04
 
 ### Added
