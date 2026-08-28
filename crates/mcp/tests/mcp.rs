@@ -189,7 +189,7 @@ fn index_status_reports_absolute_database_path() {
         .as_str()
         .unwrap();
     assert!(
-        reported.starts_with('/'),
+        std::path::Path::new(reported).is_absolute(),
         "database path should be absolute, got: {reported}"
     );
     assert!(reported.ends_with("graph.sqlite"));
