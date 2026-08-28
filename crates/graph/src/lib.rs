@@ -771,8 +771,10 @@ impl GraphStore for SqliteGraphStore {
         for row in rows {
             let (id, blob, dim) = row?;
             let vec: Vec<f32> = blob
-                .chunks_exact(4)
-                .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_ne_bytes(*c))
                 .collect();
             // 维度真校验(旧为 debug_assert,release 下静默放行):blob 字节数/4 必须等于
             // dim 列。损坏/截断的 blob(磁盘满部分写、未来 schema 变更)会产出错维向量,
