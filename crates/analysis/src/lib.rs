@@ -236,15 +236,18 @@ impl WorkspaceIndexer {
                 .iter()
                 .filter(|e| embed_seen.insert(e.id.0.clone()))
                 .map(|e| {
-                    let mut text =
-                        format!("{} {} {}", e.kind.as_str(), e.qualified_name, e.name);
+                    let mut text = format!("{} {} {}", e.kind.as_str(), e.qualified_name, e.name);
                     if let Some(anns) = anns_by_owner.get(&e.id)
                         && !anns.is_empty()
                     {
                         // 带 @ 前缀,贴近 Java 源码与用户查询习惯。
                         text.push(' ');
                         text.push_str(
-                            &anns.iter().map(|a| format!("@{a}")).collect::<Vec<_>>().join(" "),
+                            &anns
+                                .iter()
+                                .map(|a| format!("@{a}"))
+                                .collect::<Vec<_>>()
+                                .join(" "),
                         );
                     }
                     (e.id.clone(), text)
@@ -285,7 +288,16 @@ impl WorkspaceIndexer {
             .patch
             .add_edges
             .iter()
-            .filter(|e| matches!(e.kind, EdgeKind::Calls | EdgeKind::Injects | EdgeKind::Declares | EdgeKind::SuperclassOf | EdgeKind::Implements))
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    EdgeKind::Calls
+                        | EdgeKind::Injects
+                        | EdgeKind::Declares
+                        | EdgeKind::SuperclassOf
+                        | EdgeKind::Implements
+                )
+            })
             .cloned()
             .collect();
         let t = std::time::Instant::now();
@@ -297,14 +309,11 @@ impl WorkspaceIndexer {
         let amb_by_holder: HashMap<&EntityId, Vec<serde_json::Value>> = {
             let mut by_holder: HashMap<&EntityId, Vec<serde_json::Value>> = HashMap::new();
             for note in &resolution.ambiguities {
-                by_holder
-                    .entry(&note.holder)
-                    .or_default()
-                    .push(json!({
-                        "kind": note.kind,
-                        "name": note.name,
-                        "candidates": note.candidates,
-                    }));
+                by_holder.entry(&note.holder).or_default().push(json!({
+                    "kind": note.kind,
+                    "name": note.name,
+                    "candidates": note.candidates,
+                }));
             }
             by_holder
         };
@@ -340,10 +349,22 @@ impl WorkspaceIndexer {
         let structural: Vec<&Edge> = extract_edges
             .iter()
             .chain(resolved_structural.iter())
-            .filter(|e| matches!(e.kind, EdgeKind::Calls | EdgeKind::Injects | EdgeKind::Declares | EdgeKind::SuperclassOf | EdgeKind::Implements))
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    EdgeKind::Calls
+                        | EdgeKind::Injects
+                        | EdgeKind::Declares
+                        | EdgeKind::SuperclassOf
+                        | EdgeKind::Implements
+                )
+            })
             .collect();
         let clusters = compute_clusters(&structural);
-        let n_clusters_distinct = clusters.values().collect::<std::collections::HashSet<_>>().len();
+        let n_clusters_distinct = clusters
+            .values()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
         // 元数据统一合并回填:transitive_loop_depth / cluster_id / ambiguous_resolution
         // 三路信号一次写入。此前各阶段各自从 resolve 前的快照整行覆盖实体,互相冲键
         // (如方法既有 tld 又入 cluster 时 tld 被后写阶段抹掉、ambiguous_resolution 被
@@ -355,7 +376,8 @@ impl WorkspaceIndexer {
         for entity in &all_entities {
             let is_method_with_tld =
                 entity.kind == EntityKind::Method && tld.contains_key(&entity.id);
-            if !is_method_with_tld && !clusters.contains_key(&entity.id)
+            if !is_method_with_tld
+                && !clusters.contains_key(&entity.id)
                 && !amb_by_holder.contains_key(&entity.id)
             {
                 continue;
@@ -403,7 +425,10 @@ impl WorkspaceIndexer {
         let mut class_by_name: HashMap<&str, Vec<&EntityId>> = HashMap::new();
         for e in &all_entities {
             if matches!(e.kind, EntityKind::Class | EntityKind::Interface) {
-                class_by_name.entry(e.name.as_str()).or_default().push(&e.id);
+                class_by_name
+                    .entry(e.name.as_str())
+                    .or_default()
+                    .push(&e.id);
             }
         }
         let mut exc_edges: Vec<Edge> = Vec::new();
@@ -411,7 +436,10 @@ impl WorkspaceIndexer {
             if entity.kind != EntityKind::Method {
                 continue;
             }
-            let Some(flows) = entity.metadata.get("exception_flow").and_then(|v| v.as_array())
+            let Some(flows) = entity
+                .metadata
+                .get("exception_flow")
+                .and_then(|v| v.as_array())
             else {
                 continue;
             };
@@ -422,8 +450,12 @@ impl WorkspaceIndexer {
                 let Some(type_name) = flow.get("type").and_then(|v| v.as_str()) else {
                     continue;
                 };
-                let Some(candidates) = class_by_name.get(type_name) else { continue };
-                let [cid] = candidates.as_slice() else { continue }; // 歧义跳过
+                let Some(candidates) = class_by_name.get(type_name) else {
+                    continue;
+                };
+                let [cid] = candidates.as_slice() else {
+                    continue;
+                }; // 歧义跳过
                 let kind = if flow.get("flow").and_then(|v| v.as_str()) == Some("throws") {
                     EdgeKind::Throws
                 } else {
@@ -488,9 +520,9 @@ impl WorkspaceIndexer {
                             eprintln!("[ri-diag] embedding 存储失败(不阻塞 scan): {e}");
                         }
                     }
-                    Err(e) => eprintln!(
-                        "[ri-diag] embedding 跳过(模型加载/推理失败,不阻塞 scan): {e}"
-                    ),
+                    Err(e) => {
+                        eprintln!("[ri-diag] embedding 跳过(模型加载/推理失败,不阻塞 scan): {e}")
+                    }
                 }
             }
             eprintln!(
@@ -528,15 +560,14 @@ fn compute_transitive_loop_depth<'a>(
     entities: &'a [Entity],
     calls_edges: &[&Edge],
 ) -> HashMap<&'a EntityId, u32> {
-    let own: HashMap<&EntityId, u32> =
-        entities.iter().map(|e| (&e.id, own_loop_depth(e))).collect();
+    let own: HashMap<&EntityId, u32> = entities
+        .iter()
+        .map(|e| (&e.id, own_loop_depth(e)))
+        .collect();
     // 邻接:caller -> [callee],只保留两端都在 own 里的边(防悬空)。
     let mut out: HashMap<&EntityId, Vec<&EntityId>> = HashMap::new();
     for &e in calls_edges {
-        if e.kind == EdgeKind::Calls
-            && own.contains_key(&e.source)
-            && own.contains_key(&e.target)
-        {
+        if e.kind == EdgeKind::Calls && own.contains_key(&e.source) && own.contains_key(&e.target) {
             out.entry(&e.source).or_default().push(&e.target);
         }
     }
@@ -549,7 +580,12 @@ fn compute_transitive_loop_depth<'a>(
                 let o = own[node];
                 let max_callee = out
                     .get(node)
-                    .map(|cs| cs.iter().filter_map(|c| tld.get(c).copied()).max().unwrap_or(0))
+                    .map(|cs| {
+                        cs.iter()
+                            .filter_map(|c| tld.get(c).copied())
+                            .max()
+                            .unwrap_or(0)
+                    })
                     .unwrap_or(0);
                 let prev = *tld.get(node).unwrap_or(&0);
                 (node, o.saturating_add(max_callee).max(prev))
@@ -596,8 +632,12 @@ fn compute_clusters(edges: &[&Edge]) -> HashMap<EntityId, u64> {
         if selected.contains(&e.kind) {
             nodes.insert(e.source.clone());
             nodes.insert(e.target.clone());
-            adj.entry(e.source.clone()).or_default().push(e.target.clone());
-            adj.entry(e.target.clone()).or_default().push(e.source.clone());
+            adj.entry(e.source.clone())
+                .or_default()
+                .push(e.target.clone());
+            adj.entry(e.target.clone())
+                .or_default()
+                .push(e.source.clone());
         }
     }
     // 确定序:按 EntityId 字符串排序,初始 label = 序号。
@@ -633,7 +673,11 @@ fn compute_clusters(edges: &[&Edge]) -> HashMap<EntityId, u64> {
     let mut ids: Vec<u64> = label.values().copied().collect();
     ids.sort_unstable();
     ids.dedup();
-    let remap: HashMap<u64, u64> = ids.into_iter().enumerate().map(|(i, v)| (v, i as u64)).collect();
+    let remap: HashMap<u64, u64> = ids
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| (v, i as u64))
+        .collect();
     label.into_iter().map(|(k, v)| (k, remap[&v])).collect()
 }
 
@@ -703,10 +747,16 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
     for entity in entities {
         match entity.kind {
             EntityKind::Class => {
-                classes_by_name_all.entry(entity.name.as_str()).or_default().push(entity);
+                classes_by_name_all
+                    .entry(entity.name.as_str())
+                    .or_default()
+                    .push(entity);
             }
             EntityKind::Interface => {
-                ifaces_by_name_all.entry(entity.name.as_str()).or_default().push(entity);
+                ifaces_by_name_all
+                    .entry(entity.name.as_str())
+                    .or_default()
+                    .push(entity);
             }
             _ => {}
         }
@@ -724,8 +774,10 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
     let mut class_to_table: HashMap<&str, &EntityId> = HashMap::new();
     for edge in input_edges {
         if edge.kind == EdgeKind::DependsOn
-            && let (Some(src), Some(tgt)) =
-                (entity_by_id.get(&edge.source), entity_by_id.get(&edge.target))
+            && let (Some(src), Some(tgt)) = (
+                entity_by_id.get(&edge.source),
+                entity_by_id.get(&edge.target),
+            )
             && src.kind == EntityKind::Class
             && tgt.kind == EntityKind::Table
         {
@@ -791,9 +843,10 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
         if edge.kind != EdgeKind::Declares {
             continue;
         }
-        let (Some(iface), Some(_)) =
-            (entity_by_id.get(&edge.source), entity_by_id.get(&edge.target))
-        else {
+        let (Some(iface), Some(_)) = (
+            entity_by_id.get(&edge.source),
+            entity_by_id.get(&edge.target),
+        ) else {
             continue;
         };
         if iface.kind != EntityKind::Interface || iface_to_xmls.contains_key(&iface.id) {
@@ -814,9 +867,10 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
         if edge.kind != EdgeKind::Declares {
             continue;
         }
-        let (Some(iface), Some(method)) =
-            (entity_by_id.get(&edge.source), entity_by_id.get(&edge.target))
-        else {
+        let (Some(iface), Some(method)) = (
+            entity_by_id.get(&edge.source),
+            entity_by_id.get(&edge.target),
+        ) else {
             continue;
         };
         if iface.kind != EntityKind::Interface || method.kind != EntityKind::Method {
@@ -853,8 +907,10 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
     let mut method_owner: HashMap<&EntityId, &str> = HashMap::new();
     for edge in input_edges {
         if edge.kind == EdgeKind::Declares
-            && let (Some(owner), Some(m)) =
-                (entity_by_id.get(&edge.source), entity_by_id.get(&edge.target))
+            && let (Some(owner), Some(m)) = (
+                entity_by_id.get(&edge.source),
+                entity_by_id.get(&edge.target),
+            )
             && matches!(owner.kind, EntityKind::Class | EntityKind::Interface)
             && m.kind == EntityKind::Method
         {
@@ -868,8 +924,10 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
     let mut owner_injected: HashMap<&str, Vec<&str>> = HashMap::new();
     for edge in input_edges {
         if edge.kind == EdgeKind::Injects
-            && let (Some(owner), Some(bean)) =
-                (entity_by_id.get(&edge.source), entity_by_id.get(&edge.target))
+            && let (Some(owner), Some(bean)) = (
+                entity_by_id.get(&edge.source),
+                entity_by_id.get(&edge.target),
+            )
             && matches!(owner.kind, EntityKind::Class | EntityKind::Interface)
             && bean.kind == EntityKind::SpringBean
         {
@@ -942,8 +1000,10 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
             };
             let line = invoke.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             // receiver_kind/receiver 由提取层 classify_receiver 产出(旧库缺省为 bare,向后兼容)。
-            let receiver_kind =
-                invoke.get("receiver_kind").and_then(|v| v.as_str()).unwrap_or("bare");
+            let receiver_kind = invoke
+                .get("receiver_kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("bare");
             let receiver = invoke.get("receiver").and_then(|v| v.as_str());
 
             let mut resolved: Option<&EntityId> = None;
@@ -1041,7 +1101,9 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
             continue;
         };
         for iface_val in impls {
-            let Some(iface_name) = iface_val.as_str() else { continue };
+            let Some(iface_name) = iface_val.as_str() else {
+                continue;
+            };
             if let Some(cands) = ifaces_by_name_all.get(iface_name).filter(|v| v.len() > 1) {
                 ambiguities.push(AmbiguityNote {
                     holder: entity.id.clone(),
@@ -1051,7 +1113,9 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
                 });
                 continue;
             }
-            let Some(&iface_id) = interfaces_by_name.get(iface_name) else { continue };
+            let Some(&iface_id) = interfaces_by_name.get(iface_name) else {
+                continue;
+            };
             let mut edge = Edge::new(entity.id.clone(), iface_id.clone(), EdgeKind::DependsOn);
             if let Some(ev) = entity.evidence.first() {
                 edge = edge.with_evidence(
@@ -1066,7 +1130,8 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
             edges.push(edge);
             // 反向 Implements 边(interface→class):让"接口有哪些实现"可查(P1-5 MapStruct
             // Impl 等编译时生成代码补全后,接口到实现的显式语义)。
-            let mut impl_edge = Edge::new(iface_id.clone(), entity.id.clone(), EdgeKind::Implements);
+            let mut impl_edge =
+                Edge::new(iface_id.clone(), entity.id.clone(), EdgeKind::Implements);
             if let Some(ev) = entity.evidence.first() {
                 impl_edge = impl_edge.with_evidence(
                     &ev.file,
@@ -1110,12 +1175,17 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
                 kind: "superclass",
                 name: superclass.to_string(),
                 candidates: candidate_files(
-                    classes_by_name_all.get(superclass).map(Vec::as_slice).unwrap_or(&[]),
+                    classes_by_name_all
+                        .get(superclass)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
                 ),
             });
             continue;
         }
-        let Some(&super_id) = classes_by_name.get(superclass) else { continue };
+        let Some(&super_id) = classes_by_name.get(superclass) else {
+            continue;
+        };
         let mut edge = Edge::new(super_id.clone(), entity.id.clone(), EdgeKind::SuperclassOf);
         if let Some(ev) = entity.evidence.first() {
             edge = edge.with_evidence(
@@ -1131,8 +1201,10 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
     }
     for edge in input_edges {
         if edge.kind == EdgeKind::Declares
-            && let (Some(iface), Some(m)) =
-                (entity_by_id.get(&edge.source), entity_by_id.get(&edge.target))
+            && let (Some(iface), Some(m)) = (
+                entity_by_id.get(&edge.source),
+                entity_by_id.get(&edge.target),
+            )
             && iface.kind == EntityKind::Interface
             && m.kind == EntityKind::Method
             && let Some(impls) = interface_to_impls.get(iface.name.as_str())
@@ -1193,15 +1265,18 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
         if edge.kind != EdgeKind::Declares {
             continue;
         }
-        let (Some(owner), Some(method)) =
-            (entity_by_id.get(&edge.source), entity_by_id.get(&edge.target))
-        else {
+        let (Some(owner), Some(method)) = (
+            entity_by_id.get(&edge.source),
+            entity_by_id.get(&edge.target),
+        ) else {
             continue;
         };
         if owner.kind != EntityKind::Interface || method.kind != EntityKind::Method {
             continue;
         }
-        let Some(ev) = owner.evidence.first() else { continue };
+        let Some(ev) = owner.evidence.first() else {
+            continue;
+        };
         let Some(mapper) = mapper_by_key.get(&(owner.name.as_str(), ev.file.as_str())) else {
             continue;
         };
@@ -1220,7 +1295,11 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
             }
             continue;
         };
-        let mut m2t = Edge::new(edge.target.clone(), (*table_id).clone(), EdgeKind::ReadsTable);
+        let mut m2t = Edge::new(
+            edge.target.clone(),
+            (*table_id).clone(),
+            EdgeKind::ReadsTable,
+        );
         if let Some(mev) = method.evidence.first() {
             m2t = m2t.with_evidence(
                 &mev.file,
@@ -1357,7 +1436,10 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
                 kind: "test_convention",
                 name: stripped.to_string(),
                 candidates: candidate_files(
-                    classes_by_name_all.get(stripped).map(Vec::as_slice).unwrap_or(&[]),
+                    classes_by_name_all
+                        .get(stripped)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
                 ),
             });
             continue;
@@ -1414,7 +1496,9 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
             if entity.name.strip_suffix("Test") == Some(simple_name) {
                 continue; // 命名约定路径已覆盖(XxxTest → Xxx)
             }
-            let Some(hits) = classes_by_name_all.get(simple_name) else { continue };
+            let Some(hits) = classes_by_name_all.get(simple_name) else {
+                continue;
+            };
             if hits.len() > 1 {
                 ambiguities.push(AmbiguityNote {
                     holder: entity.id.clone(),
@@ -1448,7 +1532,9 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
         let mut map: HashMap<&str, Vec<&EntityId>> = HashMap::new();
         for entity in entities {
             if entity.kind == EntityKind::Method {
-                map.entry(entity.name.as_str()).or_default().push(&entity.id);
+                map.entry(entity.name.as_str())
+                    .or_default()
+                    .push(&entity.id);
             }
         }
         map
@@ -1661,27 +1747,28 @@ impl<'a> ImpactAnalyzer<'a> {
             // radius 能到后端端点。MatchesEndpoint 多为 Inferred,会拉低 confidence,
             // 与分级匹配呼应。启发式:同页面所有 endpoint 都纳入,靠 confidence 区分。
             if entity.kind == EntityKind::FrontendField
-                && let Some(file_id) = containing_file {
-                    let bridge = self.store.traverse(TraverseQuery {
-                        start: file_id,
-                        outbound: true,
-                        max_depth: 2,
-                        edge_kinds: vec![EdgeKind::Contains, EdgeKind::MatchesEndpoint],
-                    })?;
-                    for edge in bridge.edges {
-                        for ev in &edge.evidence {
-                            if ev.confidence < confidence {
-                                confidence = ev.confidence;
-                            }
+                && let Some(file_id) = containing_file
+            {
+                let bridge = self.store.traverse(TraverseQuery {
+                    start: file_id,
+                    outbound: true,
+                    max_depth: 2,
+                    edge_kinds: vec![EdgeKind::Contains, EdgeKind::MatchesEndpoint],
+                })?;
+                for edge in bridge.edges {
+                    for ev in &edge.evidence {
+                        if ev.confidence < confidence {
+                            confidence = ev.confidence;
                         }
-                        evidence.extend(edge.evidence);
                     }
-                    for related in bridge.entities {
-                        if path_set.insert(related.id.clone()) {
-                            path.push(related.id);
-                        }
+                    evidence.extend(edge.evidence);
+                }
+                for related in bridge.entities {
+                    if path_set.insert(related.id.clone()) {
+                        path.push(related.id);
                     }
                 }
+            }
             report.findings.push(ImpactFinding {
                 path,
                 evidence,

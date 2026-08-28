@@ -33,15 +33,13 @@ static METHOD_MAPPING: LazyLock<Regex> = LazyLock::new(|| {
     // group2 = 括号内参数列表,path 由 annotation_path 解析(支持 value 在任意属性位)。
     // 类级 @RequestMapping 虽也被该正则命中,但由配对阶段的 class_offset 检查排除
     // (见 extract_java),仅作 base。
-    Regex::new(r#"@(?:(Get|Post|Put|Delete|Patch)Mapping|RequestMapping)\s*\(([^)]*)\)"#)
-        .unwrap()
+    Regex::new(r#"@(?:(Get|Post|Put|Delete|Patch)Mapping|RequestMapping)\s*\(([^)]*)\)"#).unwrap()
 });
 static STRING_LITERAL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""([^"]*)""#).unwrap());
 // 注解参数里的 path 提取:value/path 属性优先(任意属性位置,兼容数组 value={"/a","/b"}
 // 取首个元素),否则首个裸字符串字面量。
-static ANN_VALUE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?:value|path)\s*=\s*\{?\s*"([^"]*)""#).unwrap()
-});
+static ANN_VALUE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?:value|path)\s*=\s*\{?\s*"([^"]*)""#).unwrap());
 
 /// 从注解参数列表提取 path 字符串。修复 `@RequestMapping(method = POST, value = "/x")`
 /// 这类 value 不在首位的写法被静默丢弃的历史问题(旧正则要求 value/裸串紧跟左括号)。
@@ -55,26 +53,23 @@ fn annotation_path(args: &str) -> Option<String> {
         .map(|m| m.as_str().to_string())
 }
 // 通用注解简单名:@Foo(…) / @Foo → group1=Foo。用于白名单注解索引(P1-1)。
-static AT_ANNOTATION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"@([A-Za-z_]\w*)").unwrap());
+static AT_ANNOTATION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@([A-Za-z_]\w*)").unwrap());
 // @Test 方法定位(P1-4)。
 static AT_TEST: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@Test\b").unwrap());
 
 // import 全限定名(含 static,剔通配符由提取侧做):写入每个 class 的 metadata.imports,
 // analysis 层借其简单名末段做 Tests 边的第二推断路径(P0②)。跑在 bare 掩码上——
 // Javadoc / 示例代码里的 "import x.y;" 字样不会误收。
-static JAVA_IMPORT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^\s*import\s+(?:static\s+)?([\w.]+(?:\.\*)?)\s*;").unwrap()
-});
+static JAVA_IMPORT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^\s*import\s+(?:static\s+)?([\w.]+(?:\.\*)?)\s*;").unwrap());
 // AOP advice 注解 + 其 pointcut 字面量(P1-2)。group2 = 参数列表,pointcut 经
 // annotation_path 提取(兼容 value 不在首位)。
 static ADVICE_ANN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"@(Around|Before|After|AfterReturning|AfterThrowing)\s*\(([^)]*)\)"#).unwrap()
 });
 // execution(返回类型 包.类.方法(..)) → 全限定方法签名(组1)。简单版,不处理通配 */||/within。
-static EXECUTION_SIG: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"execution\s*\(\s*\S+\s+([\w.$]+)\s*\(").unwrap()
-});
+static EXECUTION_SIG: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"execution\s*\(\s*\S+\s+([\w.$]+)\s*\(").unwrap());
 // class Name(可选泛型/extends)implements Iface1<Gen>, Iface2 { ... —— 组1=类名,
 // 组2=接口列表(含泛型,到 class body 的 {)。跨行靠 [^{] 匹配换行(否定字符类含 \n)。
 // 用 regex 而非 tree-sitter:implements 子句节点结构随 grammar 版本不稳,正则最可靠。
@@ -90,9 +85,8 @@ static JAVA_EXTENDS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\bclass\s+([A-Za-z_]\w*)[^{]*?\bextends\s+([A-Za-z_]\w*)").unwrap()
 });
 // abstract class Foo —— abstract 修饰符(不论有无 extends)。存 metadata.abstract 供 trace 标注。
-static JAVA_ABSTRACT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\babstract\s+class\s+([A-Za-z_]\w*)").unwrap()
-});
+static JAVA_ABSTRACT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\babstract\s+class\s+([A-Za-z_]\w*)").unwrap());
 
 // ---- MyBatis Plus 持久层(MP 3.5.7 主力 ORM:注解实体 + BaseMapper + Wrapper) ----
 // 注解-声明关联用 offset 配对(见 extract_mybatis_plus),不走 AST,避免 grammar 改动。
@@ -384,12 +378,15 @@ fn extract_java(
     // resolve 层的 A+ 防护兜底)。
     let mut invokes_by_caller: HashMap<&str, Vec<serde_json::Value>> = HashMap::new();
     for inv in &invocations {
-        invokes_by_caller.entry(inv.caller.as_str()).or_default().push(json!({
-            "name": inv.callee,
-            "line": inv.line,
-            "receiver_kind": inv.receiver_kind,
-            "receiver": inv.receiver,
-        }));
+        invokes_by_caller
+            .entry(inv.caller.as_str())
+            .or_default()
+            .push(json!({
+                "name": inv.callee,
+                "line": inv.line,
+                "receiver_kind": inv.receiver_kind,
+                "receiver": inv.receiver,
+            }));
     }
     for entity in entities.iter_mut() {
         if entity.kind != EntityKind::Method {
@@ -410,11 +407,14 @@ fn extract_java(
     if !exception_refs.is_empty() {
         let mut exc_by_method: HashMap<&str, Vec<serde_json::Value>> = HashMap::new();
         for r in &exception_refs {
-            exc_by_method.entry(r.method.as_str()).or_default().push(json!({
-                "type": r.type_name,
-                "line": r.line,
-                "flow": r.kind,
-            }));
+            exc_by_method
+                .entry(r.method.as_str())
+                .or_default()
+                .push(json!({
+                    "type": r.type_name,
+                    "line": r.line,
+                    "flow": r.kind,
+                }));
         }
         for entity in entities.iter_mut() {
             if entity.kind != EntityKind::Method {
@@ -427,7 +427,10 @@ fn extract_java(
                 serde_json::Value::Object(map) => map,
                 _ => serde_json::Map::new(),
             };
-            meta.insert("exception_flow".into(), serde_json::Value::Array(flows.clone()));
+            meta.insert(
+                "exception_flow".into(),
+                serde_json::Value::Array(flows.clone()),
+            );
             entity.metadata = serde_json::Value::Object(meta);
         }
     }
@@ -520,7 +523,11 @@ fn extract_java(
         .captures_iter(&masked.code)
         .find_map(|capture| {
             let ann_end = capture.get(0)?.end();
-            let nearest_class = class_offsets.iter().filter(|off| **off >= ann_end).min().copied();
+            let nearest_class = class_offsets
+                .iter()
+                .filter(|off| **off >= ann_end)
+                .min()
+                .copied();
             let nearest_method = method_spans
                 .iter()
                 .map(|(off, _)| *off)
@@ -577,7 +584,14 @@ fn extract_java(
             &name,
         )
         .with_metadata(serde_json::Value::Object(meta))
-        .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "Spring mapping annotation");
+        .with_evidence(
+            path,
+            line,
+            line,
+            EvidenceClass::Fact,
+            1.0,
+            "Spring mapping annotation",
+        );
         let endpoint_id = entity.id.clone();
         add_contained(file, path, entity, line, entities, edges);
         // method→endpoint(Exposes):mapping 注解贴在方法声明前,配对"注解 offset 之后
@@ -661,13 +675,26 @@ fn extract_custom_endpoints(
             (endpoint_path.clone(), String::new())
         };
         let entity = Entity::new(
-            EntityId::stable("workspace", path, EntityKind::HttpEndpoint, &name, &discriminator),
+            EntityId::stable(
+                "workspace",
+                path,
+                EntityKind::HttpEndpoint,
+                &name,
+                &discriminator,
+            ),
             EntityKind::HttpEndpoint,
             &name,
             &name,
         )
         .with_metadata(json!({"path": endpoint_path, "framework": "custom"}))
-        .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "custom RPC framework mapping");
+        .with_evidence(
+            path,
+            line,
+            line,
+            EvidenceClass::Fact,
+            1.0,
+            "custom RPC framework mapping",
+        );
         add_contained(file, path, entity, line, entities, edges);
     }
 }
@@ -779,7 +806,14 @@ fn extract_mybatis_plus(
             &table_name_str,
             &table_name_str,
         )
-        .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "MyBatis Plus @TableName");
+        .with_evidence(
+            path,
+            line,
+            line,
+            EvidenceClass::Fact,
+            1.0,
+            "MyBatis Plus @TableName",
+        );
         let class_id = EntityId::stable("workspace", path, EntityKind::Class, &class_name, "");
         edges.push(
             Edge::new(class_id, table.id.clone(), EdgeKind::DependsOn).with_evidence(
@@ -1012,7 +1046,10 @@ fn extract_implements(masked: &MaskedSource, entities: &mut [Entity]) {
                     let iface = raw.split('<').next().unwrap_or("").trim();
                     // 合法 Java 标识符(首字母、后续字母数字下划线),过滤泛型残余如 "V>"
                     let valid = !iface.is_empty()
-                        && iface.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+                        && iface
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_alphabetic())
                         && iface.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
                     if valid {
                         Some(serde_json::Value::String(iface.to_string()))
@@ -1035,7 +1072,10 @@ fn extract_implements(masked: &MaskedSource, entities: &mut [Entity]) {
                     serde_json::Value::Object(map) => map,
                     _ => serde_json::Map::new(),
                 };
-                meta.insert("implements".into(), serde_json::Value::Array(ifaces.clone()));
+                meta.insert(
+                    "implements".into(),
+                    serde_json::Value::Array(ifaces.clone()),
+                );
                 entity.metadata = serde_json::Value::Object(meta);
             }
         }
@@ -1057,7 +1097,10 @@ fn extract_extends(masked: &MaskedSource, entities: &mut [Entity]) {
                     serde_json::Value::Object(map) => map,
                     _ => serde_json::Map::new(),
                 };
-                meta.insert("superclass".into(), serde_json::Value::String(superclass.clone()));
+                meta.insert(
+                    "superclass".into(),
+                    serde_json::Value::String(superclass.clone()),
+                );
                 entity.metadata = serde_json::Value::Object(meta);
             }
         }
@@ -1102,7 +1145,10 @@ fn extract_imports(masked: &MaskedSource, entities: &mut [Entity]) {
         meta.insert(
             "imports".into(),
             serde_json::Value::Array(
-                imports.iter().map(|fq| serde_json::Value::String(fq.clone())).collect(),
+                imports
+                    .iter()
+                    .map(|fq| serde_json::Value::String(fq.clone()))
+                    .collect(),
             ),
         );
         entity.metadata = serde_json::Value::Object(meta);
@@ -1157,39 +1203,49 @@ fn extract_interface_endpoints(
             &class_name,
             &format!("iface:{iface}"),
         );
-        let entity = Entity::new(endpoint_id.clone(), EntityKind::HttpEndpoint, &class_name, &class_name)
-            .with_metadata(json!({"path": class_name, "framework": format!("implements {iface}")}))
-            .with_evidence(
-                path,
-                line,
-                line,
-                EvidenceClass::Inferred,
-                0.8,
-                "custom RPC entry (implements framework interface)",
-            );
+        let entity = Entity::new(
+            endpoint_id.clone(),
+            EntityKind::HttpEndpoint,
+            &class_name,
+            &class_name,
+        )
+        .with_metadata(json!({"path": class_name, "framework": format!("implements {iface}")}))
+        .with_evidence(
+            path,
+            line,
+            line,
+            EvidenceClass::Inferred,
+            0.8,
+            "custom RPC entry (implements framework interface)",
+        );
         add_contained(file, path, entity, line, entities, edges);
         // 关联入口方法:该类(Declares 边)里名为 handle/bizProcess 等约定入口方法的,建
         // method→endpoint Exposes 边,让 relay/find_endpoint 能从 RMB 入口追到处理逻辑。
         // 入口方法名是约定(mes/mos 自研框架无注解标入口),后续可配置化扩展。
-        const ENTRY_METHODS: &[&str] =
-            &["handle", "handleRequest", "bizProcess", "process", "apiProcess"];
+        const ENTRY_METHODS: &[&str] = &[
+            "handle",
+            "handleRequest",
+            "bizProcess",
+            "process",
+            "apiProcess",
+        ];
         let entry_edges: Vec<Edge> = edges
             .iter()
             .filter(|edge| edge.kind == EdgeKind::Declares && edge.source == class_id)
             .filter_map(|edge| {
-                let is_entry = entities
-                    .iter()
-                    .any(|entity| entity.id == edge.target
-                        && ENTRY_METHODS.contains(&entity.name.as_str()));
+                let is_entry = entities.iter().any(|entity| {
+                    entity.id == edge.target && ENTRY_METHODS.contains(&entity.name.as_str())
+                });
                 is_entry.then(|| {
-                    Edge::new(edge.target.clone(), endpoint_id.clone(), EdgeKind::Exposes).with_evidence(
-                        path,
-                        line,
-                        line,
-                        EvidenceClass::Inferred,
-                        0.8,
-                        "entry method of custom RPC handler (implements framework interface)",
-                    )
+                    Edge::new(edge.target.clone(), endpoint_id.clone(), EdgeKind::Exposes)
+                        .with_evidence(
+                            path,
+                            line,
+                            line,
+                            EvidenceClass::Inferred,
+                            0.8,
+                            "entry method of custom RPC handler (implements framework interface)",
+                        )
                 })
             })
             .collect();
@@ -1209,12 +1265,20 @@ fn extract_annotations(
     edges: &mut Vec<Edge>,
     config: &SemanticsConfig,
 ) {
-    let whitelist: HashSet<&str> = config.annotation_whitelist.iter().map(|s| s.as_str()).collect();
+    let whitelist: HashSet<&str> = config
+        .annotation_whitelist
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
     if whitelist.is_empty() {
         return;
     }
     // 黑名单兜底：即便白名单（含用户自填全集替换）误命中 @Override 等噪音也跳过。
-    let blacklist: HashSet<&str> = config.annotation_blacklist.iter().map(|s| s.as_str()).collect();
+    let blacklist: HashSet<&str> = config
+        .annotation_blacklist
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
     let content = &file.content;
     // owner 候选:(声明 name offset, EntityId)。class/interface、method、field 合并取最近。
     // 全部跑在 bare 掩码上,且 Field id 与 extract_java 同公式(含所属类判别符)。
@@ -1272,7 +1336,14 @@ fn extract_annotations(
             ann_name.as_str(),
             format!("{path}#{}@{line}", ann_name.as_str()),
         )
-        .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "annotation usage");
+        .with_evidence(
+            path,
+            line,
+            line,
+            EvidenceClass::Fact,
+            1.0,
+            "annotation usage",
+        );
         let ann_id = annotation.id.clone();
         entities.push(annotation);
         edges.push(
@@ -1316,7 +1387,11 @@ fn extract_tests(
                     .filter(|(offset, _)| *offset > ann_offset)
                     .min_by_key(|(offset, _)| *offset)?;
                 let line = line_of(content, ann_offset);
-                let method_name = name_by_id.get(method_id).copied().unwrap_or("test").to_string();
+                let method_name = name_by_id
+                    .get(method_id)
+                    .copied()
+                    .unwrap_or("test")
+                    .to_string();
                 Some((method_name, line))
             })
             .collect()
@@ -1335,7 +1410,14 @@ fn extract_tests(
             format!("{path}#test:{method_name}:{line}"),
         )
         .with_metadata(json!({"tested_method": method_name}))
-        .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "JUnit @Test method");
+        .with_evidence(
+            path,
+            line,
+            line,
+            EvidenceClass::Fact,
+            1.0,
+            "JUnit @Test method",
+        );
         entities.push(test_case);
     }
 }
@@ -1380,7 +1462,11 @@ fn extract_jobs(
                     .filter(|(offset, _)| *offset > ann_offset)
                     .min_by_key(|(offset, _)| *offset)?;
                 let line = line_of(content, ann_offset);
-                let method_name = name_by_id.get(method_id).copied().unwrap_or("job").to_string();
+                let method_name = name_by_id
+                    .get(method_id)
+                    .copied()
+                    .unwrap_or("job")
+                    .to_string();
                 Some((method_name, method_id.clone(), line, trigger))
             })
             .collect()
@@ -1399,7 +1485,14 @@ fn extract_jobs(
             format!("{path}#job:{method_name}:{line}"),
         )
         .with_metadata(json!({"trigger": trigger}))
-        .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "scheduled job entry");
+        .with_evidence(
+            path,
+            line,
+            line,
+            EvidenceClass::Fact,
+            1.0,
+            "scheduled job entry",
+        );
         let job_id = job.id.clone();
         entities.push(job);
         edges.push(
@@ -1491,7 +1584,9 @@ fn visit_spring(
     injected_fields: &mut HashMap<String, Vec<(String, String)>>,
 ) {
     match node.kind() {
-        "class_declaration" | "interface_declaration" | "record_declaration"
+        "class_declaration"
+        | "interface_declaration"
+        | "record_declaration"
         | "enum_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = node_text(source, name_node);
@@ -1525,9 +1620,13 @@ fn visit_spring(
                 let all_args = has_annotation(source, node, &["AllArgsConstructor"]);
                 if all_args || has_annotation(source, node, &["RequiredArgsConstructor"]) {
                     for bi in 0..node.named_child_count() {
-                        let Some(body) = node.named_child(bi) else { continue };
+                        let Some(body) = node.named_child(bi) else {
+                            continue;
+                        };
                         for ci in 0..body.named_child_count() {
-                            let Some(member) = body.named_child(ci) else { continue };
+                            let Some(member) = body.named_child(ci) else {
+                                continue;
+                            };
                             if member.kind() != "field_declaration" {
                                 continue;
                             }
@@ -1645,7 +1744,16 @@ fn visit_spring(
     }
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
-            visit_spring(child, source, file, path, entities, edges, signals, injected_fields);
+            visit_spring(
+                child,
+                source,
+                file,
+                path,
+                entities,
+                edges,
+                signals,
+                injected_fields,
+            );
         }
     }
 }
@@ -1721,8 +1829,14 @@ fn walk_complexity(node: Node<'_>, source: &[u8], stats: &mut ComplexityStats, l
     let kind = node.kind();
     let mut child_loop_nesting = loop_nesting;
     match kind {
-        "if_statement" | "for_statement" | "enhanced_for_statement" | "while_statement"
-        | "do_statement" | "switch_expression" | "switch_statement" | "catch_clause"
+        "if_statement"
+        | "for_statement"
+        | "enhanced_for_statement"
+        | "while_statement"
+        | "do_statement"
+        | "switch_expression"
+        | "switch_statement"
+        | "catch_clause"
         | "ternary_expression" => stats.complexity += 1,
         // && / ||:tree-sitter-java 的 binary_expression,文本含操作符即一个布尔决策点。
         "binary_expression" => {
@@ -1779,7 +1893,10 @@ struct ExceptionRef {
 
 /// 取类型节点的简单名(Exception / BusinessException),去 scoped/generic 后缀。
 fn simple_type_name(node: &Node, source: &[u8]) -> Option<String> {
-    if !matches!(node.kind(), "type_identifier" | "scoped_type_identifier" | "generic_type") {
+    if !matches!(
+        node.kind(),
+        "type_identifier" | "scoped_type_identifier" | "generic_type"
+    ) {
         return None;
     }
     let text = node_text(source, *node);
@@ -1818,8 +1935,10 @@ fn walk_exceptions(
     refs: &mut Vec<ExceptionRef>,
     file_content: &str,
 ) {
-    if matches!(node.kind(), "method_declaration" | "constructor_declaration")
-        && let Some(name_node) = node.child_by_field_name("name")
+    if matches!(
+        node.kind(),
+        "method_declaration" | "constructor_declaration"
+    ) && let Some(name_node) = node.child_by_field_name("name")
     {
         let mname = node_text(source, name_node);
         for i in 0..node.named_child_count() {
@@ -1903,12 +2022,25 @@ fn visit_methods(
             .map(|body| ComplexityStats::for_body(body, source))
             .unwrap_or_default();
         let entity = Entity::new(
-            EntityId::stable("workspace", path, EntityKind::Method, &name, &format!("arity:{arity}")),
+            EntityId::stable(
+                "workspace",
+                path,
+                EntityKind::Method,
+                &name,
+                &format!("arity:{arity}"),
+            ),
             EntityKind::Method,
             &name,
             format!("{path}#{name}"),
         )
-        .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "Java method declaration")
+        .with_evidence(
+            path,
+            line,
+            line,
+            EvidenceClass::Fact,
+            1.0,
+            "Java method declaration",
+        )
         .with_metadata(json!({
             "body_end_line": body_end_line,
             "arity": arity,
@@ -1955,8 +2087,7 @@ fn visit_methods(
         return;
     }
     if node.kind() == "method_invocation"
-        && let (Some(caller), Some(name_node)) =
-            (current_method, node.child_by_field_name("name"))
+        && let (Some(caller), Some(name_node)) = (current_method, node.child_by_field_name("name"))
     {
         let callee = node_text(source, name_node);
         if !callee.is_empty() {
@@ -2131,7 +2262,14 @@ fn link_bean(
         type_name,
         type_name,
     )
-    .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "Spring bean (DI target)");
+    .with_evidence(
+        path,
+        line,
+        line,
+        EvidenceClass::Fact,
+        1.0,
+        "Spring bean (DI target)",
+    );
     let owner_id = EntityId::stable("workspace", path, owner_kind, owner_name, "");
     let reason = match relation {
         EdgeKind::Injects => "constructor/field injection (@Autowired/@Resource/Lombok)",
@@ -2139,8 +2277,14 @@ fn link_bean(
         _ => "Spring bean relation",
     };
     edges.push(
-        Edge::new(owner_id, bean.id.clone(), relation)
-            .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, reason),
+        Edge::new(owner_id, bean.id.clone(), relation).with_evidence(
+            path,
+            line,
+            line,
+            EvidenceClass::Fact,
+            1.0,
+            reason,
+        ),
     );
     edges.push(
         Edge::new(file.id.clone(), bean.id.clone(), EdgeKind::Contains).with_evidence(

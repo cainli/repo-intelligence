@@ -96,22 +96,30 @@ fn search_trigram_recalls_camelcase_substrings_and_falls_back_for_short_queries(
             vec![],
         ))
         .unwrap();
-    let names = |ms: Vec<EntityMatch>| {
-        ms.into_iter()
-            .map(|m| m.entity.name)
-            .collect::<Vec<_>>()
-    };
+    let names = |ms: Vec<EntityMatch>| ms.into_iter().map(|m| m.entity.name).collect::<Vec<_>>();
     // camelCase 子串:查 userId 命中 getUserId(trigram 索引化子串匹配)。
-    assert!(names(store.search(SearchQuery::new("userId").with_limit(10)).unwrap())
-        .contains(&"getUserId".to_string()));
+    assert!(
+        names(
+            store
+                .search(SearchQuery::new("userId").with_limit(10))
+                .unwrap()
+        )
+        .contains(&"getUserId".to_string())
+    );
     // 大小写不敏感子串:查 user 命中全部三个(跨大小写 camelCase)。
-    let user_hits = names(store.search(SearchQuery::new("user").with_limit(10)).unwrap());
+    let user_hits = names(
+        store
+            .search(SearchQuery::new("user").with_limit(10))
+            .unwrap(),
+    );
     assert!(user_hits.contains(&"getUserId".to_string()));
     assert!(user_hits.contains(&"UserServiceImpl".to_string()));
     assert!(user_hits.contains(&"eqUser".to_string()));
     // 短查询(<3 字符)走 LIKE fallback:trigram 盲区,查 eq 仍命中 eqUser。
-    assert!(names(store.search(SearchQuery::new("eq").with_limit(10)).unwrap())
-        .contains(&"eqUser".to_string()));
+    assert!(
+        names(store.search(SearchQuery::new("eq").with_limit(10)).unwrap())
+            .contains(&"eqUser".to_string())
+    );
 }
 
 #[test]
@@ -119,9 +127,14 @@ fn search_uses_like_when_fts_disabled() {
     // fts 关闭时 search 走 LIKE 兜底(fts_populated 保护 + fts_enabled=false)。
     let mut store = SqliteGraphStore::open_in_memory_with_fts(false).unwrap();
     store
-        .apply_patch(GraphPatch::add(vec![entity(EntityKind::Method, "getUserId")], vec![]))
+        .apply_patch(GraphPatch::add(
+            vec![entity(EntityKind::Method, "getUserId")],
+            vec![],
+        ))
         .unwrap();
-    let hits = store.search(SearchQuery::new("userId").with_limit(10)).unwrap();
+    let hits = store
+        .search(SearchQuery::new("userId").with_limit(10))
+        .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].entity.name, "getUserId");
 }
@@ -199,7 +212,12 @@ fn search_exact_name_returns_only_exact_case_sensitive_matches() {
     assert_eq!(matches[0].id, exact.id);
 
     // 大小写敏感:BINARY 比较,customername 不命中
-    assert!(store.search_exact_name("customername", 100).unwrap().is_empty());
+    assert!(
+        store
+            .search_exact_name("customername", 100)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -237,8 +255,5 @@ fn search_offset_skips_the_first_n_matches() {
     assert_eq!(names(page0), ["shared_0", "shared_1"]);
     assert_eq!(names(page1), ["shared_2", "shared_3"]);
     assert_eq!(names(page2), ["shared_4"]);
-    assert!(
-        beyond.is_empty(),
-        "offset past the end must return nothing"
-    );
+    assert!(beyond.is_empty(), "offset past the end must return nothing");
 }

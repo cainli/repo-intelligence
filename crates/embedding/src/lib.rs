@@ -23,8 +23,14 @@ impl Embedder {
         let tokenizer_files = TokenizerFiles {
             tokenizer_file: include_bytes!("../models/all-MiniLM-L6-v2/tokenizer.json").to_vec(),
             config_file: include_bytes!("../models/all-MiniLM-L6-v2/config.json").to_vec(),
-            special_tokens_map_file: include_bytes!("../models/all-MiniLM-L6-v2/special_tokens_map.json").to_vec(),
-            tokenizer_config_file: include_bytes!("../models/all-MiniLM-L6-v2/tokenizer_config.json").to_vec(),
+            special_tokens_map_file: include_bytes!(
+                "../models/all-MiniLM-L6-v2/special_tokens_map.json"
+            )
+            .to_vec(),
+            tokenizer_config_file: include_bytes!(
+                "../models/all-MiniLM-L6-v2/tokenizer_config.json"
+            )
+            .to_vec(),
         };
         let mut model = UserDefinedEmbeddingModel::new(
             include_bytes!("../models/all-MiniLM-L6-v2/model.onnx").to_vec(),
@@ -32,11 +38,9 @@ impl Embedder {
         );
         // AllMiniLML6V2 用 mean pooling(对短文本/entity 名效果好)。
         model.pooling = Some(Pooling::Mean);
-        let model = TextEmbedding::try_new_from_user_defined(
-            model,
-            InitOptionsUserDefined::default(),
-        )
-        .context("加载本地 ONNX 模型失败")?;
+        let model =
+            TextEmbedding::try_new_from_user_defined(model, InitOptionsUserDefined::default())
+                .context("加载本地 ONNX 模型失败")?;
         Ok(Self { model })
     }
 
@@ -66,7 +70,11 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
     let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let score = if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) };
+    let score = if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    };
     if score.is_finite() { score } else { 0.0 }
 }
 

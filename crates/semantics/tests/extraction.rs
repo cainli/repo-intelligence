@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use repo_intelligence_model::{EdgeKind, EntityId, EntityKind, EvidenceClass};
-use repo_intelligence_semantics::{extract, extract_with_config, SemanticsConfig};
+use repo_intelligence_semantics::{SemanticsConfig, extract, extract_with_config};
 use repo_intelligence_source::{FileKind, SourceFile};
 
 fn java_file(name: &str, body: &str) -> SourceFile {
@@ -185,7 +185,10 @@ fn default_whitelist_covers_jpa_and_conditions_annotations() {
         "@ConditionalOnProperty 应结构化, got {names:?}"
     );
     assert!(
-        patch.add_edges.iter().any(|e| e.kind == EdgeKind::Annotated),
+        patch
+            .add_edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::Annotated),
         "应产出 Annotated 边"
     );
 }
@@ -258,7 +261,8 @@ fn method_body_end_line_covers_full_body() {
         .expect("metadata.body_end_line 存在");
     assert!(
         body_end > ev.start_line as u64,
-        "body_end_line {body_end} 应大于声明行 {}", ev.start_line
+        "body_end_line {body_end} 应大于声明行 {}",
+        ev.start_line
     );
 }
 
@@ -298,7 +302,11 @@ fn extract_extends_and_abstract_metadata() {
         "Concrete 应 metadata.superclass=AbstractBase"
     );
     assert!(
-        concrete.metadata.get("abstract").and_then(|v| v.as_bool()).is_none(),
+        concrete
+            .metadata
+            .get("abstract")
+            .and_then(|v| v.as_bool())
+            .is_none(),
         "Concrete 非 abstract,不应有 abstract metadata"
     );
 }

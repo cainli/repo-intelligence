@@ -34,8 +34,7 @@ pub const DEFAULT_EXCLUDED_DIRS: &[&str] = &[
 ];
 
 /// 自研 RPC 框架端点注解（原 `semantics::CUSTOM_ENDPOINT_ANNOTATIONS`）。
-pub const DEFAULT_CUSTOM_ENDPOINT_ANNOTATIONS: &[&str] =
-    &["RmbMap", "DubboService", "RpcMapping"];
+pub const DEFAULT_CUSTOM_ENDPOINT_ANNOTATIONS: &[&str] = &["RmbMap", "DubboService", "RpcMapping"];
 
 /// 自研 RPC 框架的入口标记接口：implements 这些接口的类视为业务入口（mes/mos 的 RMB
 /// 入口普遍用 `@MosApi + implements ApiHandler`、`implements IBizProcess` 这套自定义框架，
@@ -44,19 +43,103 @@ pub const DEFAULT_CUSTOM_ENDPOINT_INTERFACES: &[&str] = &["ApiHandler", "IBizPro
 
 /// 前端属性访问噪声词（原 `semantics::FRONTEND_NOISE`）。
 pub const DEFAULT_FRONTEND_NOISE: &[&str] = &[
-    "length", "size", "toString", "valueOf", "prototype", "constructor",
-    "call", "apply", "bind", "push", "pop", "shift", "unshift",
-    "split", "join", "slice", "splice", "concat", "reverse", "sort",
-    "map", "filter", "forEach", "find", "findIndex", "some", "every", "reduce", "reduceRight",
-    "includes", "indexOf", "lastIndexOf", "flat", "flatMap", "fill", "copyWithin",
-    "floor", "ceil", "round", "random", "abs", "max", "min", "pow", "sqrt", "log", "exp", "sign",
-    "keys", "values", "entries", "assign", "freeze", "from", "isArray", "create", "getPrototypeOf",
-    "trim", "trimStart", "trimEnd", "replace", "replaceAll", "match", "matchAll", "search",
-    "toLowerCase", "toUpperCase", "charAt", "charCodeAt", "padStart", "padEnd", "startsWith", "endsWith",
-    "then", "catch", "finally", "resolve", "reject", "all", "race", "allSettled",
-    "log", "error", "warn", "info", "debug", "time", "timeEnd",
-    "createElement", "appendChild", "querySelector", "querySelectorAll", "getElementById",
-    "addEventListener", "removeEventListener", "preventDefault", "stopPropagation",
+    "length",
+    "size",
+    "toString",
+    "valueOf",
+    "prototype",
+    "constructor",
+    "call",
+    "apply",
+    "bind",
+    "push",
+    "pop",
+    "shift",
+    "unshift",
+    "split",
+    "join",
+    "slice",
+    "splice",
+    "concat",
+    "reverse",
+    "sort",
+    "map",
+    "filter",
+    "forEach",
+    "find",
+    "findIndex",
+    "some",
+    "every",
+    "reduce",
+    "reduceRight",
+    "includes",
+    "indexOf",
+    "lastIndexOf",
+    "flat",
+    "flatMap",
+    "fill",
+    "copyWithin",
+    "floor",
+    "ceil",
+    "round",
+    "random",
+    "abs",
+    "max",
+    "min",
+    "pow",
+    "sqrt",
+    "log",
+    "exp",
+    "sign",
+    "keys",
+    "values",
+    "entries",
+    "assign",
+    "freeze",
+    "from",
+    "isArray",
+    "create",
+    "getPrototypeOf",
+    "trim",
+    "trimStart",
+    "trimEnd",
+    "replace",
+    "replaceAll",
+    "match",
+    "matchAll",
+    "search",
+    "toLowerCase",
+    "toUpperCase",
+    "charAt",
+    "charCodeAt",
+    "padStart",
+    "padEnd",
+    "startsWith",
+    "endsWith",
+    "then",
+    "catch",
+    "finally",
+    "resolve",
+    "reject",
+    "all",
+    "race",
+    "allSettled",
+    "log",
+    "error",
+    "warn",
+    "info",
+    "debug",
+    "time",
+    "timeEnd",
+    "createElement",
+    "appendChild",
+    "querySelector",
+    "querySelectorAll",
+    "getElementById",
+    "addEventListener",
+    "removeEventListener",
+    "preventDefault",
+    "stopPropagation",
 ];
 
 /// 放行的生成源码目录前缀（命中 builtin exclude 但相对路径匹配这些前缀 → 仍索引）。
@@ -75,12 +158,24 @@ pub const DEFAULT_SCHEDULER_ANNOTATIONS: &[&str] = &["Scheduled", "XxlJob", "Job
 /// annotation_blacklist 兜底过滤误命中噪音。
 pub const DEFAULT_ANNOTATION_WHITELIST: &[&str] = &[
     // 事务 / 异步 / 缓存 / 事件 —— 业务行为注解，查询价值高。
-    "Transactional", "Async", "Cacheable", "CacheEvict", "CachePut", "EventListener",
-    "PostConstruct", "PreDestroy", "TransactionalEventListener", "Aspect",
+    "Transactional",
+    "Async",
+    "Cacheable",
+    "CacheEvict",
+    "CachePut",
+    "EventListener",
+    "PostConstruct",
+    "PreDestroy",
+    "TransactionalEventListener",
+    "Aspect",
     // 持久层标识（JPA/MyBatis）—— 让"@Entity 标注的类""@Mapper 接口"可查。
-    "Entity", "Table", "Mapper", "Repository",
+    "Entity",
+    "Table",
+    "Mapper",
+    "Repository",
     // Spring Boot 装配条件 / 环境 —— 开关与 profile 语义，影响面分析价值高。
-    "ConditionalOnProperty", "Profile",
+    "ConditionalOnProperty",
+    "Profile",
 ];
 
 /// 注解黑名单（即便被白名单规则意外命中也绝不索引的噪音）。
@@ -161,10 +256,10 @@ impl IndexerConfig {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let text = fs::read_to_string(&path)
-            .with_context(|| format!("read config {}", path.display()))?;
-        let config: IndexerConfig = toml::from_str(&text)
-            .with_context(|| format!("parse config {}", path.display()))?;
+        let text =
+            fs::read_to_string(&path).with_context(|| format!("read config {}", path.display()))?;
+        let config: IndexerConfig =
+            toml::from_str(&text).with_context(|| format!("parse config {}", path.display()))?;
         Ok(config)
     }
 }
@@ -421,7 +516,8 @@ frontend_noise_extra = ["bizUtil", "formatDate"]
     fn load_reads_workspace_config() {
         let dir = tempfile::tempdir().unwrap();
         let mut f = fs::File::create(dir.path().join(CONFIG_FILENAME)).unwrap();
-        f.write_all(b"[analysis]\ndefault_impact_limit = 250\n").unwrap();
+        f.write_all(b"[analysis]\ndefault_impact_limit = 250\n")
+            .unwrap();
         drop(f);
         let cfg = IndexerConfig::load(dir.path()).unwrap();
         assert_eq!(cfg.analysis.default_impact_limit, 250);

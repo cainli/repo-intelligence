@@ -44,7 +44,13 @@ fn mcp_searches_the_persistent_graph() {
     let input = br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_entities","arguments":{"query":"customerName"}}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database), directory.path()).unwrap();
+    repo_intelligence_mcp::serve(
+        Cursor::new(input),
+        &mut output,
+        Some(&database),
+        directory.path(),
+    )
+    .unwrap();
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     assert_eq!(response["id"], 2);
     assert!(
@@ -109,7 +115,13 @@ fn index_status_is_bounded_for_large_graphs() {
     let input = br#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"get_index_status","arguments":{}}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database), directory.path()).unwrap();
+    repo_intelligence_mcp::serve(
+        Cursor::new(input),
+        &mut output,
+        Some(&database),
+        directory.path(),
+    )
+    .unwrap();
 
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     assert_eq!(
@@ -133,7 +145,13 @@ fn index_status_reports_an_uninitialized_index() {
     let input = br#"{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"get_index_status","arguments":{}}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database), directory.path()).unwrap();
+    repo_intelligence_mcp::serve(
+        Cursor::new(input),
+        &mut output,
+        Some(&database),
+        directory.path(),
+    )
+    .unwrap();
 
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     let structured = &response["result"]["structuredContent"];
@@ -159,7 +177,13 @@ fn index_status_reports_absolute_database_path() {
     let input = br#"{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"get_index_status","arguments":{}}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database), directory.path()).unwrap();
+    repo_intelligence_mcp::serve(
+        Cursor::new(input),
+        &mut output,
+        Some(&database),
+        directory.path(),
+    )
+    .unwrap();
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     let reported = response["result"]["structuredContent"]["database"]
         .as_str()
@@ -181,7 +205,13 @@ fn analyze_change_warns_when_index_is_empty() {
     let input = br#"{"jsonrpc":"2.0","id":43,"method":"tools/call","params":{"name":"analyze_change","arguments":{"target_kind":"field","operation":"rename","from":"x","to":"y"}}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database), directory.path()).unwrap();
+    repo_intelligence_mcp::serve(
+        Cursor::new(input),
+        &mut output,
+        Some(&database),
+        directory.path(),
+    )
+    .unwrap();
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     let questions = response["result"]["structuredContent"]["open_questions"]
         .as_array()
@@ -237,7 +267,13 @@ fn system_view_is_bounded_and_groups_by_kind() {
     let input = br#"{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"show_system_view","arguments":{"view":"repositories"}}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database), directory.path()).unwrap();
+    repo_intelligence_mcp::serve(
+        Cursor::new(input),
+        &mut output,
+        Some(&database),
+        directory.path(),
+    )
+    .unwrap();
 
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     let structured = &response["result"]["structuredContent"];
@@ -269,7 +305,13 @@ fn search_returns_structured_content_as_an_object() {
     let input = br#"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"search_entities","arguments":{"query":"customerName"}}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database), directory.path()).unwrap();
+    repo_intelligence_mcp::serve(
+        Cursor::new(input),
+        &mut output,
+        Some(&database),
+        directory.path(),
+    )
+    .unwrap();
 
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     let structured = &response["result"]["structuredContent"];
@@ -324,7 +366,13 @@ fn system_view_filters_to_the_requested_plane() {
     let input = br#"{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"show_system_view","arguments":{"view":"data"}}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database), directory.path()).unwrap();
+    repo_intelligence_mcp::serve(
+        Cursor::new(input),
+        &mut output,
+        Some(&database),
+        directory.path(),
+    )
+    .unwrap();
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     let by_kind = &response["result"]["structuredContent"]["entities_by_kind"];
     assert_eq!(by_kind["table"], 1);
@@ -407,7 +455,13 @@ fn find_endpoint_returns_only_endpoint_kinds() {
     let input = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"find_endpoint","arguments":{"query":"order"}}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database), directory.path()).unwrap();
+    repo_intelligence_mcp::serve(
+        Cursor::new(input),
+        &mut output,
+        Some(&database),
+        directory.path(),
+    )
+    .unwrap();
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     let items = response["result"]["structuredContent"]["items"]
         .as_array()
@@ -445,7 +499,13 @@ fn analyze_change_paginates_findings_and_reports_total() {
     let input = br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"analyze_change","arguments":{"target_kind":"field","operation":"remove","from":"sharedName","limit":2,"offset":0}}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database), directory.path()).unwrap();
+    repo_intelligence_mcp::serve(
+        Cursor::new(input),
+        &mut output,
+        Some(&database),
+        directory.path(),
+    )
+    .unwrap();
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     let structured = &response["result"]["structuredContent"];
     assert_eq!(structured["findings"].as_array().unwrap().len(), 2);
@@ -474,8 +534,13 @@ fn scan_workspace_reports_kind_distribution_and_excluded_dirs() {
     let input = serde_json::to_string(&request).unwrap();
 
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input.as_bytes()), &mut output, Some(&database), database.parent().unwrap())
-        .unwrap();
+    repo_intelligence_mcp::serve(
+        Cursor::new(input.as_bytes()),
+        &mut output,
+        Some(&database),
+        database.parent().unwrap(),
+    )
+    .unwrap();
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     let structured = &response["result"]["structuredContent"];
     assert!(structured["entities_by_kind"].is_object());
@@ -502,7 +567,13 @@ fn empty_search_attaches_a_hint_instead_of_silent_zero() {
     let input = br#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"analyze_requirement","arguments":{"query":"nonexistent"}}}
 "#;
     let mut output = Vec::new();
-    repo_intelligence_mcp::serve(Cursor::new(input), &mut output, Some(&database), directory.path()).unwrap();
+    repo_intelligence_mcp::serve(
+        Cursor::new(input),
+        &mut output,
+        Some(&database),
+        directory.path(),
+    )
+    .unwrap();
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     let structured = &response["result"]["structuredContent"];
     assert_eq!(structured["count"], 0);
@@ -600,8 +671,13 @@ fn call_tool(
     });
     let mut output = Vec::new();
     let line = format!("{request}\n");
-    repo_intelligence_mcp::serve(Cursor::new(line.as_bytes()), &mut output, Some(database), database.parent().unwrap())
-        .unwrap();
+    repo_intelligence_mcp::serve(
+        Cursor::new(line.as_bytes()),
+        &mut output,
+        Some(database),
+        database.parent().unwrap(),
+    )
+    .unwrap();
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     response["result"]["structuredContent"].clone()
 }
@@ -764,7 +840,10 @@ fn trace_disambiguates_same_name_by_qualified_name() {
         "trace_callers",
         serde_json::json!({"name": "S27204"}),
     );
-    assert_eq!(by_name["start_count"], 2, "both same-named starts merge: {by_name}");
+    assert_eq!(
+        by_name["start_count"], 2,
+        "both same-named starts merge: {by_name}"
+    );
     assert!(
         by_name["hint"].as_str().is_some(),
         "ambiguous starts should attach a disambiguation hint: {by_name}"
@@ -901,8 +980,22 @@ fn field_with_evidence(name: &str) -> Entity {
         name,
         format!("E.{name}"),
     )
-    .with_evidence("E.java", 10, 12, EvidenceClass::Fact, 1.0, "field declared here")
-    .with_evidence("Mapper.xml", 5, 5, EvidenceClass::Inferred, 0.7, "mapped in result map")
+    .with_evidence(
+        "E.java",
+        10,
+        12,
+        EvidenceClass::Fact,
+        1.0,
+        "field declared here",
+    )
+    .with_evidence(
+        "Mapper.xml",
+        5,
+        5,
+        EvidenceClass::Inferred,
+        0.7,
+        "mapped in result map",
+    )
 }
 
 #[test]
@@ -914,7 +1007,10 @@ fn search_compact_omits_evidence_bodies_by_default() {
     let database = directory.path().join("graph.sqlite");
     let mut store = SqliteGraphStore::open(&database).unwrap();
     store
-        .apply_patch(GraphPatch::add(vec![field_with_evidence("s27204_code")], vec![]))
+        .apply_patch(GraphPatch::add(
+            vec![field_with_evidence("s27204_code")],
+            vec![],
+        ))
         .unwrap();
     drop(store);
 
@@ -946,7 +1042,10 @@ fn search_verbose_expands_the_full_entity() {
     let database = directory.path().join("graph.sqlite");
     let mut store = SqliteGraphStore::open(&database).unwrap();
     store
-        .apply_patch(GraphPatch::add(vec![field_with_evidence("s27204_code")], vec![]))
+        .apply_patch(GraphPatch::add(
+            vec![field_with_evidence("s27204_code")],
+            vec![],
+        ))
         .unwrap();
     drop(store);
 
@@ -988,7 +1087,9 @@ fn search_paginates_with_offset_and_reports_has_more() {
             )
         })
         .collect();
-    store.apply_patch(GraphPatch::add(entities, vec![])).unwrap();
+    store
+        .apply_patch(GraphPatch::add(entities, vec![]))
+        .unwrap();
     drop(store);
 
     let page0 = call_tool(

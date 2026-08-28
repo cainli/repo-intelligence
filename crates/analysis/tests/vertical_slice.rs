@@ -92,9 +92,11 @@ fn scan_reports_stage_and_file_progress() {
         .unwrap();
 
     assert_eq!(progress.first().unwrap().phase, ScanPhase::Discovering);
-    assert!(progress
-        .iter()
-        .any(|event| event.phase == ScanPhase::Parsing && event.total == 1));
+    assert!(
+        progress
+            .iter()
+            .any(|event| event.phase == ScanPhase::Parsing && event.total == 1)
+    );
     assert!(
         progress
             .iter()
@@ -885,10 +887,17 @@ fn mybatis_plus_lambda_wrapper_extracts_column() {
 fn incremental_scan_reuses_unchanged_extracts() {
     // 未变文件跳过:第二次 scan files_extracted=0,且图中实体数不变(file_state 增量)。
     let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join("A.java"), "class A { private String name; }").unwrap();
+    fs::write(
+        dir.path().join("A.java"),
+        "class A { private String name; }",
+    )
+    .unwrap();
     let mut store = SqliteGraphStore::open_in_memory().unwrap();
     let first = WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
-    assert_eq!(first.files_extracted, first.files_indexed, "首次全量 extract");
+    assert_eq!(
+        first.files_extracted, first.files_indexed,
+        "首次全量 extract"
+    );
     let (entities_after_first, _) = store.counts().unwrap();
     let second = WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
     assert_eq!(second.files_extracted, 0, "未变文件跳过,extract=0");
@@ -926,7 +935,11 @@ fn incremental_scan_removes_deleted_file_entities() {
     // 删除文件:第二次 scan files_deleted=1,该文件实体从图中消失,其余不变。
     let dir = tempfile::tempdir().unwrap();
     let b = dir.path().join("B.java");
-    fs::write(dir.path().join("A.java"), "class A { private String name; }").unwrap();
+    fs::write(
+        dir.path().join("A.java"),
+        "class A { private String name; }",
+    )
+    .unwrap();
     fs::write(&b, "class B { private String title; }").unwrap();
     let mut store = SqliteGraphStore::open_in_memory().unwrap();
     WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
@@ -1092,7 +1105,11 @@ fn method_level_request_mapping_wildcard_match() {
         "#,
     )
     .unwrap();
-    fs::write(dir.path().join("p.vue"), r#"<script>axios.post("/foo")</script>"#).unwrap();
+    fs::write(
+        dir.path().join("p.vue"),
+        r#"<script>axios.post("/foo")</script>"#,
+    )
+    .unwrap();
     let mut store = SqliteGraphStore::open_in_memory().unwrap();
     WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
     let call = store
@@ -1138,7 +1155,11 @@ fn segment_suffix_align_rejects_long_tail() {
         "#,
     )
     .unwrap();
-    fs::write(dir.path().join("p.vue"), r#"<script>axios.get("/foo")</script>"#).unwrap();
+    fs::write(
+        dir.path().join("p.vue"),
+        r#"<script>axios.get("/foo")</script>"#,
+    )
+    .unwrap();
     let mut store = SqliteGraphStore::open_in_memory().unwrap();
     WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
     let call = store
@@ -1155,7 +1176,11 @@ fn segment_suffix_align_rejects_long_tail() {
                 .with_kinds(vec![EdgeKind::MatchesEndpoint]),
         )
         .unwrap();
-    assert!(t.edges.is_empty(), "段数差>3 的长尾不应连, got {:?}", t.edges);
+    assert!(
+        t.edges.is_empty(),
+        "段数差>3 的长尾不应连, got {:?}",
+        t.edges
+    );
 }
 
 #[test]
@@ -1254,9 +1279,15 @@ fn tests_edge_inferred_from_test_class_imports() {
                 .any(|n| n.id == e.target && n.name == "DemoService")
     });
     let Some(edge) = edge else {
-        panic!("DemoUnitTest 应经 Tests(import 推断)连到 DemoService: {:?}", t.edges);
+        panic!(
+            "DemoUnitTest 应经 Tests(import 推断)连到 DemoService: {:?}",
+            t.edges
+        );
     };
-    let ev = edge.evidence.first().expect("import 推断 Tests 边带 evidence");
+    let ev = edge
+        .evidence
+        .first()
+        .expect("import 推断 Tests 边带 evidence");
     assert_eq!(ev.classification, EvidenceClass::Inferred);
     assert!(
         (ev.confidence - 0.6).abs() < f32::EPSILON,
@@ -1506,10 +1537,7 @@ fn cross_file_static_call_on_named_type() {
         .find(|x| x.entity.kind == EntityKind::Method && x.entity.name == "m")
         .expect("method m");
     let chain = store
-        .traverse(
-            TraverseQuery::outbound(m.entity.id.clone())
-                .with_kinds(vec![EdgeKind::Calls]),
-        )
+        .traverse(TraverseQuery::outbound(m.entity.id.clone()).with_kinds(vec![EdgeKind::Calls]))
         .unwrap();
     let names: Vec<&str> = chain.entities.iter().map(|e| e.name.as_str()).collect();
     assert!(
@@ -1549,10 +1577,7 @@ fn chain_and_new_receivers_do_not_create_cross_file_calls() {
         .find(|x| x.entity.kind == EntityKind::Method && x.entity.name == "m")
         .expect("method m");
     let chain = store
-        .traverse(
-            TraverseQuery::outbound(m.entity.id.clone())
-                .with_kinds(vec![EdgeKind::Calls]),
-        )
+        .traverse(TraverseQuery::outbound(m.entity.id.clone()).with_kinds(vec![EdgeKind::Calls]))
         .unwrap();
     let names: Vec<&str> = chain.entities.iter().map(|e| e.name.as_str()).collect();
     assert!(
@@ -1595,9 +1620,7 @@ fn injected_field_call_reaches_injected_type_method() {
         .find(|x| x.entity.kind == EntityKind::Method && x.entity.name == "get")
         .expect("method get");
     let chain = store
-        .traverse(
-            TraverseQuery::outbound(get.entity.id.clone()).with_kinds(vec![EdgeKind::Calls]),
-        )
+        .traverse(TraverseQuery::outbound(get.entity.id.clone()).with_kinds(vec![EdgeKind::Calls]))
         .unwrap();
     let names: Vec<&str> = chain.entities.iter().map(|e| e.name.as_str()).collect();
     assert!(
@@ -1686,9 +1709,7 @@ fn injected_field_call_without_explicit_this_resolves_via_field() {
         .find(|x| x.entity.kind == EntityKind::Method && x.entity.name == "get")
         .expect("method get");
     let chain = store
-        .traverse(
-            TraverseQuery::outbound(get.entity.id.clone()).with_kinds(vec![EdgeKind::Calls]),
-        )
+        .traverse(TraverseQuery::outbound(get.entity.id.clone()).with_kinds(vec![EdgeKind::Calls]))
         .unwrap();
     let names: Vec<&str> = chain.entities.iter().map(|e| e.name.as_str()).collect();
     assert!(
@@ -1779,10 +1800,7 @@ fn native_mybatis_binds_method_to_statement_to_table() {
         )
         .unwrap();
     assert!(
-        write_chain
-            .entities
-            .iter()
-            .any(|e| e.name == "t_user"),
+        write_chain.entities.iter().any(|e| e.name == "t_user"),
         "insert → statement → WritesTable → t_user 应连通, got {:?}",
         write_chain.entities
     );
@@ -1815,10 +1833,7 @@ fn superclass_of_edge_links_superclass_to_subclass() {
         .expect("AbstractBase")
         .entity;
     let chain = store
-        .traverse(
-            TraverseQuery::outbound(base.id.clone())
-                .with_kinds(vec![EdgeKind::SuperclassOf]),
-        )
+        .traverse(TraverseQuery::outbound(base.id.clone()).with_kinds(vec![EdgeKind::SuperclassOf]))
         .unwrap();
     let names: Vec<&str> = chain.entities.iter().map(|e| e.name.as_str()).collect();
     assert!(

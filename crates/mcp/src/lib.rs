@@ -3,8 +3,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
-use repo_intelligence_config::IndexerConfig;
 use repo_intelligence_analysis::{ImpactAnalyzer, WorkspaceIndexer};
+use repo_intelligence_config::IndexerConfig;
 use repo_intelligence_embedding::cosine;
 use repo_intelligence_graph::{GraphStore, SqliteGraphStore};
 use repo_intelligence_model::{
@@ -764,12 +764,8 @@ fn resolve_database(
     base: &Path,
     fallback: Option<&Path>,
 ) -> Result<std::path::PathBuf> {
-    if let Some(repo) = arguments["repository"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-    {
-        let canon =
-            std::fs::canonicalize(repo).unwrap_or_else(|_| std::path::PathBuf::from(repo));
+    if let Some(repo) = arguments["repository"].as_str().filter(|s| !s.is_empty()) {
+        let canon = std::fs::canonicalize(repo).unwrap_or_else(|_| std::path::PathBuf::from(repo));
         let id = blake3::hash(canon.to_string_lossy().as_bytes()).to_hex()[..16].to_string();
         let dir = base.join("repos");
         std::fs::create_dir_all(&dir).ok();
@@ -778,7 +774,9 @@ fn resolve_database(
         Ok(db_path)
     } else {
         fallback.map(std::path::PathBuf::from).ok_or_else(|| {
-            anyhow::anyhow!("MCP server has no database configured (无 repository 参数且无 --database)")
+            anyhow::anyhow!(
+                "MCP server has no database configured (无 repository 参数且无 --database)"
+            )
         })
     }
 }
@@ -871,7 +869,9 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
         }
         "find_hotspots" => {
             let store = SqliteGraphStore::open(&path)?;
-            let metric = arguments["metric"].as_str().unwrap_or("transitive_loop_depth");
+            let metric = arguments["metric"]
+                .as_str()
+                .unwrap_or("transitive_loop_depth");
             let min_value = arguments["min_value"].as_u64().map(|v| v as u32);
             let limit = parse_limit(arguments).clamp(1, MAX_PAGE_LIMIT);
             find_hotspots(&store, metric, min_value, limit)?
@@ -928,11 +928,23 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
                 .as_f64()
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0) as f32;
-            let limit = (arguments["limit"].as_u64().unwrap_or(50) as usize).clamp(1, MAX_PAGE_LIMIT);
+            let limit =
+                (arguments["limit"].as_u64().unwrap_or(50) as usize).clamp(1, MAX_PAGE_LIMIT);
             let offset = parse_offset(arguments);
             let verbose = arguments["verbose"].as_bool().unwrap_or(false);
             let store = SqliteGraphStore::open(&path)?;
-            trace_graph(&store, name, depth, kinds, false, min_confidence, limit, offset, None, verbose)?
+            trace_graph(
+                &store,
+                name,
+                depth,
+                kinds,
+                false,
+                min_confidence,
+                limit,
+                offset,
+                None,
+                verbose,
+            )?
         }
         "trace_callees" => {
             let name = arguments["name"].as_str().unwrap_or_default();
@@ -942,11 +954,23 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
                 .as_f64()
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0) as f32;
-            let limit = (arguments["limit"].as_u64().unwrap_or(50) as usize).clamp(1, MAX_PAGE_LIMIT);
+            let limit =
+                (arguments["limit"].as_u64().unwrap_or(50) as usize).clamp(1, MAX_PAGE_LIMIT);
             let offset = parse_offset(arguments);
             let verbose = arguments["verbose"].as_bool().unwrap_or(false);
             let store = SqliteGraphStore::open(&path)?;
-            trace_graph(&store, name, depth, kinds, true, min_confidence, limit, offset, None, verbose)?
+            trace_graph(
+                &store,
+                name,
+                depth,
+                kinds,
+                true,
+                min_confidence,
+                limit,
+                offset,
+                None,
+                verbose,
+            )?
         }
         "trace_table_access" => {
             let name = arguments["name"].as_str().unwrap_or_default();
@@ -971,11 +995,23 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
                     kinds.push(EdgeKind::WritesTable);
                 }
             }
-            let limit = (arguments["limit"].as_u64().unwrap_or(50) as usize).clamp(1, MAX_PAGE_LIMIT);
+            let limit =
+                (arguments["limit"].as_u64().unwrap_or(50) as usize).clamp(1, MAX_PAGE_LIMIT);
             let offset = parse_offset(arguments);
             let verbose = arguments["verbose"].as_bool().unwrap_or(false);
             let store = SqliteGraphStore::open(&path)?;
-            trace_graph(&store, name, depth, kinds, false, min_confidence, limit, offset, None, verbose)?
+            trace_graph(
+                &store,
+                name,
+                depth,
+                kinds,
+                false,
+                min_confidence,
+                limit,
+                offset,
+                None,
+                verbose,
+            )?
         }
         "trace_full_path" => {
             let name = arguments["name"].as_str().unwrap_or_default();
@@ -1006,13 +1042,25 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
                 ],
                 value => serde_json::from_value(value.clone())?,
             };
-            let limit = (arguments["limit"].as_u64().unwrap_or(50) as usize).clamp(1, MAX_PAGE_LIMIT);
+            let limit =
+                (arguments["limit"].as_u64().unwrap_or(50) as usize).clamp(1, MAX_PAGE_LIMIT);
             let offset = parse_offset(arguments);
             let verbose = arguments["verbose"].as_bool().unwrap_or(false);
             let store = SqliteGraphStore::open(&path)?;
             // to_kind 经 trace_graph 在分页前过滤(has_more/total 反映过滤后集合);
             // 此前在分页后 retain 会产生"每页过滤后为 0 却 has_more=true"的死翻页。
-            trace_graph(&store, name, depth, kinds, outbound, min_confidence, limit, offset, to_kind, verbose)?
+            trace_graph(
+                &store,
+                name,
+                depth,
+                kinds,
+                outbound,
+                min_confidence,
+                limit,
+                offset,
+                to_kind,
+                verbose,
+            )?
         }
         "verify_edge" => {
             let source = arguments["source"].as_str().unwrap_or_default();
@@ -1181,7 +1229,11 @@ impl ComplexityFilter {
 }
 
 fn metadata_u32(entity: &repo_intelligence_model::Entity, key: &str) -> Option<u32> {
-    entity.metadata.get(key).and_then(|v| v.as_u64()).map(|v| v as u32)
+    entity
+        .metadata
+        .get(key)
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
 }
 
 fn passes_min(entity: &repo_intelligence_model::Entity, key: &str, min: Option<u32>) -> bool {
@@ -1241,7 +1293,10 @@ fn search_with_filter(
         .collect();
     // sort_by 覆盖原 relevance 排序(用户明确要按复杂度排);非法值忽略保持原序。
     if let Some(metric) = &cx.sort_by
-        && matches!(metric.as_str(), "complexity" | "transitive_loop_depth" | "loop_depth")
+        && matches!(
+            metric.as_str(),
+            "complexity" | "transitive_loop_depth" | "loop_depth"
+        )
     {
         entities.sort_by(|a, b| {
             metadata_u32(b, metric)
@@ -1339,7 +1394,9 @@ fn run_search(
     let parsed_kinds = parse_entity_kinds(arguments)?;
     let cx = ComplexityFilter {
         min_complexity: arguments["min_complexity"].as_u64().map(|v| v as u32),
-        min_transitive_loop_depth: arguments["min_transitive_loop_depth"].as_u64().map(|v| v as u32),
+        min_transitive_loop_depth: arguments["min_transitive_loop_depth"]
+            .as_u64()
+            .map(|v| v as u32),
         min_loop_depth: arguments["min_loop_depth"].as_u64().map(|v| v as u32),
         sort_by: arguments["sort_by"].as_str().map(|s| s.to_string()),
     };
@@ -1369,7 +1426,9 @@ fn run_search(
 fn parse_entity_kinds(arguments: &Value) -> Result<Option<Vec<EntityKind>>> {
     match &arguments["kind"] {
         Value::Null => Ok(None),
-        Value::String(_) => Ok(Some(vec![serde_json::from_value(arguments["kind"].clone())?])),
+        Value::String(_) => Ok(Some(vec![serde_json::from_value(
+            arguments["kind"].clone(),
+        )?])),
         Value::Array(items) => Ok(Some(
             items
                 .iter()
@@ -1495,7 +1554,12 @@ fn parse_depth(arguments: &Value, default: usize) -> usize {
 /// containment or table-read edges; an explicit array overrides it.
 fn parse_edge_kinds(arguments: &Value) -> Result<Vec<EdgeKind>> {
     match &arguments["edge_kinds"] {
-        Value::Null => Ok(vec![EdgeKind::Calls, EdgeKind::Injects, EdgeKind::Declares, EdgeKind::SuperclassOf]),
+        Value::Null => Ok(vec![
+            EdgeKind::Calls,
+            EdgeKind::Injects,
+            EdgeKind::Declares,
+            EdgeKind::SuperclassOf,
+        ]),
         value => Ok(serde_json::from_value(value.clone())?),
     }
 }
@@ -1534,8 +1598,7 @@ fn edge_view(edge: &Edge, verbose: bool) -> Value {
         "evidence_count": edge.evidence.len(),
     });
     match verbose {
-        true => view["evidence"] =
-            serde_json::to_value(&edge.evidence).unwrap_or_default(),
+        true => view["evidence"] = serde_json::to_value(&edge.evidence).unwrap_or_default(),
         false => {
             if let Some(first) = edge.evidence.first() {
                 view["evidence_first"] = json!({
@@ -2006,8 +2069,15 @@ fn relay_edge_type(kind: EdgeKind, peer_kind: Option<EntityKind>) -> String {
 fn relay_layer(kind: EntityKind) -> &'static str {
     use EntityKind as K;
     match kind {
-        K::Table | K::Column | K::Database | K::Datasource | K::Mapper | K::MapperMethod
-        | K::XmlStatement | K::ResultMap | K::SqlField => "db_mapper",
+        K::Table
+        | K::Column
+        | K::Database
+        | K::Datasource
+        | K::Mapper
+        | K::MapperMethod
+        | K::XmlStatement
+        | K::ResultMap
+        | K::SqlField => "db_mapper",
         K::HttpEndpoint | K::HttpClientCall | K::ApiField => "remote",
         K::SpringBean | K::Class | K::Interface | K::Method | K::Field => "domain",
         _ => "infra",
@@ -2151,21 +2221,45 @@ mod tests {
     #[test]
     fn edge_view_marks_tentative_by_classification_and_confidence() {
         // Fact → 不 tentative
-        let fact = Edge::new(id("a"), id("b"), EdgeKind::Calls)
-            .with_evidence("F.java", 1, 1, EvidenceClass::Fact, 1.0, "fact");
+        let fact = Edge::new(id("a"), id("b"), EdgeKind::Calls).with_evidence(
+            "F.java",
+            1,
+            1,
+            EvidenceClass::Fact,
+            1.0,
+            "fact",
+        );
         assert_eq!(edge_view(&fact, true)["tentative"], false);
         assert_eq!(edge_view(&fact, true)["confidence"], 1.0);
         // Inferred → 无论置信度都 tentative
-        let inferred = Edge::new(id("a"), id("b"), EdgeKind::MappedFrom)
-            .with_evidence("F.java", 1, 1, EvidenceClass::Inferred, 0.9, "inferred");
+        let inferred = Edge::new(id("a"), id("b"), EdgeKind::MappedFrom).with_evidence(
+            "F.java",
+            1,
+            1,
+            EvidenceClass::Inferred,
+            0.9,
+            "inferred",
+        );
         assert_eq!(edge_view(&inferred, true)["tentative"], true);
         // Resolved 高置信 → 不 tentative
-        let resolved_hi = Edge::new(id("a"), id("b"), EdgeKind::MatchesEndpoint)
-            .with_evidence("F.java", 1, 1, EvidenceClass::Resolved, 0.95, "resolved");
+        let resolved_hi = Edge::new(id("a"), id("b"), EdgeKind::MatchesEndpoint).with_evidence(
+            "F.java",
+            1,
+            1,
+            EvidenceClass::Resolved,
+            0.95,
+            "resolved",
+        );
         assert_eq!(edge_view(&resolved_hi, true)["tentative"], false);
         // Resolved 低置信 → tentative
-        let resolved_lo = Edge::new(id("a"), id("b"), EdgeKind::MatchesEndpoint)
-            .with_evidence("F.java", 1, 1, EvidenceClass::Resolved, 0.6, "low");
+        let resolved_lo = Edge::new(id("a"), id("b"), EdgeKind::MatchesEndpoint).with_evidence(
+            "F.java",
+            1,
+            1,
+            EvidenceClass::Resolved,
+            0.6,
+            "low",
+        );
         assert_eq!(edge_view(&resolved_lo, true)["tentative"], true);
         // 无证据 → tentative
         let no_evidence = Edge::new(id("a"), id("b"), EdgeKind::Calls);
@@ -2174,18 +2268,24 @@ mod tests {
 
     #[test]
     fn edge_view_compact_mode_omits_full_evidence_array() {
-        let mut edge = Edge::new(
-            EntityId("a".into()),
-            EntityId("b".into()),
-            EdgeKind::Calls,
-        );
+        let mut edge = Edge::new(EntityId("a".into()), EntityId("b".into()), EdgeKind::Calls);
         for i in 0..3 {
-            edge = edge.with_evidence(format!("f{i}.java"), i + 1, i + 1, EvidenceClass::Fact, 1.0, "long reason text");
+            edge = edge.with_evidence(
+                format!("f{i}.java"),
+                i + 1,
+                i + 1,
+                EvidenceClass::Fact,
+                1.0,
+                "long reason text",
+            );
         }
         let compact = edge_view(&edge, false);
         // 紧凑模式:evidence_count 表示总量,不再序列化完整数组
         assert_eq!(compact["evidence_count"], 3);
-        assert!(compact["evidence"].is_null(), "compact view must not carry full evidence[]");
+        assert!(
+            compact["evidence"].is_null(),
+            "compact view must not carry full evidence[]"
+        );
         let first = &compact["evidence_first"];
         assert_eq!(first["file"], "f0.java");
         assert_eq!(first["start_line"], 1);
@@ -2196,12 +2296,7 @@ mod tests {
 
     #[test]
     fn trace_entity_view_compact_omits_metadata_and_evidence_array() {
-        let mut entity = Entity::new(
-            EntityId("a".into()),
-            EntityKind::Method,
-            "doIt",
-            "Svc#doIt",
-        );
+        let mut entity = Entity::new(EntityId("a".into()), EntityKind::Method, "doIt", "Svc#doIt");
         for i in 0..2 {
             entity = entity.with_evidence(
                 format!("f{i}.java"),
@@ -2215,8 +2310,14 @@ mod tests {
         let compact = trace_entity_view(&entity, false);
         assert_eq!(compact["evidence_count"], 2);
         // 紧凑档不携带 metadata blob 与全量 evidence[]。
-        assert!(compact["metadata"].is_null(), "compact view must not carry metadata");
-        assert!(compact["evidence"].is_null(), "compact view must not carry evidence[]");
+        assert!(
+            compact["metadata"].is_null(),
+            "compact view must not carry metadata"
+        );
+        assert!(
+            compact["evidence"].is_null(),
+            "compact view must not carry evidence[]"
+        );
         // 首条证据锚点保留"这可信吗、来自哪"的最小依据。
         assert_eq!(compact["anchor"]["file"], "f0.java");
         assert_eq!(compact["anchor"]["start_line"], 1);
@@ -2261,8 +2362,14 @@ mod tests {
         // 默认 edge_kinds 含 declares 后,Service 类 → 自己的 method → Mapper method → table 通。
         // MOS 端真实盲点:此前从类 trace to_kind=table 返回 0(类无 calls 边,declares 缺失)。
         let mut store = SqliteGraphStore::open_in_memory().unwrap();
-        let svc = Entity::new(id("svc"), EntityKind::Class, "Svc", "Svc")
-            .with_evidence("Svc.java", 1, 1, EvidenceClass::Fact, 1.0, "declared");
+        let svc = Entity::new(id("svc"), EntityKind::Class, "Svc", "Svc").with_evidence(
+            "Svc.java",
+            1,
+            1,
+            EvidenceClass::Fact,
+            1.0,
+            "declared",
+        );
         let svc_m = Entity::new(id("svc.m"), EntityKind::Method, "doWork", "Svc#doWork")
             .with_evidence("Svc.java", 2, 2, EvidenceClass::Fact, 1.0, "declared");
         let mapper_m = Entity::new(
@@ -2271,16 +2378,47 @@ mod tests {
             "selectList",
             "UserMapper#selectList",
         )
-        .with_evidence("UserMapper.java", 3, 3, EvidenceClass::Fact, 1.0, "declared");
-        let table = Entity::new(id("t"), EntityKind::Table, "sys_user", "sys_user")
-            .with_evidence("UserMapper.xml", 4, 4, EvidenceClass::Fact, 1.0, "table");
+        .with_evidence(
+            "UserMapper.java",
+            3,
+            3,
+            EvidenceClass::Fact,
+            1.0,
+            "declared",
+        );
+        let table = Entity::new(id("t"), EntityKind::Table, "sys_user", "sys_user").with_evidence(
+            "UserMapper.xml",
+            4,
+            4,
+            EvidenceClass::Fact,
+            1.0,
+            "table",
+        );
         let edges = vec![
-            Edge::new(id("svc"), id("svc.m"), EdgeKind::Declares)
-                .with_evidence("Svc.java", 1, 1, EvidenceClass::Fact, 1.0, "declares"),
-            Edge::new(id("svc.m"), id("mapper.m"), EdgeKind::Calls)
-                .with_evidence("Svc.java", 2, 2, EvidenceClass::Inferred, 0.7, "call"),
-            Edge::new(id("mapper.m"), id("t"), EdgeKind::ReadsTable)
-                .with_evidence("UserMapper.xml", 3, 3, EvidenceClass::Fact, 1.0, "reads"),
+            Edge::new(id("svc"), id("svc.m"), EdgeKind::Declares).with_evidence(
+                "Svc.java",
+                1,
+                1,
+                EvidenceClass::Fact,
+                1.0,
+                "declares",
+            ),
+            Edge::new(id("svc.m"), id("mapper.m"), EdgeKind::Calls).with_evidence(
+                "Svc.java",
+                2,
+                2,
+                EvidenceClass::Inferred,
+                0.7,
+                "call",
+            ),
+            Edge::new(id("mapper.m"), id("t"), EdgeKind::ReadsTable).with_evidence(
+                "UserMapper.xml",
+                3,
+                3,
+                EvidenceClass::Fact,
+                1.0,
+                "reads",
+            ),
         ];
         store
             .apply_patch(GraphPatch::add(vec![svc, svc_m, mapper_m, table], edges))
@@ -2316,7 +2454,19 @@ mod tests {
             EdgeKind::Exposes,
             EdgeKind::MatchesEndpoint,
         ];
-        let r2 = trace_graph(&store, "Svc", 5, kinds_without, true, 0.0, 50, 0, None, false).unwrap();
+        let r2 = trace_graph(
+            &store,
+            "Svc",
+            5,
+            kinds_without,
+            true,
+            0.0,
+            50,
+            0,
+            None,
+            false,
+        )
+        .unwrap();
         let qns2: Vec<&str> = r2["items"]
             .as_array()
             .unwrap()
@@ -2334,10 +2484,21 @@ mod tests {
         // 从 abstract 类 outbound:SuperclassOf(基类→子类)+ Declares(子类→method)
         // + Calls(method→mapper)+ ReadsTable(mapper→table)。缺 superclass_of 则断在第一跳。
         let mut store = SqliteGraphStore::open_in_memory().unwrap();
-        let base = Entity::new(id("base"), EntityKind::Class, "AbstractBase", "AbstractBase")
-            .with_evidence("Base.java", 1, 1, EvidenceClass::Fact, 1.0, "declared");
-        let sub = Entity::new(id("sub"), EntityKind::Class, "Concrete", "Concrete")
-            .with_evidence("Concrete.java", 1, 1, EvidenceClass::Fact, 1.0, "declared");
+        let base = Entity::new(
+            id("base"),
+            EntityKind::Class,
+            "AbstractBase",
+            "AbstractBase",
+        )
+        .with_evidence("Base.java", 1, 1, EvidenceClass::Fact, 1.0, "declared");
+        let sub = Entity::new(id("sub"), EntityKind::Class, "Concrete", "Concrete").with_evidence(
+            "Concrete.java",
+            1,
+            1,
+            EvidenceClass::Fact,
+            1.0,
+            "declared",
+        );
         let sub_m = Entity::new(id("sub.m"), EntityKind::Method, "doWork", "Concrete#doWork")
             .with_evidence("Concrete.java", 2, 2, EvidenceClass::Fact, 1.0, "declared");
         let mapper_m = Entity::new(
@@ -2347,20 +2508,53 @@ mod tests {
             "M#selectList",
         )
         .with_evidence("M.java", 3, 3, EvidenceClass::Fact, 1.0, "declared");
-        let table = Entity::new(id("t"), EntityKind::Table, "orders", "orders")
-            .with_evidence("M.xml", 4, 4, EvidenceClass::Fact, 1.0, "table");
+        let table = Entity::new(id("t"), EntityKind::Table, "orders", "orders").with_evidence(
+            "M.xml",
+            4,
+            4,
+            EvidenceClass::Fact,
+            1.0,
+            "table",
+        );
         let edges = vec![
-            Edge::new(id("base"), id("sub"), EdgeKind::SuperclassOf)
-                .with_evidence("Concrete.java", 1, 1, EvidenceClass::Fact, 1.0, "extends"),
-            Edge::new(id("sub"), id("sub.m"), EdgeKind::Declares)
-                .with_evidence("Concrete.java", 1, 1, EvidenceClass::Fact, 1.0, "declares"),
-            Edge::new(id("sub.m"), id("mapper.m"), EdgeKind::Calls)
-                .with_evidence("Concrete.java", 2, 2, EvidenceClass::Inferred, 0.7, "call"),
-            Edge::new(id("mapper.m"), id("t"), EdgeKind::ReadsTable)
-                .with_evidence("M.xml", 3, 3, EvidenceClass::Fact, 1.0, "reads"),
+            Edge::new(id("base"), id("sub"), EdgeKind::SuperclassOf).with_evidence(
+                "Concrete.java",
+                1,
+                1,
+                EvidenceClass::Fact,
+                1.0,
+                "extends",
+            ),
+            Edge::new(id("sub"), id("sub.m"), EdgeKind::Declares).with_evidence(
+                "Concrete.java",
+                1,
+                1,
+                EvidenceClass::Fact,
+                1.0,
+                "declares",
+            ),
+            Edge::new(id("sub.m"), id("mapper.m"), EdgeKind::Calls).with_evidence(
+                "Concrete.java",
+                2,
+                2,
+                EvidenceClass::Inferred,
+                0.7,
+                "call",
+            ),
+            Edge::new(id("mapper.m"), id("t"), EdgeKind::ReadsTable).with_evidence(
+                "M.xml",
+                3,
+                3,
+                EvidenceClass::Fact,
+                1.0,
+                "reads",
+            ),
         ];
         store
-            .apply_patch(GraphPatch::add(vec![base, sub, sub_m, mapper_m, table], edges))
+            .apply_patch(GraphPatch::add(
+                vec![base, sub, sub_m, mapper_m, table],
+                edges,
+            ))
             .unwrap();
 
         let kinds_with = vec![
@@ -2373,7 +2567,19 @@ mod tests {
             EdgeKind::Exposes,
             EdgeKind::MatchesEndpoint,
         ];
-        let r1 = trace_graph(&store, "AbstractBase", 5, kinds_with, true, 0.0, 50, 0, None, false).unwrap();
+        let r1 = trace_graph(
+            &store,
+            "AbstractBase",
+            5,
+            kinds_with,
+            true,
+            0.0,
+            50,
+            0,
+            None,
+            false,
+        )
+        .unwrap();
         let qns1: Vec<&str> = r1["items"]
             .as_array()
             .unwrap()
@@ -2394,7 +2600,19 @@ mod tests {
             EdgeKind::Exposes,
             EdgeKind::MatchesEndpoint,
         ];
-        let r2 = trace_graph(&store, "AbstractBase", 5, kinds_without, true, 0.0, 50, 0, None, false).unwrap();
+        let r2 = trace_graph(
+            &store,
+            "AbstractBase",
+            5,
+            kinds_without,
+            true,
+            0.0,
+            50,
+            0,
+            None,
+            false,
+        )
+        .unwrap();
         let qns2: Vec<&str> = r2["items"]
             .as_array()
             .unwrap()
@@ -2414,24 +2632,56 @@ mod tests {
 
         let svc = Entity::new(id("svc"), EntityKind::Class, "Svc", "com.example.Svc")
             .with_evidence("Svc.java", 10, 10, EvidenceClass::Fact, 1.0, "declared");
-        let caller =
-            Entity::new(id("caller"), EntityKind::Class, "Caller", "com.example.Caller")
-                .with_evidence("Caller.java", 1, 1, EvidenceClass::Fact, 1.0, "declared");
-        let mapper = Entity::new(id("mapper"), EntityKind::Mapper, "UserMapper", "com.example.UserMapper")
-            .with_evidence("UserMapper.java", 1, 1, EvidenceClass::Fact, 1.0, "mapper");
-        let field1 = Entity::new(id("field1"), EntityKind::Field, "field1", "com.example.Svc.field1")
-            .with_evidence("Svc.java", 20, 20, EvidenceClass::Fact, 1.0, "field");
+        let caller = Entity::new(
+            id("caller"),
+            EntityKind::Class,
+            "Caller",
+            "com.example.Caller",
+        )
+        .with_evidence("Caller.java", 1, 1, EvidenceClass::Fact, 1.0, "declared");
+        let mapper = Entity::new(
+            id("mapper"),
+            EntityKind::Mapper,
+            "UserMapper",
+            "com.example.UserMapper",
+        )
+        .with_evidence("UserMapper.java", 1, 1, EvidenceClass::Fact, 1.0, "mapper");
+        let field1 = Entity::new(
+            id("field1"),
+            EntityKind::Field,
+            "field1",
+            "com.example.Svc.field1",
+        )
+        .with_evidence("Svc.java", 20, 20, EvidenceClass::Fact, 1.0, "field");
 
         let edges = vec![
             // inbound: Caller → Svc(call)
-            Edge::new(id("caller"), id("svc"), EdgeKind::Calls)
-                .with_evidence("Caller.java", 5, 5, EvidenceClass::Inferred, 0.7, "call"),
+            Edge::new(id("caller"), id("svc"), EdgeKind::Calls).with_evidence(
+                "Caller.java",
+                5,
+                5,
+                EvidenceClass::Inferred,
+                0.7,
+                "call",
+            ),
             // outbound: Svc → Mapper(db_read)
-            Edge::new(id("svc"), id("mapper"), EdgeKind::ReadsTable)
-                .with_evidence("Svc.java", 12, 12, EvidenceClass::Fact, 1.0, "reads"),
+            Edge::new(id("svc"), id("mapper"), EdgeKind::ReadsTable).with_evidence(
+                "Svc.java",
+                12,
+                12,
+                EvidenceClass::Fact,
+                1.0,
+                "reads",
+            ),
             // 结构边:应被 relay_kinds 过滤,不进 outbound
-            Edge::new(id("svc"), id("field1"), EdgeKind::Contains)
-                .with_evidence("Svc.java", 20, 20, EvidenceClass::Fact, 1.0, "contains"),
+            Edge::new(id("svc"), id("field1"), EdgeKind::Contains).with_evidence(
+                "Svc.java",
+                20,
+                20,
+                EvidenceClass::Fact,
+                1.0,
+                "contains",
+            ),
         ];
         store
             .apply_patch(GraphPatch::add(vec![svc, caller, mapper, field1], edges))
@@ -2518,7 +2768,6 @@ mod tests {
         assert_eq!(out["rows"].as_array().unwrap().len(), 1);
         assert_eq!(out["truncated"], true);
     }
-
 
     #[test]
     fn tools_list_stays_under_token_budget() {

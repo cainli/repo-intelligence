@@ -11,8 +11,8 @@ use repo_intelligence_model::{Edge, EdgeKind, Entity, EntityId, EntityKind, Evid
 use repo_intelligence_source::{FileKind, SourceFile};
 use serde_json::json;
 
-use crate::registry::{ExtractContext, SemanticExtractor};
 use crate::add_contained;
+use crate::registry::{ExtractContext, SemanticExtractor};
 
 // implementation/api/... ("group:artifact:version") 或 (libs.xxx 别名)。
 // 组1=引号坐标(group:artifact,版本剥离以利合并),组2=libs.xxx 别名。
@@ -87,7 +87,12 @@ impl SemanticExtractor for PackageJsonExtractor {
 }
 
 /// build.gradle(.kts) → 模块 Gradle Package + 依赖 Package(--DependsOn)。
-fn extract_gradle(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges: &mut Vec<Edge>) {
+fn extract_gradle(
+    file: &SourceFile,
+    path: &str,
+    entities: &mut Vec<Entity>,
+    edges: &mut Vec<Edge>,
+) {
     // 模块名 = build 脚本所在目录名
     let module_name = file
         .relative_path
@@ -97,13 +102,26 @@ fn extract_gradle(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edg
         .unwrap_or("gradle-module")
         .to_string();
     let module = Entity::new(
-        EntityId::stable("workspace", path, EntityKind::Package, &module_name, "gradle"),
+        EntityId::stable(
+            "workspace",
+            path,
+            EntityKind::Package,
+            &module_name,
+            "gradle",
+        ),
         EntityKind::Package,
         &module_name,
         &module_name,
     )
     .with_metadata(json!({"ecosystem": "gradle"}))
-    .with_evidence(path, 1, 1, EvidenceClass::Fact, 1.0, "Gradle module (build script)");
+    .with_evidence(
+        path,
+        1,
+        1,
+        EvidenceClass::Fact,
+        1.0,
+        "Gradle module (build script)",
+    );
     let module_id = module.id.clone();
     add_contained(file, path, module, 1, entities, edges);
 
@@ -173,7 +191,14 @@ fn extract_version_catalog(
             &alias_key,
         )
         .with_metadata(json!({"ecosystem": "gradle", "coordinate": coord, "alias": alias}))
-        .with_evidence(path, 1, 1, EvidenceClass::Fact, 1.0, "Gradle version catalog alias");
+        .with_evidence(
+            path,
+            1,
+            1,
+            EvidenceClass::Fact,
+            1.0,
+            "Gradle version catalog alias",
+        );
         entities.push(entity);
     }
 }
@@ -216,7 +241,14 @@ fn extract_package_json(
         &module_name,
     )
     .with_metadata(json!({"ecosystem": "npm"}))
-    .with_evidence(path, 1, 1, EvidenceClass::Fact, 1.0, "npm package (package.json)");
+    .with_evidence(
+        path,
+        1,
+        1,
+        EvidenceClass::Fact,
+        1.0,
+        "npm package (package.json)",
+    );
     let module_id = module.id.clone();
     add_contained(file, path, module, 1, entities, edges);
     for section in ["dependencies", "devDependencies", "peerDependencies"] {
@@ -225,7 +257,13 @@ fn extract_package_json(
         };
         for dep_name in obj.keys() {
             let dep = Entity::new(
-                EntityId::stable("workspace", path, EntityKind::Package, dep_name.as_str(), "npm"),
+                EntityId::stable(
+                    "workspace",
+                    path,
+                    EntityKind::Package,
+                    dep_name.as_str(),
+                    "npm",
+                ),
                 EntityKind::Package,
                 dep_name.as_str(),
                 dep_name.as_str(),

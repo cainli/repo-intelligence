@@ -53,7 +53,10 @@ pub struct FrontendExtractor;
 
 impl SemanticExtractor for FrontendExtractor {
     fn supports(&self, kind: FileKind) -> bool {
-        matches!(kind, FileKind::Vue | FileKind::JavaScript | FileKind::TypeScript)
+        matches!(
+            kind,
+            FileKind::Vue | FileKind::JavaScript | FileKind::TypeScript
+        )
     }
 
     fn extract(

@@ -220,8 +220,7 @@ impl SqliteGraphStore {
     fn run_select(&self, sql: &str, max_rows: usize) -> Result<QueryResult> {
         use rusqlite::types::ValueRef;
         let mut stmt = self.connection.prepare(sql)?;
-        let columns: Vec<String> =
-            stmt.column_names().iter().map(|c| c.to_string()).collect();
+        let columns: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
         let mut rows = Vec::new();
         let mut truncated = false;
         let mut rows_iter = stmt.query([])?;
@@ -251,7 +250,11 @@ impl SqliteGraphStore {
             }
             rows.push(out);
         }
-        Ok(QueryResult { columns, rows, truncated })
+        Ok(QueryResult {
+            columns,
+            rows,
+            truncated,
+        })
     }
 
     fn initialize(&self) -> Result<()> {
@@ -365,8 +368,9 @@ impl SqliteGraphStore {
     fn ensure_line_columns(&self) -> Result<()> {
         for table in ["entity", "edge"] {
             let missing = {
-                let mut statement =
-                    self.connection.prepare(&format!("PRAGMA table_info({table})"))?;
+                let mut statement = self
+                    .connection
+                    .prepare(&format!("PRAGMA table_info({table})"))?;
                 let columns: Vec<String> = statement
                     .query_map([], |row| row.get::<_, String>(1))?
                     .filter_map(|result| result.ok())
@@ -375,7 +379,9 @@ impl SqliteGraphStore {
             };
             if missing {
                 self.connection.execute(
-                    &format!("ALTER TABLE {table} ADD COLUMN start_line INTEGER NOT NULL DEFAULT 0"),
+                    &format!(
+                        "ALTER TABLE {table} ADD COLUMN start_line INTEGER NOT NULL DEFAULT 0"
+                    ),
                     [],
                 )?;
                 self.connection.execute(
@@ -582,10 +588,7 @@ impl SqliteGraphStore {
         ids: &[String],
     ) -> Result<()> {
         for chunk in ids.chunks(900) {
-            let placeholders: String = (0..chunk.len())
-                .map(|_| "?")
-                .collect::<Vec<_>>()
-                .join(", ");
+            let placeholders: String = (0..chunk.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
             let sql = format!("{prefix} ({placeholders})");
             transaction.execute(&sql, params_from_iter(chunk.iter()))?;
         }
@@ -671,9 +674,8 @@ impl GraphStore for SqliteGraphStore {
         // 待删实体 = file_id 自身 + 经 Contains 边挂载的全部子实体(类/字段/方法…)。
         let mut ids: Vec<String> = vec![file_id.0.clone()];
         {
-            let mut select_children = transaction.prepare(
-                "SELECT target_id FROM edge WHERE source_id = ?1 AND kind = 'contains'",
-            )?;
+            let mut select_children = transaction
+                .prepare("SELECT target_id FROM edge WHERE source_id = ?1 AND kind = 'contains'")?;
             let rows = select_children.query_map([&file_id.0], |row| row.get::<_, String>(0))?;
             for row in rows {
                 ids.push(row?);
@@ -682,7 +684,11 @@ impl GraphStore for SqliteGraphStore {
         // 删除顺序:先批量清 FTS(fts_enabled 时,单语句),再逐实体清牵连边 + 实体本身。
         // 单文件子树通常几十实体;edge/entity 用 prepare_cached 逐条(避开 999 绑定上限)。
         if self.fts_enabled && !ids.is_empty() {
-            Self::fts_bulk_in(&transaction, "DELETE FROM entity_fts WHERE entity_id IN", &ids)?;
+            Self::fts_bulk_in(
+                &transaction,
+                "DELETE FROM entity_fts WHERE entity_id IN",
+                &ids,
+            )?;
         }
         // 清理向量层(无开关依赖:有数据则删,no-op 否则)。fts_bulk_in 是通用批量删除 helper。
         if !ids.is_empty() {
@@ -739,10 +745,9 @@ impl GraphStore for SqliteGraphStore {
         let mut stmt = self
             .connection
             .prepare("SELECT entity_id, text_hash FROM entity_embedding")?;
-        let rows =
-            stmt.query_map([], |row| {
-                Ok((EntityId(row.get::<_, String>(0)?), row.get::<_, String>(1)?))
-            })?;
+        let rows = stmt.query_map([], |row| {
+            Ok((EntityId(row.get::<_, String>(0)?), row.get::<_, String>(1)?))
+        })?;
         let mut map = HashMap::new();
         for row in rows {
             let (id, hash) = row?;
@@ -844,7 +849,14 @@ impl GraphStore for SqliteGraphStore {
             // ESCAPE '\' 后 \\% / \\_ 当字面量。
             let terms: Vec<String> = raw_words
                 .iter()
-                .map(|w| format!("%{}%", w.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")))
+                .map(|w| {
+                    format!(
+                        "%{}%",
+                        w.replace('\\', "\\\\")
+                            .replace('%', "\\%")
+                            .replace('_', "\\_")
+                    )
+                })
                 .collect();
             let clauses = terms
                 .iter()
@@ -1029,16 +1041,24 @@ mod tests {
         // 工具层走 trait API 读 json 不依赖本列;此测试钉住"直连查询体验"这一收益。
         use repo_intelligence_model::{Entity, EntityKind, EvidenceClass};
         let mut store = SqliteGraphStore::open_in_memory().unwrap();
-        let entity = Entity::new(id("C"), EntityKind::Class, "C", "C")
-            .with_evidence("F.java", 42, 48, EvidenceClass::Fact, 1.0, "decl");
+        let entity = Entity::new(id("C"), EntityKind::Class, "C", "C").with_evidence(
+            "F.java",
+            42,
+            48,
+            EvidenceClass::Fact,
+            1.0,
+            "decl",
+        );
         store
             .apply_patch(GraphPatch::add(vec![entity], Vec::new()))
             .unwrap();
         let (start, end): (i64, i64) = store
             .connection
-            .query_row("SELECT start_line, end_line FROM entity WHERE id = 'C'", [], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
+            .query_row(
+                "SELECT start_line, end_line FROM entity WHERE id = 'C'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .unwrap();
         assert_eq!(start, 42, "start_line 应写入顶层列");
         assert_eq!(end, 48, "end_line 应写入顶层列");

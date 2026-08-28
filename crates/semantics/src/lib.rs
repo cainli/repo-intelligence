@@ -25,10 +25,7 @@ pub fn extract(file: &SourceFile) -> Result<GraphPatch> {
 
 /// 按 `SemanticsConfig` 提取语义:用 `Registry::default_java_stack()` 分发到
 /// 首个支持该文件类型的提取器。自研 RPC 注解与前端噪声词从配置读取。
-pub fn extract_with_config(
-    file: &SourceFile,
-    config: &SemanticsConfig,
-) -> Result<GraphPatch> {
+pub fn extract_with_config(file: &SourceFile, config: &SemanticsConfig) -> Result<GraphPatch> {
     let path = file.relative_path.to_string_lossy().to_string();
     let file_entity = base_file_entity(file, &path);
     let mut entities = vec![file_entity];
@@ -77,7 +74,14 @@ pub(crate) fn base_file_entity(file: &SourceFile, path: &str) -> Entity {
         path,
     )
     .with_metadata(json!({"content_hash": file.content_hash}))
-    .with_evidence(path, 1, 1, EvidenceClass::Fact, 1.0, "discovered source file")
+    .with_evidence(
+        path,
+        1,
+        1,
+        EvidenceClass::Fact,
+        1.0,
+        "discovered source file",
+    )
 }
 
 pub(crate) fn line_of(content: &str, offset: usize) -> u32 {

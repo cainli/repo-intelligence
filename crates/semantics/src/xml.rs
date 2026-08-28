@@ -19,16 +19,15 @@ static SQL_ALIAS: LazyLock<Regex> =
 static SQL_FROM: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(?:FROM|JOIN|UPDATE|INTO)\s+([A-Za-z_][\w.]*)").unwrap());
 // insert 的列列表:INSERT INTO t (col1, col2, …) → group1 = 列清单(P1-3 写入列)。
-static SQL_INSERT_COLS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)INSERT\s+INTO\s+[\w.]+\s*\(([^)]+)\)").unwrap()
-});
+static SQL_INSERT_COLS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)INSERT\s+INTO\s+[\w.]+\s*\(([^)]+)\)").unwrap());
 // update 的 SET 段:SET col1=…, col2=… → group1 = SET 子句(再按 word= 取列名)。
-static SQL_UPDATE_SET: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bSET\s+(.*?)(?:\bWHERE\b|;|$)").unwrap()
-});
+static SQL_UPDATE_SET: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bSET\s+(.*?)(?:\bWHERE\b|;|$)").unwrap());
 // G1:WHERE 子句体 → group1(WHERE 到 GROUP BY/ORDER BY/HAVING/LIMIT/结尾)。
 static SQL_WHERE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?is)\bWHERE\b(.*?)(?:\bGROUP\s+BY\b|\bORDER\s+BY\b|\bHAVING\b|\bLIMIT\b|$|;)").unwrap()
+    Regex::new(r"(?is)\bWHERE\b(.*?)(?:\bGROUP\s+BY\b|\bORDER\s+BY\b|\bHAVING\b|\bLIMIT\b|$|;)")
+        .unwrap()
 });
 // G1:JOIN ON 子句体 → group1(ON 到 WHERE/下一 JOIN/其他子句关键字)。
 static SQL_JOIN_ON: LazyLock<Regex> = LazyLock::new(|| {
@@ -36,25 +35,21 @@ static SQL_JOIN_ON: LazyLock<Regex> = LazyLock::new(|| {
 });
 // G1:列名候选(标识符,可带别名前缀 u.col)。函数名/关键字由 classify 过滤;
 // MyBatis 占位符 #{...}/${...} 内的标识符(jdbcType/VARCHAR 等参数属性)由区间屏蔽排除。
-static SQL_COLUMN_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)").unwrap()
-});
+static SQL_COLUMN_TOKEN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)").unwrap());
 // UPDATE-SET 赋值列:`col = `。曾写在循环里(clippy 警告),提到 static。
-static SQL_ASSIGN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"([A-Za-z_]\w*)\s*=").unwrap());
+static SQL_ASSIGN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"([A-Za-z_]\w*)\s*=").unwrap());
 // G1:SQL 噪声区间——MyBatis 占位符 `#{...}`/`${...}`(参数名 + jdbcType + SQL 类型)
 // 与动态标签 `<...>`(if/test/collection 等 OGNL 属性名)。落在其中的标识符不是列,
 // 必须用区间屏蔽:逐字符推断拦不住深层 `#{name,jdbcType=VARCHAR}`,也不拦 `<if test=…>`
 // 里的 if/test/userId。WHERE/JOIN 与 UPDATE-SET 共用此清洗。
-static SQL_NOISE_SPAN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)#\{[^}]*\}|\$\{[^}]*\}|<[^>]*>").unwrap()
-});
+static SQL_NOISE_SPAN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)#\{[^}]*\}|\$\{[^}]*\}|<[^>]*>").unwrap());
 // <mapper namespace="com.x.UserDao">:MyBatis 接口绑定的权威键(=接口 Java 全限定名)。
 // 配对 method↔statement 走 namespace + statement_id,见 analysis::resolve_cross_stack。
 // 原生 MyBatis(无 @TableName/BaseMapper)的 method→table 链全靠这条 namespace 接上。
-static XML_NAMESPACE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)<mapper\b[^>]*\bnamespace\s*=\s*"([^"]+)""#).unwrap()
-});
+static XML_NAMESPACE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)<mapper\b[^>]*\bnamespace\s*=\s*"([^"]+)""#).unwrap());
 
 pub struct XmlExtractor;
 
@@ -105,7 +100,14 @@ fn extract_xml(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges:
             format!("{path}#{}", statement_id.as_str()),
         )
         .with_metadata(metadata)
-        .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "MyBatis statement");
+        .with_evidence(
+            path,
+            line,
+            line,
+            EvidenceClass::Fact,
+            1.0,
+            "MyBatis statement",
+        );
         let statement_id_value = statement.id.clone();
         add_contained(file, path, statement, line, entities, edges);
         for alias in SQL_ALIAS.captures_iter(sql.as_str()) {
@@ -124,14 +126,28 @@ fn extract_xml(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges:
                 format!("{path}#{}:{}", statement_id.as_str(), name.as_str()),
             )
             .with_metadata(json!({"source_column": &alias[1]}))
-            .with_evidence(path, field_line, field_line, EvidenceClass::Fact, 1.0, "SQL column alias");
+            .with_evidence(
+                path,
+                field_line,
+                field_line,
+                EvidenceClass::Fact,
+                1.0,
+                "SQL column alias",
+            );
             edges.push(
                 Edge::new(
                     statement_id_value.clone(),
                     field.id.clone(),
                     EdgeKind::ReadsColumn,
                 )
-                .with_evidence(path, field_line, field_line, EvidenceClass::Fact, 1.0, "selected SQL field"),
+                .with_evidence(
+                    path,
+                    field_line,
+                    field_line,
+                    EvidenceClass::Fact,
+                    1.0,
+                    "selected SQL field",
+                ),
             );
             entities.push(field);
         }
@@ -143,7 +159,14 @@ fn extract_xml(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges:
                 name.as_str(),
                 name.as_str(),
             )
-            .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "SQL table reference");
+            .with_evidence(
+                path,
+                line,
+                line,
+                EvidenceClass::Fact,
+                1.0,
+                "SQL table reference",
+            );
             let writes_target = operation != "select" && table_index == 0;
             let edge_kind = if writes_target {
                 EdgeKind::WritesTable
@@ -181,7 +204,8 @@ fn extract_xml(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges:
                         if !seen_cols.insert(col_name.clone()) {
                             continue;
                         }
-                        let field_line = line_of(&file.content, sql.start() + body_start + tok_start);
+                        let field_line =
+                            line_of(&file.content, sql.start() + body_start + tok_start);
                         let field = Entity::new(
                             EntityId::stable(
                                 "workspace",
@@ -197,10 +221,28 @@ fn extract_xml(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges:
                         .with_metadata(json!({"source_column": &col_name, "origin": "where_join"}))
                         // 启发式 regex 提取(可能误分类子查询别名/OGNL),标 Inferred 而非 Fact,
                         // 让 confidence-gating 能将其与精确解析的 SELECT-alias ReadsColumn 区分、按需 verify。
-                        .with_evidence(path, field_line, field_line, EvidenceClass::Inferred, 0.7, "SQL where/join column (regex-inferred)");
+                        .with_evidence(
+                            path,
+                            field_line,
+                            field_line,
+                            EvidenceClass::Inferred,
+                            0.7,
+                            "SQL where/join column (regex-inferred)",
+                        );
                         edges.push(
-                            Edge::new(statement_id_value.clone(), field.id.clone(), EdgeKind::ReadsColumn)
-                                .with_evidence(path, field_line, field_line, EvidenceClass::Inferred, 0.7, "where/join reads column (regex-inferred)"),
+                            Edge::new(
+                                statement_id_value.clone(),
+                                field.id.clone(),
+                                EdgeKind::ReadsColumn,
+                            )
+                            .with_evidence(
+                                path,
+                                field_line,
+                                field_line,
+                                EvidenceClass::Inferred,
+                                0.7,
+                                "where/join reads column (regex-inferred)",
+                            ),
                         );
                         entities.push(field);
                     }
@@ -218,11 +260,7 @@ fn extract_xml(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges:
                     .map(|list| {
                         list.split(',')
                             .map(|token| {
-                                token
-                                    .trim()
-                                    .trim_matches('`')
-                                    .trim_matches('"')
-                                    .to_string()
+                                token.trim().trim_matches('`').trim_matches('"').to_string()
                             })
                             .filter(|token| {
                                 !token.is_empty()
@@ -245,9 +283,7 @@ fn extract_xml(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges:
                         let cleaned = SQL_NOISE_SPAN.replace_all(set_clause, " ");
                         SQL_ASSIGN
                             .captures_iter(&cleaned)
-                            .filter_map(|capture| {
-                                capture.get(1).map(|m| m.as_str().to_string())
-                            })
+                            .filter_map(|capture| capture.get(1).map(|m| m.as_str().to_string()))
                             .collect()
                     })
                     .unwrap_or_default()
@@ -260,17 +296,28 @@ fn extract_xml(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges:
                     format!("{path}#{col_name}"),
                 )
                 .with_metadata(json!({"source": "xml_write"}))
-                .with_evidence(path, line, line, EvidenceClass::Fact, 1.0, "SQL write column");
+                .with_evidence(
+                    path,
+                    line,
+                    line,
+                    EvidenceClass::Fact,
+                    1.0,
+                    "SQL write column",
+                );
                 edges.push(
-                    Edge::new(statement_id_value.clone(), column.id.clone(), EdgeKind::WritesColumn)
-                        .with_evidence(
-                            path,
-                            line,
-                            line,
-                            EvidenceClass::Fact,
-                            1.0,
-                            "insert/update writes column",
-                        ),
+                    Edge::new(
+                        statement_id_value.clone(),
+                        column.id.clone(),
+                        EdgeKind::WritesColumn,
+                    )
+                    .with_evidence(
+                        path,
+                        line,
+                        line,
+                        EvidenceClass::Fact,
+                        1.0,
+                        "insert/update writes column",
+                    ),
                 );
                 entities.push(column);
             }
@@ -311,11 +358,10 @@ fn extract_where_join_columns(body: &str) -> Vec<(String, usize)> {
 /// 表别名前缀无意义且跨 statement 不稳定。
 fn classify_where_column(token: &str, body: &str, match_start: usize) -> Option<String> {
     const KEYWORDS: &[&str] = &[
-        "and", "or", "not", "null", "is", "in", "like", "between", "exists",
-        "as", "on", "where", "select", "from", "join", "inner", "left", "right",
-        "full", "outer", "group", "order", "by", "having", "limit", "union",
-        "case", "when", "then", "else", "end", "distinct", "all", "any",
-        "true", "false", "asc", "desc",
+        "and", "or", "not", "null", "is", "in", "like", "between", "exists", "as", "on", "where",
+        "select", "from", "join", "inner", "left", "right", "full", "outer", "group", "order",
+        "by", "having", "limit", "union", "case", "when", "then", "else", "end", "distinct", "all",
+        "any", "true", "false", "asc", "desc",
     ];
     let lower = token.to_ascii_lowercase();
     if KEYWORDS.contains(&lower.as_str()) {
@@ -357,7 +403,10 @@ mod tests {
 
     #[test]
     fn classify_keeps_plain_column() {
-        assert_eq!(classify_where_column("user_id", "where user_id = 1", 6), Some("user_id".into()));
+        assert_eq!(
+            classify_where_column("user_id", "where user_id = 1", 6),
+            Some("user_id".into())
+        );
     }
     #[test]
     fn classify_drops_sql_keyword() {
@@ -365,7 +414,10 @@ mod tests {
     }
     #[test]
     fn classify_strips_alias_prefix() {
-        assert_eq!(classify_where_column("u.user_id", "where u.user_id = 1", 6), Some("user_id".into()));
+        assert_eq!(
+            classify_where_column("u.user_id", "where u.user_id = 1", 6),
+            Some("user_id".into())
+        );
     }
     #[test]
     fn classify_drops_function_call() {
@@ -374,12 +426,18 @@ mod tests {
     #[test]
     fn classify_drops_mybatis_param() {
         // #{userid}:token 前是 #{ → 参数占位符,非列。
-        assert_eq!(classify_where_column("userid", "where id = #{userid}", 13), None);
+        assert_eq!(
+            classify_where_column("userid", "where id = #{userid}", 13),
+            None
+        );
     }
     #[test]
     fn classify_keeps_join_on_column() {
         // ON a.id = b.aid:a.id 取 id。
-        assert_eq!(classify_where_column("a.id", "a.id = b.aid", 0), Some("id".into()));
+        assert_eq!(
+            classify_where_column("a.id", "a.id = b.aid", 0),
+            Some("id".into())
+        );
     }
     #[test]
     fn extract_filters_mybatis_placeholder_attrs() {

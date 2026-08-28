@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use repo_intelligence_config::IndexerConfig;
 use repo_intelligence_analysis::{ImpactAnalyzer, ScanPhase, ScanProgress, WorkspaceIndexer};
+use repo_intelligence_config::IndexerConfig;
 use repo_intelligence_graph::{GraphStore, SqliteGraphStore};
 use repo_intelligence_mcp::build_relay;
 use repo_intelligence_model::{ChangeRequest, Entity, EntityId, EntityKind, SearchQuery};
@@ -253,11 +253,7 @@ fn run() -> Result<()> {
                 }),
             )
         }
-        Command::Relay {
-            qn,
-            depth,
-            format,
-        } => {
+        Command::Relay { qn, depth, format } => {
             let store = SqliteGraphStore::open(&cli.database)?;
             let doc = build_relay(&store, &qn, depth, true)?;
             emit(format, doc)
@@ -331,12 +327,10 @@ fn semantic_search_items(
     }
     let all = store.get_all_embeddings()?;
     if all.is_empty() {
-        anyhow::bail!(
-            "无 embedding:未 scan 或配置 [index] embedding=false。scan 后再查。"
-        );
+        anyhow::bail!("无 embedding:未 scan 或配置 [index] embedding=false。scan 后再查。");
     }
-    let mut embedder = repo_intelligence_embedding::Embedder::new()
-        .context("加载 embedding 模型失败")?;
+    let mut embedder =
+        repo_intelligence_embedding::Embedder::new().context("加载 embedding 模型失败")?;
     let qvec = embedder
         .embed(vec![query.to_string()])?
         .into_iter()
