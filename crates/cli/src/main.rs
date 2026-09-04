@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -8,7 +9,9 @@ use repo_intelligence_analysis::{ImpactAnalyzer, ScanPhase, ScanProgress, Worksp
 use repo_intelligence_config::IndexerConfig;
 use repo_intelligence_graph::{GraphStore, SqliteGraphStore};
 use repo_intelligence_mcp::build_relay;
-use repo_intelligence_model::{ChangeRequest, Entity, EntityId, EntityKind, SearchQuery};
+use repo_intelligence_model::{
+    ChangeOperation, ChangeRequest, Entity, EntityId, EntityKind, SearchQuery,
+};
 use repo_intelligence_protocol::Envelope;
 
 #[derive(Parser)]
@@ -54,10 +57,21 @@ enum Command {
         limit: usize,
     },
     Impact {
+        /// ChangeRequest JSON 文件(示例见 README「变更影响面」);与 --entity 二选一。
+        #[arg(long, conflicts_with = "entity")]
+        request: Option<PathBuf>,
+        /// 快捷入口:直接给实体精确名,免手写 JSON。默认按 change_semantics 评估影响面。
         #[arg(long)]
-        request: PathBuf,
+        entity: Option<String>,
+        /// 与 --entity 搭配的变更操作(snake_case,默认 change_semantics)。
+        #[arg(long, default_value = "change_semantics")]
+        operation: String,
         #[arg(long, value_enum, default_value = "text")]
         format: OutputFormat,
+        /// 输出完整 report(实体带 metadata、全量 evidence);默认紧凑档
+        /// (对齐 MCP trace/query 紧凑视图,ruoyi 实测 27.8KB → 约 2KB)。
+        #[arg(long)]
+        verbose: bool,
     },
     Status {
         #[arg(long, value_enum, default_value = "text")]
@@ -103,6 +117,20 @@ enum Command {
         min_value: Option<u64>,
         #[arg(long, value_enum, default_value = "json")]
         format: OutputFormat,
+    },
+    /// 跨库 HTTP 链路对齐(P2):前端库 http_client_call ↔ 后端库 http_endpoint。
+    /// (method, path) 精确匹配——两侧提取时已把 {}/${}/数字参数归一为 `{}`。
+    /// 输出匹配对(同端点的前端调用位置聚合)与未匹配清单。
+    HttpJoin {
+        /// 前端库(sqlite,含 http_client_call 实体)
+        frontend: PathBuf,
+        /// 后端库(sqlite,含 http_endpoint 实体)
+        backend: PathBuf,
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+        /// 未匹配前端调用的展示上限
+        #[arg(long, default_value_t = 20)]
+        show_unmatched: usize,
     },
     Mcp,
 }
@@ -181,6 +209,8 @@ fn run() -> Result<()> {
                     "files_unchanged": summary.files_unchanged,
                     "entities_indexed": summary.entities_indexed,
                     "edges_indexed": summary.edges_indexed,
+                    "embedded_count": summary.embedded_count,
+                    "embedding_ms": summary.embedding_ms,
                     "ambiguous_skipped": summary.ambiguous_skipped
                 }),
             )
@@ -206,13 +236,73 @@ fn run() -> Result<()> {
             let hits = hotspots_items(&store, metric, min_value, limit)?;
             emit(format, hits)
         }
-        Command::Impact { request, format } => {
-            let change: ChangeRequest = serde_json::from_slice(
-                &fs::read(&request).with_context(|| format!("read {}", request.display()))?,
-            )?;
-            let store = SqliteGraphStore::open(&cli.database)?;
-            let report = ImpactAnalyzer::new(&store).analyze(&change)?;
+        Command::HttpJoin {
+            frontend,
+            backend,
+            format,
+            show_unmatched,
+        } => {
+            let report = http_join_report(&frontend, &backend, show_unmatched)?;
             emit(format, report)
+        }
+        Command::Impact {
+            request,
+            entity,
+            operation,
+            format,
+            verbose,
+        } => {
+            let change = match (entity, request) {
+                (Some(name), _) => {
+                    let op: ChangeOperation = serde_json::from_str(&format!("\"{operation}\""))
+                        .with_context(|| {
+                            format!(
+                                "未知 operation '{operation}'(可选 add/remove/rename/\
+                                 change_type/change_nullable/change_format/change_semantics)"
+                            )
+                        })?;
+                    ChangeRequest {
+                        // analyzer 只按 from 的精确实体名定位,target_kind 仅为描述字段。
+                        target_kind: String::new(),
+                        operation: op,
+                        from: Some(name),
+                        to: None,
+                        limit: None,
+                        offset: None,
+                        depth: None,
+                    }
+                }
+                (None, Some(path)) => {
+                    let bytes =
+                        fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+                    if bytes.first() != Some(&b'{') {
+                        anyhow::bail!(
+                            "--request 需要 ChangeRequest JSON 文件(以 {{ 开头,示例见 README \
+                             「变更影响面」);要直接分析实体请改用 --entity <NAME>"
+                        );
+                    }
+                    serde_json::from_slice(&bytes)?
+                }
+                (None, None) => anyhow::bail!(
+                    "impact 需要 --entity <NAME>(快捷)或 --request <change.json>(完整请求, \
+                     示例见 README)"
+                ),
+            };
+            let store = SqliteGraphStore::open(&cli.database)?;
+            // [analysis] 分页上限等从 .repo-intelligence.toml 读(库文件上两级为项目根);
+            // 无配置文件时 IndexerConfig::load 返回默认值。
+            let analysis = cli
+                .database
+                .parent()
+                .and_then(std::path::Path::parent)
+                .map(|root| IndexerConfig::load(root).map(|c| c.analysis))
+                .unwrap_or_else(|| Ok(Default::default()))?;
+            let report = ImpactAnalyzer::with_config(&store, analysis).analyze(&change)?;
+            if verbose {
+                emit(format, report)
+            } else {
+                emit(format, report.compact_value())
+            }
         }
         Command::Status { format } => {
             let store = SqliteGraphStore::open(&cli.database)?;
@@ -327,7 +417,10 @@ fn semantic_search_items(
     }
     let all = store.get_all_embeddings()?;
     if all.is_empty() {
-        anyhow::bail!("无 embedding:未 scan 或配置 [index] embedding=false。scan 后再查。");
+        // 对齐 MCP semantic_search 的降级:输出空结果 + 提示,而非硬报错(失败语义不同:
+        // 索引存在但无向量是配置态,不是查询失败)。
+        eprintln!("hint: 无 embedding——未 scan 或配置 [index] embedding=false。scan 后再查。");
+        return Ok(Vec::new());
     }
     let mut embedder =
         repo_intelligence_embedding::Embedder::new().context("加载 embedding 模型失败")?;
@@ -413,4 +506,156 @@ fn hotspots_items(
             linear_scan_in_loop: pick(&e, "linear_scan_in_loop"),
         })
         .collect())
+}
+
+/// http-join 输出:一条匹配对聚合同一 (method, path) 的多个前端调用位置。
+#[derive(serde::Serialize)]
+struct HttpJoinMatch {
+    method: String,
+    path: String,
+    endpoint: String,
+    client_calls: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct HttpJoinReport {
+    frontend_db: String,
+    backend_db: String,
+    client_calls_total: usize,
+    endpoints_total: usize,
+    matched_calls: usize,
+    matched_pairs: usize,
+    matches: Vec<HttpJoinMatch>,
+    unmatched_shown: usize,
+    unmatched_clients: Vec<String>,
+}
+
+/// 从库中取 HTTP 类实体的 (method, path, qualified_name);缺 metadata 的丢弃。
+fn http_calls_of(
+    store: &SqliteGraphStore,
+    kind: EntityKind,
+) -> Result<Vec<(String, String, String)>> {
+    Ok(store
+        .all_entities()?
+        .into_iter()
+        .filter(|e| e.kind == kind)
+        .filter_map(|e| {
+            let method = e.metadata.get("method")?.as_str()?.to_uppercase();
+            let path = e.metadata.get("path")?.as_str()?.to_string();
+            Some((method, path, e.qualified_name))
+        })
+        .collect())
+}
+
+/// 匹配核心(纯函数便于测试):(method, path) 精确对齐,同端点的多调用点聚合。
+/// 路径归一不在此处——两侧提取时均过 semantics::normalize_path(参数段 → `{}`)。
+fn match_http_calls(
+    clients: &[(String, String, String)],
+    endpoints: &[(String, String, String)],
+) -> (Vec<HttpJoinMatch>, Vec<String>) {
+    let mut by_key: HashMap<(&str, &str), &str> = HashMap::new();
+    for (method, path, qn) in endpoints {
+        by_key.entry((method.as_str(), path.as_str())).or_insert(qn);
+    }
+    let mut matches: Vec<HttpJoinMatch> = Vec::new();
+    let mut match_index: HashMap<(&str, &str), usize> = HashMap::new();
+    let mut unmatched: Vec<String> = Vec::new();
+    for (method, path, qn) in clients {
+        match by_key.get(&(method.as_str(), path.as_str())) {
+            Some(endpoint) => match match_index.get(&(method.as_str(), path.as_str())) {
+                Some(&index) => matches[index].client_calls.push(qn.clone()),
+                None => {
+                    match_index.insert((method.as_str(), path.as_str()), matches.len());
+                    matches.push(HttpJoinMatch {
+                        method: method.clone(),
+                        path: path.clone(),
+                        endpoint: (*endpoint).to_string(),
+                        client_calls: vec![qn.clone()],
+                    });
+                }
+            },
+            None => unmatched.push(qn.clone()),
+        }
+    }
+    (matches, unmatched)
+}
+
+fn http_join_report(
+    frontend: &std::path::Path,
+    backend: &std::path::Path,
+    show_unmatched: usize,
+) -> Result<HttpJoinReport> {
+    let fe = SqliteGraphStore::open(frontend)?;
+    let be = SqliteGraphStore::open(backend)?;
+    let clients = http_calls_of(&fe, EntityKind::HttpClientCall)?;
+    let endpoints = http_calls_of(&be, EntityKind::HttpEndpoint)?;
+    let (matches, unmatched) = match_http_calls(&clients, &endpoints);
+    let matched_calls = matches.iter().map(|m| m.client_calls.len()).sum();
+    Ok(HttpJoinReport {
+        frontend_db: frontend.display().to_string(),
+        backend_db: backend.display().to_string(),
+        client_calls_total: clients.len(),
+        endpoints_total: endpoints.len(),
+        matched_calls,
+        matched_pairs: matches.len(),
+        matches,
+        unmatched_shown: unmatched.len().min(show_unmatched),
+        unmatched_clients: unmatched.into_iter().take(show_unmatched).collect(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_join_matches_and_aggregates_same_endpoint_calls() {
+        let clients = vec![
+            (
+                "GET".into(),
+                "/system/user/{}".into(),
+                "src/api/user.ts#GET /system/user/{}".into(),
+            ),
+            (
+                "GET".into(),
+                "/system/user/{}".into(),
+                "src/api/other.ts#GET /system/user/{}".into(),
+            ),
+            (
+                "DELETE".into(),
+                "/system/user/{}".into(),
+                "src/api/user.ts#DELETE /system/user/{}".into(),
+            ),
+        ];
+        let endpoints = vec![
+            (
+                "GET".into(),
+                "/system/user/{}".into(),
+                "GET /system/user/{}".into(),
+            ),
+            (
+                "DELETE".into(),
+                "/system/user/{}".into(),
+                "DELETE /system/user/{}".into(),
+            ),
+        ];
+        let (matches, unmatched) = match_http_calls(&clients, &endpoints);
+        assert_eq!(matches.len(), 2, "两个 (method,path) 键");
+        assert_eq!(
+            matches.iter().map(|m| m.client_calls.len()).sum::<usize>(),
+            3,
+            "全部调用点聚合到匹配对"
+        );
+        assert_eq!(matches[0].client_calls.len(), 2, "同端点多调用点");
+        assert!(unmatched.is_empty());
+    }
+
+    #[test]
+    fn http_join_method_mismatch_stays_unmatched() {
+        let clients = vec![("POST".into(), "/x".into(), "a.ts#POST /x".into())];
+        let endpoints = vec![("GET".into(), "/x".into(), "GET /x".into())];
+        let (matches, unmatched) = match_http_calls(&clients, &endpoints);
+        assert!(matches.is_empty(), "method 不同不误连");
+        assert_eq!(unmatched.len(), 1);
+    }
 }

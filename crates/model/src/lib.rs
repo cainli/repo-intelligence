@@ -42,6 +42,13 @@ pub enum EntityKind {
     VuePage,
     VueComponent,
     FrontendField,
+    /// TS/JS 函数(`export function f()` / `export const f = () =>`)。
+    /// 对标 cb 的 Function 符号层——P0 补齐 vue/ts 栈 TS 侧缺口(2026-09 评测)。
+    Function,
+    /// TS enum(`export enum X` / `const enum X`)。
+    Enum,
+    /// TS type alias(`export type X = ...`)。
+    TypeAlias,
     HttpClientCall,
     HttpEndpoint,
     ApiField,
@@ -63,6 +70,10 @@ pub enum EntityKind {
     /// 定时/批处理调度入口(`@Scheduled`/`@XxlJob`/`@JobHandler` 等)。作为端到端
     /// 链路的起点语义,通过 `Schedules` 边指向它调度的 handler 方法。
     Job,
+    /// 前端路由项(vue-router `routes` 配置,仅含 `RouteRecordRaw`/vue-router import
+    /// 的文件才提取)。metadata:path/component_spec(原始 import spec)/name。
+    /// 通过 `Renders` 边指向页面 vue_page。
+    Route,
 }
 
 impl EntityKind {
@@ -80,6 +91,9 @@ impl EntityKind {
             Self::VuePage => "vue_page",
             Self::VueComponent => "vue_component",
             Self::FrontendField => "frontend_field",
+            Self::Function => "function",
+            Self::Enum => "enum",
+            Self::TypeAlias => "type_alias",
             Self::HttpClientCall => "http_client_call",
             Self::HttpEndpoint => "http_endpoint",
             Self::ApiField => "api_field",
@@ -97,6 +111,7 @@ impl EntityKind {
             Self::ConfigFile => "config_file",
             Self::Annotation => "annotation",
             Self::Job => "job",
+            Self::Route => "route",
         }
     }
 }
@@ -232,10 +247,17 @@ pub enum EdgeKind {
     /// 让 trace 从超类(含 abstract 抽象基类)下钻到具体子类——业务逻辑常在子类,abstract
     /// 类自身方法不直接调 Dao,需经此边追到子类的表依赖。
     SuperclassOf,
-    /// method -[Throws]-> exception_class:方法 throws 声明抛出的异常类型(Fact,throws 子句)。
+    /// method -[Throws]-> exception_class:方法抛出的异常类型。两种来源:签名 throws 声明
+    /// (Inferred 0.7 "throws clause")与 `throw new X(...)` 语句(Fact 0.9 "throw statement")。
     Throws,
     /// method -[Handles]-> exception_class:方法 try-catch 处理的异常类型(Inferred,catch 子句)。
     Handles,
+    /// route -[Renders]-> vue_page:路由指向的页面组件(component import spec 归一后
+    /// 精确匹配文件路径,路径唯一无歧义;Fact 0.9)。
+    Renders,
+    /// vue_page -[ComponentRef]-> vue_page:`import X from '...*.vue'` 组件引用
+    /// (Fact 0.9)。替代同名 frontend_field 的弱近似关联,支撑"改组件影响哪些页面"。
+    ComponentRef,
 }
 
 impl EdgeKind {
@@ -266,6 +288,8 @@ impl EdgeKind {
             Self::SuperclassOf => "superclass_of",
             Self::Throws => "throws",
             Self::Handles => "handles",
+            Self::Renders => "renders",
+            Self::ComponentRef => "component_ref",
         }
     }
 }
@@ -471,4 +495,112 @@ pub struct ImpactReport {
     pub offset: usize,
     /// True when `offset + limit < total` — more findings are available.
     pub has_more: bool,
+}
+
+impl ImpactReport {
+    /// 紧凑视图(2026-09-04,对标 MCP trace/query 紧凑档 v0.1.36 同策略):
+    /// finding 里完整 Entity(metadata.imports 数组可达数十项)与 evidence[](reason
+    /// 长文本)是大响应主因(ruoyi SysUserServiceImpl 实测 27.8KB/次)。紧凑档每条
+    /// 只留实体三元组 + plane/severity/confidence + 证据 `{count, first}` 锚点
+    /// (形状与 mcp::compact_evidence 一致),分页信封字段原样保留。
+    pub fn compact_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "findings": self
+                .findings
+                .iter()
+                .map(|finding| {
+                    serde_json::json!({
+                        "entity": {
+                            "kind": finding.entity.kind,
+                            "name": finding.entity.name,
+                            "qualified_name": finding.entity.qualified_name,
+                        },
+                        "plane": finding.plane,
+                        "severity": finding.severity,
+                        "confidence": finding.confidence,
+                        "evidence": compact_evidence(&finding.evidence),
+                    })
+                })
+                .collect::<Vec<_>>(),
+            "open_questions": self.open_questions,
+            "total": self.total,
+            "limit": self.limit,
+            "offset": self.offset,
+            "has_more": self.has_more,
+        })
+    }
+}
+
+/// evidence 紧凑锚点(与 mcp::compact_evidence 同形状,免跨 crate 依赖)。
+fn compact_evidence(evidence: &[Evidence]) -> serde_json::Value {
+    match evidence.first() {
+        None => serde_json::json!({"count": 0}),
+        Some(first) => serde_json::json!({
+            "count": evidence.len(),
+            "first": {"file": first.file, "start_line": first.start_line},
+        }),
+    }
+}
+
+/// 聚类汇总(v0.1.37,对标 codebase-memory 聚类自动标注):scan 时随聚类一并计算落库,
+/// get_clusters 直接读表输出,免去消费端手写 SQL 做"簇→模块"归属分析。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ClusterInfo {
+    pub cluster_id: u64,
+    /// 成员 qualified_name 路径前缀(去 /src 后取前两段)众数,即簇的"事实模块"名。
+    pub label: Option<String>,
+    /// 簇内边 / (簇内边 + 跨簇边),∈ [0,1];无边孤簇记 1.0。
+    pub cohesion: f64,
+    /// 簇内 calls/injects 度数最高的成员名(至多 3 个,Declares 结构边不计度)。
+    pub top_nodes: Vec<String>,
+    pub size: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn impact_report_compact_value_omits_metadata_and_evidence_arrays() {
+        let report = ImpactReport {
+            findings: vec![ImpactFinding {
+                entity: Entity::new(
+                    EntityId::stable("workspace", "a.java", EntityKind::Class, "A", ""),
+                    EntityKind::Class,
+                    "A",
+                    "A",
+                )
+                .with_metadata(serde_json::json!({"imports": ["x.Y"]})),
+                plane: "calls".into(),
+                severity: "medium".into(),
+                confidence: 0.7,
+                path: vec![],
+                evidence: vec![Evidence {
+                    file: "a.java".into(),
+                    start_line: 1,
+                    end_line: 2,
+                    classification: EvidenceClass::Fact,
+                    confidence: 1.0,
+                    reason: "a very long reason text".into(),
+                    snippet: None,
+                }],
+            }],
+            ..Default::default()
+        };
+        let value = report.compact_value();
+        let dumped = value.to_string();
+        assert!(!dumped.contains("imports"), "实体 metadata 不应进紧凑档");
+        assert!(
+            !dumped.contains("very long reason"),
+            "evidence reason 不应进紧凑档"
+        );
+        let finding = &value["findings"][0];
+        assert_eq!(finding["entity"]["name"], "A");
+        assert_eq!(finding["entity"]["kind"], "class");
+        // f32 序列化有尾差(0.7 → 0.699…),按容差比较。
+        assert!((finding["confidence"].as_f64().unwrap() - 0.7).abs() < 1e-3);
+        assert_eq!(finding["evidence"]["count"], 1);
+        assert_eq!(finding["evidence"]["first"]["file"], "a.java");
+        assert_eq!(finding["evidence"]["first"]["start_line"], 1);
+    }
 }

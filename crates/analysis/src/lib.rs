@@ -6,8 +6,8 @@ use anyhow::{Result, anyhow};
 pub use repo_intelligence_config::{AnalysisConfig, IndexerConfig};
 use repo_intelligence_graph::GraphStore;
 use repo_intelligence_model::{
-    ChangeOperation, ChangeRequest, Edge, EdgeKind, Entity, EntityId, EntityKind, EvidenceClass,
-    GraphPatch, ImpactFinding, ImpactReport, TraverseQuery,
+    ChangeOperation, ChangeRequest, ClusterInfo, Edge, EdgeKind, Entity, EntityId, EntityKind,
+    EvidenceClass, GraphPatch, ImpactFinding, ImpactReport, TraverseQuery,
 };
 use repo_intelligence_source::{SourceFile, discover_with_config};
 use serde_json::json;
@@ -32,6 +32,10 @@ pub struct ScanSummary {
     /// A+ 策略下因裸名歧义被跳过的跨文件解析数(已记入请求方实体的
     /// metadata.ambiguous_resolution,消费方可据此消歧或复核)。
     pub ambiguous_skipped: usize,
+    /// 本轮实际重算的 embedding 实体数与总耗时(ms)。全量首扫的耗时大头在此
+    /// (v0.1.36 实测 ruoyi 7050 实体 ≈9.35s),上收进摘要让"索引慢在哪"可观测。
+    pub embedded_count: usize,
+    pub embedding_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -361,6 +365,7 @@ impl WorkspaceIndexer {
             })
             .collect();
         let clusters = compute_clusters(&structural);
+        let cluster_infos = summarize_clusters(&clusters, &structural, &all_entities);
         let n_clusters_distinct = clusters
             .values()
             .collect::<std::collections::HashSet<_>>()
@@ -417,6 +422,9 @@ impl WorkspaceIndexer {
             "[ri-diag] clusters: {n_cluster} entities → {n_clusters_distinct} clusters, in {:.2}s",
             t.elapsed().as_secs_f64()
         );
+        // 聚类汇总落库(全量覆盖):get_clusters 直接读表输出 label/cohesion/top_nodes,
+        // 消费端不再需要手写 SQL 做"簇→模块"归属分析。
+        store.set_cluster_info(&cluster_infos)?;
 
         // 异常流解析(对标 codebase-memory THROWS/HANDLES):method.metadata.exception_flow
         // 的 type name → class/interface 实体,建 throws/handles 边。同名唯一命中建边,
@@ -456,21 +464,33 @@ impl WorkspaceIndexer {
                 let [cid] = candidates.as_slice() else {
                     continue;
                 }; // 歧义跳过
-                let kind = if flow.get("flow").and_then(|v| v.as_str()) == Some("throws") {
-                    EdgeKind::Throws
-                } else {
-                    EdgeKind::Handles
+                let flow_kind = flow.get("flow").and_then(|v| v.as_str()).unwrap_or("");
+                let (kind, class, confidence, reason) = match flow_kind {
+                    // `throw new X(...)` 语句:代码明写的事实。
+                    "raise" => (
+                        EdgeKind::Throws,
+                        EvidenceClass::Fact,
+                        0.9,
+                        "throw statement",
+                    ),
+                    // 方法签名 throws 声明。
+                    "throws" => (
+                        EdgeKind::Throws,
+                        EvidenceClass::Inferred,
+                        0.7,
+                        "throws clause",
+                    ),
+                    _ => (
+                        EdgeKind::Handles,
+                        EvidenceClass::Inferred,
+                        0.7,
+                        "catch clause",
+                    ),
                 };
                 let line = flow.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 exc_edges.push(
-                    Edge::new(entity.id.clone(), (*cid).clone(), kind).with_evidence(
-                        file,
-                        line,
-                        line,
-                        EvidenceClass::Inferred,
-                        0.7,
-                        "exception flow resolve",
-                    ),
+                    Edge::new(entity.id.clone(), (*cid).clone(), kind)
+                        .with_evidence(file, line, line, class, confidence, reason),
                 );
             }
         }
@@ -485,14 +505,23 @@ impl WorkspaceIndexer {
         );
 
         // 向量层:对本次变更实体生成 embedding(增量——仅 text_hash 变化才重新生成)。
+        // text_hash 带模型指纹前缀:换模型(v0.1.37 英文 → 多语)后旧向量自动失效重算,
+        // 防止"新模型查旧向量"的静默错配。
         if config.index.embedding && !embed_inputs.is_empty() {
             let t = Instant::now();
+            let text_hash = |text: &str| -> String {
+                format!(
+                    "{}:{}",
+                    repo_intelligence_embedding::Embedder::MODEL_ID,
+                    blake3::hash(text.as_bytes()).to_hex()
+                )
+            };
             let state = store.get_embedding_state()?;
             // 筛 text_hash 变化(或新实体)。
             let to_embed: Vec<(EntityId, String)> = embed_inputs
                 .into_iter()
                 .filter(|(id, text)| {
-                    let h = blake3::hash(text.as_bytes()).to_hex().to_string();
+                    let h = text_hash(text);
                     state.get(id).is_none_or(|old| *old != h)
                 })
                 .collect();
@@ -508,13 +537,7 @@ impl WorkspaceIndexer {
                         let rows: Vec<(EntityId, Vec<f32>, String)> = to_embed
                             .iter()
                             .zip(vecs)
-                            .map(|((id, text), vec)| {
-                                (
-                                    id.clone(),
-                                    vec,
-                                    blake3::hash(text.as_bytes()).to_hex().to_string(),
-                                )
-                            })
+                            .map(|((id, text), vec)| (id.clone(), vec, text_hash(text)))
                             .collect();
                         if let Err(e) = store.set_embeddings(&rows) {
                             eprintln!("[ri-diag] embedding 存储失败(不阻塞 scan): {e}");
@@ -525,6 +548,8 @@ impl WorkspaceIndexer {
                     }
                 }
             }
+            summary.embedding_ms = t.elapsed().as_millis() as u64;
+            summary.embedded_count = n;
             eprintln!(
                 "[ri-diag] embedding: {n} entities in {:.2}s",
                 t.elapsed().as_secs_f64()
@@ -679,6 +704,102 @@ fn compute_clusters(edges: &[&Edge]) -> HashMap<EntityId, u64> {
         .map(|(i, v)| (v, i as u64))
         .collect();
     label.into_iter().map(|(k, v)| (k, remap[&v])).collect()
+}
+
+/// qualified_name 的"事实模块"键:取路径(`#` 前段),切掉 `/src/` 后缀后取前两段
+/// (`ruoyi-modules/ruoyi-workflow/src/...` → `ruoyi-modules/ruoyi-workflow`)。
+fn module_label(qualified_name: &str) -> Option<String> {
+    let path = qualified_name.split('#').next()?;
+    let base = path.split("/src/").next().unwrap_or(path);
+    let segs: Vec<&str> = base.split('/').filter(|s| !s.is_empty()).collect();
+    if segs.is_empty() {
+        return None;
+    }
+    let taken = if segs.len() >= 2 {
+        segs[..2].join("/")
+    } else {
+        segs.join("/")
+    };
+    (!taken.is_empty()).then_some(taken)
+}
+
+/// 聚类汇总(对标 codebase-memory 聚类自动标注):label/ cohesion / top_nodes。
+/// 度数只统计 Calls/Injects(Declares 等结构边会把 class 出度顶爆 top_nodes)。
+fn summarize_clusters(
+    clusters: &HashMap<EntityId, u64>,
+    structural: &[&Edge],
+    all_entities: &[Entity],
+) -> Vec<ClusterInfo> {
+    let by_id: HashMap<&EntityId, &Entity> = all_entities.iter().map(|e| (&e.id, e)).collect();
+    let mut members: HashMap<u64, Vec<&EntityId>> = HashMap::new();
+    for (id, &cid) in clusters {
+        members.entry(cid).or_default().push(id);
+    }
+    let mut degree: HashMap<&EntityId, u32> = HashMap::new();
+    let mut internal: HashMap<u64, u32> = HashMap::new();
+    let mut boundary: HashMap<u64, u32> = HashMap::new();
+    for e in structural {
+        let (Some(ca), Some(cb)) = (clusters.get(&e.source), clusters.get(&e.target)) else {
+            continue;
+        };
+        if matches!(e.kind, EdgeKind::Calls | EdgeKind::Injects) {
+            *degree.entry(&e.source).or_insert(0) += 1;
+            *degree.entry(&e.target).or_insert(0) += 1;
+        }
+        if ca == cb {
+            *internal.entry(*ca).or_insert(0) += 1;
+        } else {
+            *boundary.entry(*ca).or_insert(0) += 1;
+            *boundary.entry(*cb).or_insert(0) += 1;
+        }
+    }
+    let mut infos: Vec<ClusterInfo> = members
+        .into_iter()
+        .map(|(cid, ids)| {
+            // label:成员模块键众数;tie 取字典序最小,保证确定输出。
+            let mut module_count: HashMap<String, u32> = HashMap::new();
+            for id in &ids {
+                if let Some(e) = by_id.get(id)
+                    && let Some(m) = module_label(&e.qualified_name)
+                {
+                    *module_count.entry(m).or_insert(0) += 1;
+                }
+            }
+            let label = module_count
+                .into_iter()
+                .max_by(|(m1, c1), (m2, c2)| c1.cmp(c2).then(m2.cmp(m1)))
+                .map(|(m, _)| m);
+            let size = ids.len() as u32;
+            let mut tops: Vec<(&EntityId, u32)> = ids
+                .iter()
+                .filter_map(|id| degree.get(id).map(|&d| (*id, d)))
+                .collect();
+            tops.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.0.cmp(&b.0.0)));
+            let top_nodes = tops
+                .iter()
+                .take(3)
+                .filter_map(|(id, _)| by_id.get(*id).map(|e| e.name.clone()))
+                .collect();
+            let (i, b) = (
+                internal.get(&cid).copied().unwrap_or(0),
+                boundary.get(&cid).copied().unwrap_or(0),
+            );
+            let cohesion = if i + b == 0 {
+                1.0
+            } else {
+                i as f64 / (i + b) as f64
+            };
+            ClusterInfo {
+                cluster_id: cid,
+                label,
+                cohesion,
+                top_nodes,
+                size,
+            }
+        })
+        .collect();
+    infos.sort_by(|a, b| b.size.cmp(&a.size).then(a.cluster_id.cmp(&b.cluster_id)));
+    infos
 }
 
 fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution {
@@ -947,6 +1068,33 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
             *type_name_owners.entry(e.name.as_str()).or_insert(0) += 1;
         }
     }
+    // 继承方法上溯(一层):class.metadata.superclass(提取层正则,单继承)且超类名全局唯一
+    // 时,把超类声明的方法并入子类方法表(子类同名优先)——覆盖 `class DateUtils extends
+    // commons DateUtils` 后调用继承方法的形态。仅上溯 class extends 链,接口默认方法
+    // 多源歧义不上溯。
+    {
+        let mut merges: Vec<(&str, &str)> = Vec::new();
+        for e in entities {
+            if e.kind == EntityKind::Class
+                && let Some(sup) = e.metadata.get("superclass").and_then(|v| v.as_str())
+                && type_name_owners.get(sup).copied().unwrap_or(0) == 1
+                && type_methods.contains_key(sup)
+                && type_methods.contains_key(e.name.as_str())
+            {
+                merges.push((e.name.as_str(), sup));
+            }
+        }
+        for (sub, sup) in merges {
+            let Some(super_ms) = type_methods.get(sup).cloned() else {
+                continue;
+            };
+            if let Some(ms) = type_methods.get_mut(sub) {
+                for (mn, mid) in super_ms {
+                    ms.entry(mn).or_insert(mid);
+                }
+            }
+        }
+    }
     // owner → {字段名 → 注入类型名}:Step B 把 `this.service.foo()` 的 receiver=service
     // 精确解析到注入类型,消除"多个注入 type 都有同名方法"的歧义(字段名直接锁定单一 type)。
     let mut owner_fields: HashMap<&str, HashMap<&str, &str>> = HashMap::new();
@@ -1034,8 +1182,9 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
                 via_field = true;
             }
             // 优先级 1:静态调用(receiver 是全局类型名且非歧义,如 JsonUtil.foo)→ 精确 0.7。
+            // receiver_kind=="qualified" 为 FQCN 调用(com.foo.Bar.stat)截末段后的类型名。
             if !via_field
-                && receiver_kind == "name"
+                && matches!(receiver_kind, "name" | "qualified")
                 && let Some(rv) = receiver
                 && type_name_owners.get(rv).copied().unwrap_or(0) <= 1
                 && let Some(ms) = type_methods.get(rv)
@@ -1571,6 +1720,141 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
         }
     }
 
+    // 跨文件 TS 调用(P0,vue/ts 栈):vue_page.metadata.call_sites × 全图 ts function
+    // 索引。页面调用点(`api.listUser(...)` 的成员名 / 裸名)在全图唯一命中同名 function
+    // 且不在本文件 → vue_page -[Calls]-> function(Inferred 0.6)。同名多文件(A+ 同策略)
+    // 记歧义拒边;同文件调用已由 extract 层文件内边覆盖,不重复建。
+    let mut ts_fns_by_name: HashMap<&str, Vec<&Entity>> = HashMap::new();
+    for entity in entities.iter().filter(|e| e.kind == EntityKind::Function) {
+        ts_fns_by_name
+            .entry(entity.name.as_str())
+            .or_default()
+            .push(entity);
+    }
+    for page in entities.iter().filter(|e| e.kind == EntityKind::VuePage) {
+        let Some(sites) = page.metadata.get("call_sites").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for site in sites {
+            let Some(name) = site.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let line = site
+                .get("line")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default() as u32;
+            let Some(cands) = ts_fns_by_name.get(name) else {
+                continue;
+            };
+            if cands.len() > 1 {
+                ambiguities.push(AmbiguityNote {
+                    holder: page.id.clone(),
+                    kind: "ts_call",
+                    name: name.to_string(),
+                    candidates: candidate_files(cands),
+                });
+                continue;
+            }
+            let target = cands[0];
+            if target
+                .evidence
+                .first()
+                .is_some_and(|ev| ev.file == page.qualified_name)
+            {
+                continue;
+            }
+            edges.push(
+                Edge::new(page.id.clone(), target.id.clone(), EdgeKind::Calls).with_evidence(
+                    page.qualified_name.as_str(),
+                    line,
+                    line,
+                    EvidenceClass::Inferred,
+                    0.6,
+                    "call-site name match to TS function (cross-file)",
+                ),
+            );
+        }
+    }
+
+    // 前端路由 → 页面组件(P1):route.metadata.component_spec 归一为文件路径后精确匹配
+    // vue_page(qualified_name = 文件路径,路径唯一无歧义,无需 A+ 名字仲裁)。import 语句
+    // 是事实(Fact 0.9)。链路价值:route -[renders]-> vue_page -[calls]-> api function,
+    // "路由 → 页面 → api" 递归可达。
+    let page_by_path: HashMap<&str, &Entity> = entities
+        .iter()
+        .filter(|e| e.kind == EntityKind::VuePage)
+        .map(|e| (e.qualified_name.as_str(), e))
+        .collect();
+    for route in entities.iter().filter(|e| e.kind == EntityKind::Route) {
+        let Some(spec) = route
+            .metadata
+            .get("component_spec")
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        let Some(resolved) = resolve_import_spec(spec, &route.qualified_name) else {
+            continue;
+        };
+        let Some(page) = lookup_page(&page_by_path, &resolved) else {
+            continue;
+        };
+        let ev = route.evidence.first();
+        edges.push(
+            Edge::new(route.id.clone(), page.id.clone(), EdgeKind::Renders).with_evidence(
+                ev.map(|e| e.file.as_str()).unwrap_or(""),
+                ev.map(|e| e.start_line).unwrap_or_default(),
+                ev.map(|e| e.end_line).unwrap_or_default(),
+                EvidenceClass::Fact,
+                0.9,
+                "route component import resolves to page file",
+            ),
+        );
+    }
+    // 组件引用(P1):vue_page.metadata.component_refs 同法解析。支撑"改组件影响哪些页面"
+    // 的 inbound 查询(替代同名 frontend_field 弱近似)。
+    let mut ref_seen: HashSet<(String, String)> = HashSet::new();
+    for page in entities.iter().filter(|e| e.kind == EntityKind::VuePage) {
+        let Some(refs) = page
+            .metadata
+            .get("component_refs")
+            .and_then(|v| v.as_array())
+        else {
+            continue;
+        };
+        for reference in refs {
+            let Some(spec) = reference.get("spec").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(resolved) = resolve_import_spec(spec, &page.qualified_name) else {
+                continue;
+            };
+            let Some(target) = lookup_page(&page_by_path, &resolved) else {
+                continue;
+            };
+            if target.id == page.id || !ref_seen.insert((page.id.0.clone(), target.id.0.clone())) {
+                continue;
+            }
+            edges.push(
+                Edge::new(page.id.clone(), target.id.clone(), EdgeKind::ComponentRef)
+                    .with_evidence(
+                        page.qualified_name.as_str(),
+                        reference
+                            .get("line")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or_default() as u32,
+                        reference
+                            .get("line")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or_default() as u32,
+                        EvidenceClass::Fact,
+                        0.9,
+                        "import of .vue component",
+                    ),
+            );
+        }
+    }
+
     // A+ note 去重:同一实体同一 (kind,name) 可能被多个 invoke / 多个 method 触发,
     // 合并成一条,避免 metadata.ambiguous_resolution 噪声膨胀。
     let mut seen: HashSet<(String, &'static str, String)> = HashSet::new();
@@ -1579,6 +1863,43 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
         patch: GraphPatch::add(Vec::new(), edges),
         ambiguities,
     }
+}
+
+/// import spec → 仓库相对文件路径。支持 `@/x`(alias = src,plus-ui/element-admin 惯例)、
+/// `~/x`、相对 `./x`/`../x`(相对 from_path 所在目录归一);裸包名(无路径语义)返回 None。
+/// 只做纯路径运算——不查文件系统,目标存在性由调用方在全图实体索引上精确匹配兜底。
+fn resolve_import_spec(spec: &str, from_path: &str) -> Option<String> {
+    if let Some(rest) = spec.strip_prefix("@/") {
+        return Some(format!("src/{rest}"));
+    }
+    if let Some(rest) = spec.strip_prefix("~/") {
+        return Some(format!("src/{rest}"));
+    }
+    if spec.starts_with('.') {
+        let base = from_path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+        let joined = format!("{base}/{spec}");
+        let mut parts: Vec<&str> = Vec::new();
+        for part in joined.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                segment => parts.push(segment),
+            }
+        }
+        return Some(parts.join("/"));
+    }
+    None
+}
+
+/// vue_page 路径索引查找:先精确,失败补 `.vue` 重试——vue-router 的
+/// `component: () => import('@/views/x/index')` 惯例省略后缀(bundler 解析)。
+fn lookup_page<'a>(index: &'a HashMap<&str, &Entity>, path: &str) -> Option<&'a Entity> {
+    index
+        .get(path)
+        .or_else(|| index.get(format!("{path}.vue").as_str()))
+        .copied()
 }
 
 /// 一条因裸名歧义被跳过的跨文件解析(A+ 策略)。`holder` = 请求方实体(边本该从它出发),

@@ -1841,3 +1841,261 @@ fn superclass_of_edge_links_superclass_to_subclass() {
         "AbstractBase 经 SuperclassOf 应到 Concrete, got {names:?}"
     );
 }
+
+#[test]
+fn throw_statement_links_method_to_exception_class() {
+    // `throw new ServiceException(...)` 语句(raise)与签名 throws 声明都应建 Throws 边;
+    // catch 的项目内异常建 Handles;catch JDK 异常(不在项目 class 图内)不建边。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("Biz.java"),
+        r#"
+        class ServiceException extends RuntimeException {}
+        class BizService {
+          void save() {
+            if (bad()) { throw new ServiceException("dup"); }
+          }
+          void load() throws ServiceException, java.io.IOException {
+            try { save(); } catch (ServiceException e) { log(e); } catch (IllegalStateException e) { }
+          }
+          boolean bad() { return true; }
+          void log(Exception e) { }
+        }
+        "#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+
+    let save = store
+        .search(SearchQuery::new("save").with_limit(20))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::Method && m.entity.name == "save")
+        .expect("save method")
+        .entity;
+    let save_edges = store
+        .traverse(
+            TraverseQuery::outbound(save.id.clone())
+                .with_depth(1)
+                .with_kinds(vec![EdgeKind::Throws]),
+        )
+        .unwrap();
+    assert!(
+        save_edges
+            .entities
+            .iter()
+            .any(|e| e.name == "ServiceException"),
+        "save 的 throw new 应建 Throws→ServiceException, got {:?}",
+        save_edges.entities
+    );
+
+    let load = store
+        .search(SearchQuery::new("load").with_limit(20))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::Method && m.entity.name == "load")
+        .expect("load method")
+        .entity;
+    let load_edges = store
+        .traverse(
+            TraverseQuery::outbound(load.id.clone())
+                .with_depth(1)
+                .with_kinds(vec![EdgeKind::Throws, EdgeKind::Handles]),
+        )
+        .unwrap();
+    // 签名 throws + catch ServiceException 各一条;catch IllegalStateException(JDK,图外)不建。
+    assert_eq!(
+        load_edges.entities.len(),
+        2,
+        "load 应达 ServiceException(throws+handles)且不含 JDK 异常, got {:?}",
+        load_edges.entities
+    );
+
+    // evidence reason 区分 raise / throws clause 两种来源。
+    let all = store.extract_edges().unwrap();
+    let save_direct: Vec<_> = all
+        .iter()
+        .filter(|e| e.source == save.id && e.kind == EdgeKind::Throws)
+        .collect();
+    assert!(
+        save_direct
+            .iter()
+            .any(|e| e.evidence[0].reason == "throw statement"),
+        "raise 边 reason 应为 throw statement, got {save_direct:?}"
+    );
+    let load_direct: Vec<_> = all
+        .iter()
+        .filter(|e| e.source == load.id && matches!(e.kind, EdgeKind::Throws | EdgeKind::Handles))
+        .collect();
+    assert!(
+        load_direct
+            .iter()
+            .any(|e| e.kind == EdgeKind::Throws && e.evidence[0].reason == "throws clause"),
+        "签名边 reason 应为 throws clause, got {load_direct:?}"
+    );
+    assert!(
+        load_direct
+            .iter()
+            .any(|e| e.kind == EdgeKind::Handles && e.evidence[0].reason == "catch clause"),
+        "catch 边 reason 应为 catch clause, got {load_direct:?}"
+    );
+}
+
+#[test]
+fn qualified_static_call_and_inherited_method_resolve_cross_file() {
+    // com.foo.DateUtils.now()(FQCN,receiver 截末段)与 ChildUtils extends DateUtils
+    // 后调用继承方法,两条新路径都应建 calls 边到 DateUtils.now。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("DateUtils.java"),
+        r#"
+        package com.foo;
+        class DateUtils {
+          static String now() { return "t"; }
+        }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("Callers.java"),
+        r#"
+        class Helper {
+          void t() { com.foo.DateUtils.now(); }
+        }
+        class ChildUtils extends DateUtils {
+          void u() { DateUtils.now(); }
+        }
+        "#,
+    )
+    .unwrap();
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+
+    let now_id = store
+        .search(SearchQuery::new("now").with_limit(20))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::Method && m.entity.name == "now")
+        .expect("DateUtils.now method")
+        .entity
+        .id;
+    let inbound = store
+        .traverse(TraverseQuery {
+            start: now_id,
+            outbound: false,
+            max_depth: 1,
+            edge_kinds: vec![EdgeKind::Calls],
+        })
+        .unwrap()
+        .entities;
+    let names: Vec<&str> = inbound.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names.contains(&"t"),
+        "FQCN 调用应解析到 DateUtils.now, got {names:?}"
+    );
+    assert!(
+        names.contains(&"u"),
+        "继承方法调用应解析到 DateUtils.now(上溯), got {names:?}"
+    );
+}
+
+#[test]
+fn indexes_vue_router_renders_and_component_ref_edges() {
+    // P1 vue/ts:route -[renders]-> vue_page(嵌套 path 拼接 + import spec 归一)+
+    // vue_page -[component_ref]-> vue_page。递归链路"路由 → 页面 → api 函数"可达。
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src/views/user")).unwrap();
+    fs::create_dir_all(dir.path().join("src/components")).unwrap();
+    fs::create_dir_all(dir.path().join("src/layout")).unwrap();
+    fs::create_dir_all(dir.path().join("src/api")).unwrap();
+    fs::write(
+        dir.path().join("src/router.ts"),
+        "import Layout from '@/layout/index.vue'\nexport const routes: RouteRecordRaw[] = [\n  { path: '/user', component: Layout, children: [\n    { path: 'profile', component: () => import('@/views/user/profile.vue'), name: 'UserProfile' } ] } ]\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("src/layout/index.vue"),
+        "<template><div/></template>",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("src/views/user/profile.vue"),
+        "<script setup>\nimport UserCard from '@/components/UserCard.vue'\nimport { getUser } from '@/api/user'\nconst u = await getUser(1)\n</script>",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("src/components/UserCard.vue"),
+        "<template><div/></template>",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("src/api/user.ts"),
+        "export const getUser = (id: number): Promise<unknown> => request({ url: '/user/1' });\n",
+    )
+    .unwrap();
+
+    let mut store = SqliteGraphStore::open_in_memory().unwrap();
+    WorkspaceIndexer.scan(dir.path(), &mut store).unwrap();
+
+    // route 实体:相对 path 'profile' 与父 '/user' 拼接为 /user/profile
+    let route = store
+        .search(SearchQuery::new("profile").with_limit(30))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::Route && m.entity.name == "/user/profile")
+        .expect("嵌套 path 应拼接为 /user/profile")
+        .entity;
+    let rendered = store
+        .traverse(
+            TraverseQuery::outbound(route.id.clone())
+                .with_depth(1)
+                .with_kinds(vec![EdgeKind::Renders]),
+        )
+        .unwrap();
+    assert!(
+        rendered
+            .entities
+            .iter()
+            .any(|e| e.kind == EntityKind::VuePage && e.name == "profile"),
+        "route 应 renders 到 profile 页面: {rendered:?}"
+    );
+
+    // component_ref:profile 页 import 的 UserCard.vue
+    let profile_page = store
+        .search(SearchQuery::new("profile").with_limit(30))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.entity.kind == EntityKind::VuePage && m.entity.name == "profile")
+        .expect("profile 页面")
+        .entity;
+    let refs = store
+        .traverse(
+            TraverseQuery::outbound(profile_page.id.clone())
+                .with_depth(1)
+                .with_kinds(vec![EdgeKind::ComponentRef]),
+        )
+        .unwrap();
+    assert!(
+        refs.entities
+            .iter()
+            .any(|e| e.kind == EntityKind::VuePage && e.name == "UserCard"),
+        "profile 页应 component_ref 到 UserCard 页面: {refs:?}"
+    );
+
+    // 全链路:route -[renders]-> page -[calls]-> api function(depth 2 递归可达)
+    let chain = store
+        .traverse(
+            TraverseQuery::outbound(route.id)
+                .with_depth(2)
+                .with_kinds(vec![EdgeKind::Renders, EdgeKind::Calls]),
+        )
+        .unwrap();
+    assert!(
+        chain
+            .entities
+            .iter()
+            .any(|e| e.kind == EntityKind::Function && e.name == "getUser"),
+        "路由 → 页面 → api 函数应递归可达: {chain:?}"
+    );
+}

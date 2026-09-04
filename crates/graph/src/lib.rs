@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use repo_intelligence_model::{
-    Edge, Entity, EntityId, GraphPatch, QueryResult, SearchQuery, TraverseQuery,
+    ClusterInfo, Edge, Entity, EntityId, GraphPatch, QueryResult, SearchQuery, TraverseQuery,
 };
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
@@ -52,6 +52,15 @@ pub trait GraphStore {
     }
     /// 向量层:读取全部 entity_id → embedding(语义检索查询用,应用层算余弦)。
     fn get_all_embeddings(&self) -> Result<Vec<(EntityId, Vec<f32>)>> {
+        Ok(Vec::new())
+    }
+
+    /// 聚类汇总(v0.1.37):全量替换 cluster_info 表(scan 每轮重算覆盖)。默认 no-op。
+    fn set_cluster_info(&mut self, _infos: &[ClusterInfo]) -> Result<()> {
+        Ok(())
+    }
+    /// 聚类汇总:读取全部簇标注(按 size 降序)。旧库无表/未重扫时返回空。
+    fn get_cluster_info(&self) -> Result<Vec<ClusterInfo>> {
         Ok(Vec::new())
     }
 }
@@ -299,6 +308,13 @@ impl SqliteGraphStore {
                 embedding BLOB NOT NULL,
                 dim INTEGER NOT NULL,
                 text_hash TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cluster_info (
+                cluster_id INTEGER PRIMARY KEY,
+                label TEXT,
+                cohesion REAL NOT NULL DEFAULT 0,
+                top_nodes TEXT NOT NULL DEFAULT '[]',
+                size INTEGER NOT NULL DEFAULT 0
             );
             ",
         )?;
@@ -791,6 +807,45 @@ impl GraphStore for SqliteGraphStore {
             out.push((EntityId(id), vec));
         }
         Ok(out)
+    }
+
+    fn set_cluster_info(&mut self, infos: &[ClusterInfo]) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM cluster_info", [])?;
+        for c in infos {
+            transaction.execute(
+                "INSERT INTO cluster_info(cluster_id, label, cohesion, top_nodes, size)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    c.cluster_id as i64,
+                    c.label,
+                    c.cohesion,
+                    serde_json::to_string(&c.top_nodes)?,
+                    c.size as i64,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn get_cluster_info(&self) -> Result<Vec<ClusterInfo>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT cluster_id, label, cohesion, top_nodes, size
+             FROM cluster_info ORDER BY size DESC, cluster_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let top_nodes_raw: String = row.get(3)?;
+            Ok(ClusterInfo {
+                cluster_id: row.get::<_, i64>(0)? as u64,
+                label: row.get(1)?,
+                cohesion: row.get(2)?,
+                top_nodes: serde_json::from_str(&top_nodes_raw).unwrap_or_default(),
+                size: row.get::<_, i64>(4)? as u32,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     fn apply_patch(&mut self, patch: GraphPatch) -> Result<()> {

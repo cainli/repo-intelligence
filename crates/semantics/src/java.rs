@@ -33,7 +33,11 @@ static METHOD_MAPPING: LazyLock<Regex> = LazyLock::new(|| {
     // group2 = 括号内参数列表,path 由 annotation_path 解析(支持 value 在任意属性位)。
     // 类级 @RequestMapping 虽也被该正则命中,但由配对阶段的 class_offset 检查排除
     // (见 extract_java),仅作 base。
-    Regex::new(r#"@(?:(Get|Post|Put|Delete|Patch)Mapping|RequestMapping)\s*\(([^)]*)\)"#).unwrap()
+    // 括号可选(2026-09-04):裸 @GetMapping(无参,路径全靠类级 base)曾因要求括号
+    // 连匹配都不进,ruoyi ~23 个方法丢失 endpoint(SysProfileController 的
+    // GET/PUT /system/user/profile)。\b 防 @GetMappingXxx 误配。
+    Regex::new(r#"@(?:(Get|Post|Put|Delete|Patch)Mapping|RequestMapping)\b\s*(?:\(([^)]*)\))?"#)
+        .unwrap()
 });
 static STRING_LITERAL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""([^"]*)""#).unwrap());
 // 注解参数里的 path 提取:value/path 属性优先(任意属性位置,兼容数组 value={"/a","/b"}
@@ -51,6 +55,32 @@ fn annotation_path(args: &str) -> Option<String> {
         .captures(args)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
+}
+
+/// 类级 base 与方法级 path 的拼接(Spring URL 语义)。返回 None = 无路径可表达,
+/// 调用方跳过该注解不产 endpoint(与历史"完全无路径不产 endpoint"语义一致)。
+///
+/// Spring 语义要点(实现前先想清这三条):
+/// 1. **恒拼接**:方法路径不管有没有前导 `/`,都是**追加**到 base 之后,不是"绝对路径
+///    覆盖"。`base="/user"` + `"list"` 与 `base="/user"` + `"/list"` 结果相同——
+///    直接字符串相接会把 `/user` + `"list"` 拼成 `/userlist`,必须以 `/` 分隔。
+/// 2. **空方法路径回退 base**:裸 `@GetMapping` / `@GetMapping("")` / `@GetMapping(method=…)`
+///    的路径就是类级 base 本身;此时 base 为空才是真正的"无路径"(→ None)。
+/// 3. 斜杠归一(`/` 重复、首尾 `/`)不用管——调用方随后过 `normalize_path`。
+///    但拼接时插入的**分隔 `/` 要在这里补**,归一不会凭空造分隔符。
+///
+/// method_path 的 None(注解无参数组)与 Some("")(注解有参但 path 为空串)在此等价。
+fn join_mapping_path(base: &str, method_path: Option<&str>) -> Option<String> {
+    // 前导/尾随 `/` 都剥掉:Spring 里方法路径恒为追加,`"/x"` 与 `"x"` 等价;
+    // `Some("/")` 视为空(方法路径就是 base 本身)。
+    let method_path = method_path.unwrap_or("").trim_matches('/');
+    if method_path.is_empty() {
+        // 裸注解/空方法路径 → 回退 base;base 也空 = 无路径可表达(不产 endpoint)。
+        (!base.is_empty()).then(|| base.to_string())
+    } else {
+        // 恒以 / 分隔拼接(分隔符只能在这里补,normalize_path 不造分隔符)。
+        Some(format!("{base}/{method_path}"))
+    }
 }
 // 通用注解简单名:@Foo(…) / @Foo → group1=Foo。用于白名单注解索引(P1-1)。
 static AT_ANNOTATION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@([A-Za-z_]\w*)").unwrap());
@@ -561,12 +591,14 @@ fn extract_java(
         // group1 缺失 = @RequestMapping(无动词)→ method 通配,metadata 不含 method,
         // 让 analysis 端 endpoint_method=None → 与任意前端 call_method 低置信匹配。
         let method = capture.get(1).map(|m| m.as_str().to_uppercase());
-        // group2 = 注解参数列表;path 经 annotation_path 解析(value 可在任意属性位)。
-        // 括号内无字符串字面量(如纯 method=POST 无路径)→ 不产 endpoint。
-        let Some(path_arg) = capture.get(2).and_then(|m| annotation_path(m.as_str())) else {
+        // group2 = 注解参数列表(裸注解时整个分组缺失);path 经 annotation_path 解析
+        // (value 可在任意属性位)。无方法路径(裸注解 / 纯 method=POST)→ 回退类级 base;
+        // base 也为空 → 无路径可表达,不产 endpoint(维持历史语义)。
+        let method_path = capture.get(2).and_then(|m| annotation_path(m.as_str()));
+        let Some(joined) = join_mapping_path(&base, method_path.as_deref()) else {
             continue;
         };
-        let endpoint_path = normalize_path(&format!("{base}{path_arg}"));
+        let endpoint_path = normalize_path(&joined);
         let name = match &method {
             Some(verb) => format!("{verb} {endpoint_path}"),
             None => format!("ANY {endpoint_path}"),
@@ -1789,7 +1821,10 @@ fn classify_receiver(source: &[u8], inv_node: Node<'_>) -> (&'static str, Option
                 (Some(i), Some(f)) if i.kind() == "this" && f.kind() == "identifier" => {
                     ("field", Some(node_text(source, f)))
                 }
-                _ => ("qualified", Some(node_text(source, obj))),
+                // 限定名(com.foo.Bar.stat() 的 receiver com.foo.Bar):取末段标识符作类型名
+                // 候选,供 P1 静态调用按短名解析(歧义防护在 analysis 层)。
+                (_, Some(f)) => ("qualified", Some(node_text(source, f))),
+                _ => ("qualified", None),
             }
         }
         "method_invocation" => ("chain", None),
@@ -1882,13 +1917,13 @@ fn is_linear_scan(name: &str) -> bool {
     )
 }
 
-/// 异常流引用:method throws/catch 的异常类型名(analysis 后处理按名 resolve 到 class 实体)。
+/// 异常流引用:method throws/throw/catch 的异常类型名(analysis 后处理按名 resolve 到 class 实体)。
 #[derive(Clone)]
 struct ExceptionRef {
     method: String,
     type_name: String,
     line: u32,
-    kind: String, // "throws" / "handles"
+    kind: String, // "throws" / "raise" / "handles"
 }
 
 /// 取类型节点的简单名(Exception / BusinessException),去 scoped/generic 后缀。
@@ -1927,7 +1962,8 @@ fn first_type_name(node: Node<'_>, source: &[u8]) -> Option<String> {
 }
 
 /// 遍历收集异常流引用:method_declaration 的 throws 子句 → throws;
-/// 方法体内的 catch_clause → handles。current_method 由 method 声明下推。
+/// 方法体内 `throw new X(...)` 语句 → raise(仅 new 形态,抛变量/返回值不收);
+/// catch_clause → handles。current_method 由 method 声明下推。
 fn walk_exceptions(
     node: Node<'_>,
     source: &[u8],
@@ -1943,7 +1979,8 @@ fn walk_exceptions(
         let mname = node_text(source, name_node);
         for i in 0..node.named_child_count() {
             if let Some(child) = node.named_child(i) {
-                if child.kind() == "throws_clause" {
+                // tree-sitter-java 的 throws 子句节点 kind 是 `throws`(非 throws_clause)。
+                if child.kind() == "throws" {
                     for j in 0..child.named_child_count() {
                         if let Some(t) = child.named_child(j)
                             && let Some(tn) = simple_type_name(&t, source)
@@ -1972,6 +2009,19 @@ fn walk_exceptions(
             type_name: tn,
             line: line_of(file_content, node.start_byte()),
             kind: "handles".into(),
+        });
+    }
+    if node.kind() == "throw_statement"
+        && let Some(m) = current_method
+        && let Some(expr) = node.named_child(0)
+        && expr.kind() == "object_creation_expression"
+        && let Some(tn) = first_type_name(expr, source)
+    {
+        refs.push(ExceptionRef {
+            method: m.to_string(),
+            type_name: tn,
+            line: line_of(file_content, node.start_byte()),
+            kind: "raise".into(),
         });
     }
     for i in 0..node.named_child_count() {

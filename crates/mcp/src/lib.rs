@@ -8,8 +8,8 @@ use repo_intelligence_config::IndexerConfig;
 use repo_intelligence_embedding::cosine;
 use repo_intelligence_graph::{GraphStore, SqliteGraphStore};
 use repo_intelligence_model::{
-    ChangeRequest, Edge, EdgeKind, Entity, EntityId, EntityKind, Evidence, EvidenceClass,
-    SearchQuery, TraverseQuery,
+    ChangeRequest, ClusterInfo, Edge, EdgeKind, Entity, EntityId, EntityKind, Evidence,
+    EvidenceClass, SearchQuery, TraverseQuery,
 };
 use serde_json::{Value, json};
 
@@ -897,7 +897,16 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
         "analyze_change" => {
             let change: ChangeRequest = serde_json::from_value(arguments.clone())?;
             let store = SqliteGraphStore::open(&path)?;
-            let mut report = ImpactAnalyzer::new(&store).analyze(&change)?;
+            // [analysis] 分页上限从 .repo-intelligence.toml 读(库上两级为项目根);
+            // 此前 with_config 缺失,配置里的 default/max_impact_limit 不生效。
+            let config = IndexerConfig::load(
+                std::path::Path::new(&path)
+                    .parent()
+                    .and_then(std::path::Path::parent)
+                    .unwrap_or(std::path::Path::new(".")),
+            )?;
+            let mut report =
+                ImpactAnalyzer::with_config(&store, config.analysis).analyze(&change)?;
             // An empty index makes impact analysis meaningless — surface it so a
             // "zero findings" result isn't misread as "this change is safe".
             let (entity_count, _) = store.counts()?;
@@ -1509,8 +1518,11 @@ fn find_hotspots(
 }
 
 /// 架构聚类查询(对标 codebase-memory get_clusters)。cluster_id=None 返回 cluster 列表
-/// (按规模降序,带代表节点);cluster_id=Some 返回该 cluster 的成员列表。
+/// (按规模降序,带 label/cohesion/代表节点——v0.1.37 起读 cluster_info 表,旧库回退
+/// metadata 分组);cluster_id=Some 返回该 cluster 的成员列表。
 fn get_clusters(store: &SqliteGraphStore, cluster_id: Option<u64>, limit: usize) -> Result<Value> {
+    let infos = store.get_cluster_info()?;
+    let info_by_id: HashMap<u64, &ClusterInfo> = infos.iter().map(|c| (c.cluster_id, c)).collect();
     let entities = store.all_entities()?;
     if let Some(cid) = cluster_id {
         let members: Vec<Value> = entities
@@ -1521,7 +1533,34 @@ fn get_clusters(store: &SqliteGraphStore, cluster_id: Option<u64>, limit: usize)
                 json!({"qualified_name": e.qualified_name, "kind": e.kind.as_str(), "name": e.name})
             })
             .collect();
-        return Ok(json!({"cluster_id": cid, "members": members, "count": members.len()}));
+        let extra = match info_by_id.get(&cid) {
+            Some(c) => json!({"label": c.label, "cohesion": c.cohesion}),
+            None => json!({}),
+        };
+        return Ok(json!({
+            "cluster_id": cid,
+            "members": members,
+            "count": members.len(),
+            "label": extra.get("label"),
+            "cohesion": extra.get("cohesion"),
+        }));
+    }
+    // 新库:cluster_info 已有汇总,直接输出;旧库(未重扫)回退 metadata 分组。
+    if !infos.is_empty() {
+        let items: Vec<Value> = infos
+            .iter()
+            .take(limit)
+            .map(|c| {
+                json!({
+                    "cluster_id": c.cluster_id,
+                    "label": c.label,
+                    "cohesion": c.cohesion,
+                    "count": c.size,
+                    "representatives": c.top_nodes,
+                })
+            })
+            .collect();
+        return Ok(json!({"items": items, "count": items.len()}));
     }
     let mut groups: HashMap<u64, Vec<&Entity>> = HashMap::new();
     for e in &entities {

@@ -358,3 +358,101 @@ fn java_class_records_file_level_imports() {
         .expect("Bare");
     assert!(cls.metadata.get("imports").is_none());
 }
+
+// ---- 裸 Mapping 注解(2026-09-04):类级 @RequestMapping 前缀 + 方法级无参注解 ----
+// 回归背景:METHOD_MAPPING 曾要求括号必配,裸 @GetMapping 连匹配都不进,
+// ruoyi SysProfileController 的 GET/PUT /system/user/profile 因此缺失(~23 方法/9.5% 端点)。
+
+/// 类级 @RequestMapping + 裸 @GetMapping:方法路径回退 base 本身。
+#[test]
+fn bare_method_mapping_inherits_class_base() {
+    let sf = java_file(
+        "SysProfileController.java",
+        r#"
+        @RequestMapping("/system/user/profile")
+        public class SysProfileController {
+            @GetMapping
+            public SysProfileVo profile() { return null; }
+        }
+        "#,
+    );
+    let patch = extract(&sf).unwrap();
+    let endpoint = patch
+        .add_entities
+        .iter()
+        .find(|e| e.kind == EntityKind::HttpEndpoint)
+        .expect("裸 @GetMapping 应产出 endpoint");
+    assert_eq!(endpoint.name, "GET /system/user/profile");
+    // exposes 边仍要连到处理方法(find_endpoint/relay 靠它从 URL 追方法)。
+    assert!(
+        patch.add_edges.iter().any(|e| e.kind == EdgeKind::Exposes),
+        "endpoint 应有 method→endpoint exposes 边"
+    );
+}
+
+/// 方法路径无前导斜杠:Spring 恒以 / 分隔拼接,不许出现 /profileupdatePwd 连字。
+#[test]
+fn method_mapping_without_leading_slash_still_appends() {
+    let sf = java_file(
+        "ProfileController.java",
+        r#"
+        @RequestMapping("/system/user/profile")
+        public class ProfileController {
+            @PutMapping("updatePwd")
+            public Void updatePwd() { return null; }
+        }
+        "#,
+    );
+    let patch = extract(&sf).unwrap();
+    let endpoint = patch
+        .add_entities
+        .iter()
+        .find(|e| e.kind == EntityKind::HttpEndpoint)
+        .expect("带路径的 @PutMapping 应产出 endpoint");
+    assert_eq!(endpoint.name, "PUT /system/user/profile/updatePwd");
+}
+
+/// 裸 @GetMapping 且无类级 base:两侧都无路径,维持"无路径不产 endpoint"语义。
+#[test]
+fn bare_mapping_without_class_base_produces_no_endpoint() {
+    let sf = java_file(
+        "NoBase.java",
+        r#"
+        public class NoBase {
+            @GetMapping
+            public Object list() { return null; }
+        }
+        "#,
+    );
+    let patch = extract(&sf).unwrap();
+    assert!(
+        !patch
+            .add_entities
+            .iter()
+            .any(|e| e.kind == EntityKind::HttpEndpoint),
+        "base 与方法路径皆空不应产 endpoint"
+    );
+}
+
+/// 方法级裸 @RequestMapping(无参):method 通配(ANY),路径 = 类级 base。
+#[test]
+fn bare_method_level_request_mapping_is_wildcard_on_base() {
+    let sf = java_file(
+        "Legacy.java",
+        r#"
+        @RequestMapping("/api")
+        public class Legacy {
+            @RequestMapping
+            public Object handle() { return null; }
+        }
+        "#,
+    );
+    let patch = extract(&sf).unwrap();
+    let endpoint = patch
+        .add_entities
+        .iter()
+        .find(|e| e.kind == EntityKind::HttpEndpoint)
+        .expect("方法级裸 @RequestMapping 应产出通配 endpoint");
+    assert_eq!(endpoint.name, "ANY /api");
+    assert!(endpoint.metadata.get("method").is_none(), "ANY 不带 method");
+}

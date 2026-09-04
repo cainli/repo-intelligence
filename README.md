@@ -71,6 +71,12 @@ target/release/repo-intelligence impact \
   --format json
 ```
 
+快捷方式——直接给实体精确名,免手写 JSON(等价于 `{"operation":"change_semantics","from":"..."}`):
+
+```bash
+target/release/repo-intelligence impact --entity SysUserServiceImpl --format json
+```
+
 MCP 配置使用（`--database` 必须指向可写路径，避免使用只读的系统目录）：
 
 ```bash

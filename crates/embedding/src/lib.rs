@@ -1,9 +1,11 @@
 //! 向量层(v0.1.26):本地 ONNX(fastembed-rs)为 entity 文本生成 embedding,
 //! 对标 codebase-memory 的 `node_vectors`。这是"语义"层(FTS 是"全文"层)。
 //!
-//! 模型 AllMiniLML6V2(384 维,量化 ~22MB)随 crate 打包分发(crates/embedding/models/),
-//! 用 `UserDefinedEmbeddingModel` 本地加载——绕开 fastembed 5.x 经 hf-hub 下载的
-//! Content-Range bug,用户零联网。模型来源 Xenova/all-MiniLM-L6-v2(onnx 量化版)。
+//! 模型随 crate 打包分发(crates/embedding/models/),用 `UserDefinedEmbeddingModel`
+//! 本地加载——绕开 fastembed 5.x 经 hf-hub 下载的 Content-Range bug,用户零联网。
+//! v0.1.37 起 Xenova/paraphrase-multilingual-MiniLM-L12-v2(多语量化版,384 维):
+//! 英文 AllMiniLM 对中文 query 几乎逐字拆分、检索失效(评测 C8),多语模型同为
+//! 384 维,schema 与 text_hash 缓存机制不变。
 
 use anyhow::{Context, Result};
 use fastembed::{
@@ -16,24 +18,35 @@ pub struct Embedder {
 }
 
 impl Embedder {
+    /// 模型指纹:scan 的 text_hash 以此为前缀,换模型后旧向量自动失效重算。
+    pub const MODEL_ID: &str = "paraphrase-multilingual-MiniLM-L12-v2-quantized";
+}
+
+impl Embedder {
     /// 从 binary 内嵌的模型字节加载 ONNX(自包含——模型 `include_bytes!` 编译进 binary,
     /// 运行时零文件依赖,故发布的 npm binary 无需额外分发模型文件;修复 v0.1.26 发布包
     /// 运行时读 CARGO_MANIFEST_DIR 找不到 tokenizer.json 的致命 bug)。
     pub fn new() -> Result<Self> {
         let tokenizer_files = TokenizerFiles {
-            tokenizer_file: include_bytes!("../models/all-MiniLM-L6-v2/tokenizer.json").to_vec(),
-            config_file: include_bytes!("../models/all-MiniLM-L6-v2/config.json").to_vec(),
+            tokenizer_file: include_bytes!(
+                "../models/paraphrase-multilingual-MiniLM-L12-v2/tokenizer.json"
+            )
+            .to_vec(),
+            config_file: include_bytes!(
+                "../models/paraphrase-multilingual-MiniLM-L12-v2/config.json"
+            )
+            .to_vec(),
             special_tokens_map_file: include_bytes!(
-                "../models/all-MiniLM-L6-v2/special_tokens_map.json"
+                "../models/paraphrase-multilingual-MiniLM-L12-v2/special_tokens_map.json"
             )
             .to_vec(),
             tokenizer_config_file: include_bytes!(
-                "../models/all-MiniLM-L6-v2/tokenizer_config.json"
+                "../models/paraphrase-multilingual-MiniLM-L12-v2/tokenizer_config.json"
             )
             .to_vec(),
         };
         let mut model = UserDefinedEmbeddingModel::new(
-            include_bytes!("../models/all-MiniLM-L6-v2/model.onnx").to_vec(),
+            include_bytes!("../models/paraphrase-multilingual-MiniLM-L12-v2/model.onnx").to_vec(),
             tokenizer_files,
         );
         // AllMiniLML6V2 用 mean pooling(对短文本/entity 名效果好)。
@@ -54,7 +67,7 @@ impl Embedder {
         Ok(embeddings)
     }
 
-    /// 模型维度(AllMiniLML6V2 = 384)。建表/存储用。
+    /// 模型维度(MiniLM-L6/L12 均为 384,换模型 schema 不变)。建表/存储用。
     pub const DIM: usize = 384;
 }
 
@@ -100,5 +113,49 @@ mod tests {
             elapsed.as_secs_f64() * 10.0,
             elapsed.as_secs_f64() * 68.54
         );
+    }
+}
+
+#[cfg(test)]
+mod multilingual_smoke {
+    use super::*;
+
+    #[test]
+    fn chinese_query_matches_chinese_doc() {
+        let mut e = Embedder::new().unwrap();
+        let corpus = vec![
+            "method login 用户登录".to_string(),
+            "class AuthController POST /auth/login".to_string(),
+            "method insertUser 新增保存用户信息".to_string(),
+            "table sys_login_info 登录日志".to_string(),
+            "method exportExcel 导出 Excel".to_string(),
+        ];
+        let doc_vecs = e.embed(corpus.clone()).unwrap();
+        // 中文 query 命中含中文释义的实体文本(英文模型做不到的场景,v0.1.37 的目标);
+        // 英文 query 不得回归(对齐旧英文模型的基线能力)。
+        for (q, expect, max_rank) in [
+            ("用户登录认证", 0, 1usize),
+            ("登录日志记录", 3, 2usize),
+            // 英文 query 的最佳答案同样是 login 方法(跨语料 top1)。
+            ("user login authentication", 0, 1usize),
+        ] {
+            let qv = e.embed(vec![q.to_string()]).unwrap().pop().unwrap();
+            let mut ranked: Vec<(usize, f32)> = doc_vecs
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i, cosine(&qv, v)))
+                .collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let rank = ranked.iter().position(|(i, _)| *i == expect).unwrap();
+            assert!(
+                rank < max_rank,
+                "query {q:?} 应让 {} 进 top{max_rank}, got {ranked:?}",
+                corpus[expect]
+            );
+            eprintln!(
+                "smoke: {q:?} → {:?} ({:.3})",
+                corpus[ranked[0].0], ranked[0].1
+            );
+        }
     }
 }

@@ -7,6 +7,75 @@
 
 ## [Unreleased]
 
+## [0.1.39] - 2026-09-04
+
+端到端链路实测闭环(vue/ts 四栈替代收口,报告 `docs/eval/ri-vs-cb-20260904.md`)+ 评测导出的两项 P2 当日修复。
+
+### Added
+
+- **`http-join` CLI 子命令**:前后端 http 链路跨库 join——前端 http_client_call 与后端
+  http_endpoint 在两个 workspace.sqlite 间按 method+path 匹配,`--format json` 输出连通对。
+  plus-ui(102 .vue)× ruoyi-vue-plus 实测 193 调用 → 95 精确匹配。
+- **裸 `@GetMapping` 类级前缀拼接**:Controller 类级 `@RequestMapping("/system/user")` +
+  方法级裸 `@GetMapping`(无路径参数)此前不产端点实体;拼接后 ruoyi http_endpoint
+  243 → 284。
+
+### Changed
+
+- **impact 响应紧凑档**:finding 的大响应字段折叠,CLI 输出 27.8KB → 571B(MCP 侧同口径)。
+
+### Fixed
+
+- MyBatis namespace 后缀匹配归一 Windows 反斜杠路径(binds_to_statement 在 Windows 全空)。
+- `index_status` 绝对路径断言改 `Path::is_absolute`(POSIX `'/'` 前缀断言在 Windows 必挂)。
+- CI:embedding 模型预拉步骤补齐(Windows 无 bash 时 build.rs 下载失败致 `include_bytes!` 编译崩);
+  clippy `as_chunks` 新 lint;`cargo fmt` 全量格式化存量欠账清零。
+
+## [0.1.38] - 2026-09-03
+
+vue/ts 四栈替代可行性(P0 TS 符号层落地,报告 `docs/eval/ri-vs-cb-20260902.md`):在
+`验证项目/plus-ui`(Vue 3.5 + TS,102 .vue)上验证前端栈能力。
+
+### Added
+
+- **TS 符号声明提取**:function(两种形态:`export function foo()` 与
+  `export const foo = () =>`,含非导出)/ interface / type_alias / enum(带 `members`
+  与 `body_end_line`)。plus-ui 实测:function 1202 / interface 143 / type_alias 43 / enum 5。
+- **跨文件前端调用边**:vue_page → function calls 490 + 文件内 calls 518;跨页面同名
+  前端惯用名走 A+ 歧义拒边(ambiguous_skipped 314,67 页面命中 `metadata.ambiguous_resolution`
+  候选清单)。
+- **`.vue` 双份提取回归清零**:function 与 frontend_field 同名同 qn 的重复实体为 0。
+
+## [0.1.37] - 2026-09-02
+
+repo-intelligence vs codebase-memory 对比评测(`docs/eval/ri-vs-cb-20260828.md`,Java 深栈
+定位 RI 7.4 / cb 6.6)导出的六项改进。
+
+### Added
+
+- **throw 语句解析建 throws 边**:`throw new X(...)` 记 kind=raise(Fact 0.9 "throw
+  statement")。**顺带修复潜伏 bug**:签名 throws 分支的 tree-sitter 节点 kind 写成
+  `throws_clause`(实际为 `throws`),导致签名 throws 收集从未生效。ruoyi 实测 throws
+  0 → 112 条(对照 cb 96)。
+- **聚类自动标注 `cluster_info` 表**:label(成员路径前缀众数)/ cohesion(簇内边占比)/
+  top_nodes(calls+injects 度数 top-3),`get_clusters` 直接读表输出。ruoyi 实测 cluster 42
+  自动得 `ruoyi-common-mybatis`(0.78)、cluster 46 得 `ruoyi-common-redis`。
+- **qualified FQCN 截末段 + 继承方法上溯**:静态调用 receiver 截末段标识符;`type_methods`
+  按 `metadata.superclass` 单继承链上溯一层(超类名全局唯一才合并,A+ 同源防护)。
+  机制经单测验证;ruoyi 零增量(真实缺口是 `extends` 外部工具类,超类不在图内)。
+- **多语 embedding**:模型换 `paraphrase-multilingual-MiniLM-L12-v2` 量化版(384 维不变,
+  binary ~165MB)。中文 query 从完全失败(0.23 误命中)变为可用("用户登录认证" →
+  user_name/password/login 0.59-0.62)。**text_hash 带 MODEL_ID 前缀**,换模型自动全量重算。
+- **embedding 耗时可观测**:scan 摘要新增 `embedded_count` / `embedding_ms`(ruoyi 全量
+  10.9s → 20.2s,多语 12 层推理翻倍,`[index] embedding=false` 可关)。
+
+### Changed
+
+- **impact CLI UX**:新增 `--entity <NAME>` 快捷入口(默认 change_semantics,免手写
+  ChangeRequest JSON);`--request` 传非 JSON 时给用法提示而非裸 serde 报错。
+- **`[analysis]` 配置真实生效**:CLI 与 MCP 的 `ImpactAnalyzer` 改经 `with_config` 注入——
+  此前 `default_impact_limit`/`max_impact_limit` 是死配置。
+
 ## [0.1.36] - 2026-08-27
 
 对标 codebase-memory 的 P0 四件套收口:①工具响应 token 瘦身 ②只读 SQL 直通查询
