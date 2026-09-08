@@ -25,10 +25,10 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@cainli/repo-intelligence-darwin-arm64": "0.1.36",
-    "@cainli/repo-intelligence-darwin-x64": "0.1.36",
-    "@cainli/repo-intelligence-linux-x64-gnu": "0.1.36",
-    "@cainli/repo-intelligence-linux-arm64-gnu": "0.1.36",
-    "@cainli/repo-intelligence-win32-x64": "0.1.36"
+    "@cainli/repo-intelligence-darwin-arm64": "0.1.39",
+    "@cainli/repo-intelligence-darwin-x64": "0.1.39",
+    "@cainli/repo-intelligence-linux-x64-gnu": "0.1.39",
+    "@cainli/repo-intelligence-linux-arm64-gnu": "0.1.39",
+    "@cainli/repo-intelligence-win32-x64": "0.1.39"
   }
 }

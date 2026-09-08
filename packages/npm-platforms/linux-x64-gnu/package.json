@@ -1,6 +1,6 @@
 {
   "name": "@cainli/repo-intelligence-linux-x64-gnu",
-  "version": "0.1.36",
+  "version": "0.1.39",
   "description": "Linux x86_64 (glibc) native binary for @cainli/repo-intelligence",
   "license": "Apache-2.0",
   "repository": {
