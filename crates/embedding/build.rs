@@ -6,10 +6,11 @@ use std::process::Command;
 
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let model = manifest.join("models/all-MiniLM-L6-v2/model.onnx");
+    // 与 src/lib.rs 的 include_bytes! 路径保持一致(v0.1.37 起为多语模型)。
+    let model = manifest.join("models/paraphrase-multilingual-MiniLM-L12-v2/model.onnx");
     if !model.exists() {
         let script = manifest.join("scripts/fetch-model.sh");
-        println!("cargo:warning=[embedding] 模型缺失,自动下载(首次 ~23MB from hf-mirror)...");
+        println!("cargo:warning=[embedding] 模型缺失,自动下载(首次 ~118MB from hf-mirror)...");
         let ok = Command::new("bash")
             .arg(&script)
             .status()
