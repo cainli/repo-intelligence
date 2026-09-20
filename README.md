@@ -35,6 +35,26 @@ max_file_bytes = 4194304
 package-lock.json、生成代码等导致 scan 卡死的大文件；也可临时用 `.ignore` 的
 `*.json` + `!package.json`（gitignore 语义，支持取反）做一次性排除。
 
+### 大仓库与 embedding
+
+scan 会对实体生成语义检索向量（多语 MiniLM 量化模型，约 118MB，首次自动下载到
+`crates/embedding/models/`）。数十万实体的大仓库首扫推理可达分钟级，此前该阶段
+无中间日志、易被误判为卡死；现按 2048 条/批分批推理，每 5 秒输出一条进度：
+
+```
+[ri-diag] embedding progress: 46080/565815 in 42.1s, eta ~475s
+```
+
+急用或不需要语义检索时可整体关闭：
+
+```toml
+[index]
+embedding = false
+```
+
+关闭后图结构、FTS、全部边照常落库，仅 `semantic-search` 不可用；推理失败同理降级
+（warning 后继续），不会阻塞 scan。
+
 扫描日志和进度写入 stderr，JSON 结果仍单独写入 stdout。日志包含文件发现、
 解析、跨栈关系解析、SQLite 持久化和完成阶段；解析阶段每 100 个文件报告一次，
 并显示当前文件。
