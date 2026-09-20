@@ -262,6 +262,38 @@ impl IndexerConfig {
             toml::from_str(&text).with_context(|| format!("parse config {}", path.display()))?;
         Ok(config)
     }
+
+    /// init 的机器规格脚手架：按逻辑核数给三档 embedding 限速默认，防止低配机
+    /// 被推理打满（高配机保持全速，只留注释模板供按需启用）。探测值不可靠
+    /// （容器/共享宿主可能报宿主核数），故文件头注释写明探测结果，用户可改。
+    /// 探测失败（cores=0）按最保守的低配档处理——防卡死优先于快。
+    pub fn scaffold_toml(logical_cores: usize) -> String {
+        let (threads, delay) = match logical_cores {
+            0..=4 => (2, 200),
+            5..=8 => (4, 100),
+            _ => (0, 0),
+        };
+        let spec = if logical_cores == 0 {
+            "unknown".to_string()
+        } else {
+            logical_cores.to_string()
+        };
+        let mut out = format!(
+            "# repo-intelligence init 生成（探测到 {spec} 逻辑核）。\n\
+             # embedding 推理默认吃满所有核；目标机器不能被打满时按需调整：\n\
+             #   embedding_threads        ort 推理线程上限（0 = 不限）\n\
+             #   embedding_batch_delay_ms 每批（2048 条）推理后的休眠毫秒（0 = 连续推理）\n\
+             [index]\n"
+        );
+        if threads > 0 {
+            out.push_str(&format!(
+                "embedding_threads = {threads}\nembedding_batch_delay_ms = {delay}\n"
+            ));
+        } else {
+            out.push_str("# embedding_threads = 4\n# embedding_batch_delay_ms = 100\n");
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -559,5 +591,36 @@ excluded_patterns = ["package-lock.json", "*.log"]
         // 未覆盖字段回填 builtin
         assert_eq!(cfg.discovery.max_file_bytes, 2 * 1024 * 1024);
         assert!(cfg.discovery.excluded_dirs_extra.is_empty());
+    }
+
+    #[test]
+    fn scaffold_low_spec_machine_writes_throttle() {
+        let toml = IndexerConfig::scaffold_toml(4);
+        assert!(toml.contains("embedding_threads = 2"), "{toml}");
+        assert!(toml.contains("embedding_batch_delay_ms = 200"), "{toml}");
+        assert!(toml.contains("探测到 4 逻辑核"), "{toml}");
+    }
+
+    #[test]
+    fn scaffold_mid_spec_machine_writes_milder_throttle() {
+        let toml = IndexerConfig::scaffold_toml(8);
+        assert!(toml.contains("embedding_threads = 4"), "{toml}");
+        assert!(toml.contains("embedding_batch_delay_ms = 100"), "{toml}");
+    }
+
+    #[test]
+    fn scaffold_high_spec_machine_leaves_commented_template() {
+        let toml = IndexerConfig::scaffold_toml(16);
+        // 高配机不写限速项(全速默认),只留注释模板
+        assert!(!toml.contains("\nembedding_threads = "), "{toml}");
+        assert!(toml.contains("# embedding_threads = 4"), "{toml}");
+        assert!(toml.contains("探测到 16 逻辑核"), "{toml}");
+    }
+
+    #[test]
+    fn scaffold_unknown_cores_falls_back_to_low_spec() {
+        let toml = IndexerConfig::scaffold_toml(0);
+        assert!(toml.contains("探测到 unknown 逻辑核"), "{toml}");
+        assert!(toml.contains("embedding_threads = 2"), "{toml}");
     }
 }

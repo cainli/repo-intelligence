@@ -85,6 +85,11 @@ target/release/repo-intelligence scan . --format json
 target/release/repo-intelligence search customerName --format json
 ```
 
+`init` 会按机器规格生成 `.repo-intelligence.toml`（已存在则不动）：≤4 逻辑核默认
+限速（`embedding_threads = 2` + `embedding_batch_delay_ms = 200`），5-8 核温和限速
+（threads 4 / delay 100），≥9 核全速并留注释模板。探测结果写在文件头注释里，
+容器/共享宿主可能不准，可按需手改。
+
 影响请求：
 
 ```json

@@ -177,12 +177,27 @@ fn run() -> Result<()> {
         }
         Command::Init { workspace, format } => {
             let _store = SqliteGraphStore::open(&cli.database)?;
+            // 智能脚手架：workspace 无配置时按机器规格生成 .repo-intelligence.toml
+            // （低配机默认限速 embedding，防推理打满；高配机全速并留注释模板）。
+            // 已存在则不动——用户手改过的配置不被覆盖。
+            let toml_path = workspace.join(repo_intelligence_config::CONFIG_FILENAME);
+            let mut config_file: Option<String> = None;
+            if !toml_path.exists() {
+                let cores = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(0);
+                let scaffold = repo_intelligence_config::IndexerConfig::scaffold_toml(cores);
+                fs::write(&toml_path, scaffold)
+                    .with_context(|| format!("write config {}", toml_path.display()))?;
+                config_file = toml_path.to_str().map(str::to_string);
+            }
             emit(
                 format,
                 serde_json::json!({
                     "workspace": workspace,
                     "database": cli.database,
-                    "initialized": true
+                    "initialized": true,
+                    "config_file": config_file
                 }),
             )
         }
