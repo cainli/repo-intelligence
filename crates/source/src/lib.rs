@@ -143,6 +143,11 @@ pub fn discover_with_config(root: &Path, config: &DiscoveryConfig) -> Result<Vec
         // 文件名 glob 排除（excluded_patterns）：匹配 basename 即跳过，不读内容。
         // 与目录排除（excluded_dirs）分工：排具体文件如 package-lock.json。
         let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        // workspace 自己的配置文件是元数据不是源码：不提取、不进 file_state
+        // （否则每个配了 toml 的 workspace 凭空多一条实体/文件记录）。
+        if fname == repo_intelligence_config::CONFIG_FILENAME {
+            continue;
+        }
         if patterns.iter().any(|pattern| pattern.matches(fname)) {
             continue;
         }
