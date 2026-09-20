@@ -7,6 +7,32 @@
 
 ## [Unreleased]
 
+## [0.1.40] - 2026-09-20
+
+大仓库索引体验三连：进度可见、CPU/内存可控、init 按机器智能配置。起因是 56 万实体仓库首扫 embedding 静默推理 ~26 分钟被误判卡死。
+
+### Added
+
+- **embedding 批间进度日志**：按 2048 条/批分批推理，每 5 秒输出
+  `[ri-diag] embedding progress: done/n in Xs, eta ~Ys`，大仓库首扫不再黑盒。
+- **`[index] embedding_threads` / `embedding_batch_delay_ms`**：ort 推理线程上限与
+  批间休眠，组合实现温和后台索引（`threads=2 + delay=200` 实测 2.65× 减速，宿主保持响应）。
+- **`init` 按机器规格生成 `.repo-intelligence.toml`**：探测逻辑核数三档——≤4 核默认
+  限速（threads 2 / delay 200）、5-8 核温和（4 / 100）、≥9 核全速留注释模板；已存在
+  则不覆盖，探测结果写在文件头注释。
+
+### Changed
+
+- embedding 向量按批落库（单事务）：内存峰值 O(批) ≈3MB 而非 O(全量)（56 万实体
+  全量攒向量 ≈860MB）；批级容错——单批失败 warning 继续，连续 3 批失败放弃剩余，
+  已落库向量保留、下次 scan 增量续算。
+
+### Fixed
+
+- workspace 自身的 `.repo-intelligence.toml` 被当源码提取（builtin 目录排除不含
+  文件，`.toml` 因 libs.versions.toml 在扩展名白名单），配了 toml 的 workspace 凭空
+  多 1 条文件记录 + 1 条实体。
+
 ## [0.1.39] - 2026-09-04
 
 端到端链路实测闭环(vue/ts 四栈替代收口,报告 `docs/eval/ri-vs-cb-20260904.md`)+ 评测导出的两项 P2 当日修复。
