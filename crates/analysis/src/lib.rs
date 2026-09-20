@@ -529,24 +529,39 @@ impl WorkspaceIndexer {
             if n > 0 {
                 // 大仓库首扫(数十万实体)推理可达分钟级:分批推理并节流输出进度,
                 // 消除"全量一次调用 + 零中间日志"被误判为卡死。批级容错——单批失败
-                // 记 warning 继续(已成功批的向量照存),连续 3 批失败视为模型故障放弃
-                // 剩余;向量缺席即不参与语义检索,与 [index] embedding=false 部分生效
-                // 同语义,不阻塞 scan(FTS 等其他产物仍保留)。
+                // 记 warning 继续,连续 3 批失败视为模型故障放弃剩余;向量缺席即不参与
+                // 语义检索,与 [index] embedding=false 部分生效同语义,不阻塞 scan。
+                // 每批立即落库(set_embeddings 单事务):内存峰值 O(批) 而非 O(全量)
+                // (56 万实体全量攒向量 ≈ 860MB),中断/放弃时已落库向量保留。
+                // embedding_threads 封顶 ort 线程、embedding_batch_delay_ms 批间休眠,
+                // 组合实现温和后台索引,防止目标机器被推理打满(默认 0 = 全速)。
                 const EMBED_BATCH: usize = 2048;
-                let mut rows: Vec<(EntityId, Vec<f32>, String)> = Vec::with_capacity(n);
+                let delay = Duration::from_millis(config.index.embedding_batch_delay_ms);
                 let mut done = 0usize;
+                let mut embedded = 0usize;
                 let mut consecutive_fails = 0u32;
                 let mut last_report = Instant::now();
-                match repo_intelligence_embedding::Embedder::new() {
+                match repo_intelligence_embedding::Embedder::new_with_threads(
+                    config.index.embedding_threads,
+                ) {
                     Ok(mut embedder) => {
                         for chunk in to_embed.chunks(EMBED_BATCH) {
                             let texts: Vec<String> =
                                 chunk.iter().map(|(_, text)| text.clone()).collect();
                             match embedder.embed(texts) {
                                 Ok(vecs) => {
-                                    rows.extend(chunk.iter().cloned().zip(vecs).map(
-                                        |((id, text), vec)| (id.clone(), vec, text_hash(&text)),
-                                    ));
+                                    let rows: Vec<(EntityId, Vec<f32>, String)> = chunk
+                                        .iter()
+                                        .cloned()
+                                        .zip(vecs)
+                                        .map(|((id, text), vec)| {
+                                            (id.clone(), vec, text_hash(&text))
+                                        })
+                                        .collect();
+                                    embedded += rows.len();
+                                    if let Err(e) = store.set_embeddings(&rows) {
+                                        eprintln!("[ri-diag] embedding 存储失败(不阻塞 scan): {e}");
+                                    }
                                     consecutive_fails = 0;
                                 }
                                 Err(e) => {
@@ -568,18 +583,15 @@ impl WorkspaceIndexer {
                                 );
                                 last_report = Instant::now();
                             }
+                            if !delay.is_zero() {
+                                std::thread::sleep(delay);
+                            }
                         }
                         if done < n {
                             eprintln!(
-                                "[ri-diag] embedding 放弃剩余 {} 条(连续批次失败,已得 {} 条向量)",
-                                n - done,
-                                rows.len()
+                                "[ri-diag] embedding 放弃剩余 {} 条(连续批次失败,已得 {embedded} 条向量)",
+                                n - done
                             );
-                        }
-                        if !rows.is_empty() {
-                            if let Err(e) = store.set_embeddings(&rows) {
-                                eprintln!("[ri-diag] embedding 存储失败(不阻塞 scan): {e}");
-                            }
                         }
                     }
                     Err(e) => {

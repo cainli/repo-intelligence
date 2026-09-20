@@ -413,6 +413,14 @@ pub struct IndexingConfig {
     /// 6854 实体生成约 4.5s(增量:仅文本变化的实体重新生成)。
     #[serde(default = "default_embedding")]
     pub embedding: bool,
+    /// embedding 推理(ort intra-op)线程数上限。默认 0 = 不限(吃满所有核)。
+    /// 目标机器不能被打满时设小值(如 2),推理变慢但宿主保持响应。
+    #[serde(default)]
+    pub embedding_threads: usize,
+    /// 每批(2048 条)推理完成后的休眠毫秒。默认 0 = 连续推理。
+    /// 与 embedding_threads 组合实现温和后台索引(如 threads=2 + delay=200)。
+    #[serde(default)]
+    pub embedding_batch_delay_ms: u64,
 }
 
 fn default_fts5_fulltext() -> bool {
@@ -428,6 +436,8 @@ impl Default for IndexingConfig {
         Self {
             fts5_fulltext: default_fts5_fulltext(),
             embedding: default_embedding(),
+            embedding_threads: 0,
+            embedding_batch_delay_ms: 0,
         }
     }
 }

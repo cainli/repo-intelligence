@@ -55,6 +55,17 @@ embedding = false
 关闭后图结构、FTS、全部边照常落库，仅 `semantic-search` 不可用；推理失败同理降级
 （warning 后继续），不会阻塞 scan。
 
+在不能被打满的目标机器（服务器/低配机）上索引时，可限制 CPU 占用：
+
+```toml
+[index]
+embedding_threads = 2        # ort 推理线程上限（默认 0 = 吃满所有核）
+embedding_batch_delay_ms = 200 # 每批（2048 条）推理后休眠毫秒（默认 0 = 连续推理）
+```
+
+两者可组合（如 `threads=2 + delay=200`）：推理吞吐下降、总耗时变长，但宿主始终保持
+响应。已落库向量按批提交，中途中断时已完成部分保留，下次 scan 增量续算。
+
 扫描日志和进度写入 stderr，JSON 结果仍单独写入 stdout。日志包含文件发现、
 解析、跨栈关系解析、SQLite 持久化和完成阶段；解析阶段每 100 个文件报告一次，
 并显示当前文件。

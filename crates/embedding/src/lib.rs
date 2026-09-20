@@ -27,6 +27,12 @@ impl Embedder {
     /// 运行时零文件依赖,故发布的 npm binary 无需额外分发模型文件;修复 v0.1.26 发布包
     /// 运行时读 CARGO_MANIFEST_DIR 找不到 tokenizer.json 的致命 bug)。
     pub fn new() -> Result<Self> {
+        Self::new_with_threads(0)
+    }
+
+    /// 同 `new()`,但可限 ort intra-op 线程数(0 = 不限,吃满所有核)。
+    /// 目标机器不能被推理打满时由 scan 配置传入小值(如 2)。
+    pub fn new_with_threads(intra_threads: usize) -> Result<Self> {
         let tokenizer_files = TokenizerFiles {
             tokenizer_file: include_bytes!(
                 "../models/paraphrase-multilingual-MiniLM-L12-v2/tokenizer.json"
@@ -51,9 +57,15 @@ impl Embedder {
         );
         // AllMiniLML6V2 用 mean pooling(对短文本/entity 名效果好)。
         model.pooling = Some(Pooling::Mean);
-        let model =
-            TextEmbedding::try_new_from_user_defined(model, InitOptionsUserDefined::default())
-                .context("加载本地 ONNX 模型失败")?;
+        // intra_threads=0 传默认(None)= 用满所有核;>0 时封顶,限 CPU 占用换吞吐。
+        let options = InitOptionsUserDefined::default();
+        let options = if intra_threads > 0 {
+            options.with_intra_threads(intra_threads)
+        } else {
+            options
+        };
+        let model = TextEmbedding::try_new_from_user_defined(model, options)
+            .context("加载本地 ONNX 模型失败")?;
         Ok(Self { model })
     }
 
