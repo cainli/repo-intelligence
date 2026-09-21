@@ -1,10 +1,10 @@
 name: release
 
 # 打 v* tag 自动触发,或 Actions 页手动触发(从 main)。
-# 4 个可靠平台(linux-x64/arm64、darwin-arm64、win32-x64)原生构建,全过才发主包;
-# darwin-x64(Intel Mac)单列 best-effort:ort 对 x86_64-apple-darwin 无预编译、不能从
-# arm64 交叉编译,只能用稀缺的 macos-13 原生 runner,队列慢且可能失败——故不阻塞主包,
-# 跑成则额外覆盖 Intel Mac,跑不成其余平台照常发布(optionalDependencies 缺失仅为 warning)。
+# 4 个平台(linux-x64/arm64、darwin-arm64、win32-x64)原生构建,全过才发主包。
+# Intel Mac(darwin-x64)已放弃:ort 对 x86_64-apple-darwin 无预编译、不能从 arm64
+# 交叉编译,只能用 macos-13 原生 runner——0.1.39/0.1.40 连续两版 5 次排队(最长 6h+)
+# 零次排到,该 runner 已进 GitHub 退役流程,不再尝试(0.1.41 起)。
 on:
   push:
     tags:
@@ -86,53 +86,6 @@ jobs:
       - name: Publish platform package
         run: npm publish --access public
         working-directory: ${{ matrix.pkg-dir }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-  # best-effort:Intel Mac。不阻塞主包发布(continue-on-error + publish-main 不依赖它)。
-  build-darwin-x64:
-    name: build (darwin-x64) [best-effort]
-    runs-on: macos-13
-    continue-on-error: true
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: '.'
-          key: x86_64-apple-darwin
-
-      - name: Fetch embedding model
-        run: bash crates/embedding/scripts/fetch-model.sh
-
-      - name: Build release binary
-        run: cargo build --release --locked
-
-      - name: Smoke-test binary
-        run: ./target/release/repo-intelligence --version
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
-
-      - name: Place binary into platform package
-        run: |
-          mkdir -p packages/npm-platforms/darwin-x64/bin
-          cp target/release/repo-intelligence packages/npm-platforms/darwin-x64/bin/repo-intelligence
-
-      - name: Verify package contents
-        run: npm pack --dry-run
-        working-directory: packages/npm-platforms/darwin-x64
-
-      - name: Publish platform package
-        run: npm publish --access public
-        working-directory: packages/npm-platforms/darwin-x64
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 

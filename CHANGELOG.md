@@ -7,6 +7,13 @@
 
 ## [Unreleased]
 
+### Removed
+
+- **放弃 Intel Mac(darwin-x64)平台包**:ort 对 x86_64-apple-darwin 无预编译、无法
+  交叉编译,唯一载体 macos-13 runner 已进 GitHub 退役流程——0.1.39/0.1.40 连续两版
+  5 次排队(最长 6h+)零次排到。支持平台收敛为 linux-x64/arm64、darwin-arm64、
+  win32-x64;Intel Mac 用户装主包会得到明确缺失提示。
+
 ## [0.1.40] - 2026-09-20
 
 大仓库索引体验三连：进度可见、CPU/内存可控、init 按机器智能配置。起因是 56 万实体仓库首扫 embedding 静默推理 ~26 分钟被误判卡死。
