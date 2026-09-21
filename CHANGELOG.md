@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+## [0.1.41] - 2026-09-21
+
+平台收敛版:支持平台从 5 个收敛为 4 个。
+
 ### Removed
 
 - **放弃 Intel Mac(darwin-x64)平台包**:ort 对 x86_64-apple-darwin 无预编译、无法
