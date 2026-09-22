@@ -168,6 +168,14 @@ pub const DEFAULT_ANNOTATION_WHITELIST: &[&str] = &[
     "PreDestroy",
     "TransactionalEventListener",
     "Aspect",
+    // AOP advice / pointcut 声明注解(量极小——只有切面类的方法会用),入白名单让
+    // "哪些方法是通知方法"可查;织入目标由 Intercepts 边(pointcut 解析)表达。
+    "Around",
+    "Before",
+    "After",
+    "AfterReturning",
+    "AfterThrowing",
+    "Pointcut",
     // 持久层标识（JPA/MyBatis）—— 让"@Entity 标注的类""@Mapper 接口"可查。
     "Entity",
     "Table",

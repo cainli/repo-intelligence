@@ -3,6 +3,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
+use regex::Regex;
 pub use repo_intelligence_config::{AnalysisConfig, IndexerConfig};
 use repo_intelligence_graph::GraphStore;
 use repo_intelligence_model::{
@@ -853,8 +854,28 @@ fn summarize_clusters(
     infos
 }
 
-fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution {
-    let mut edges = Vec::new();
+/// 类/接口实体的 Java FQN:extract 层建实体时由文件路径推导写入 metadata.fqn
+/// (src/main/java|src/test/java 标记布局;非标布局不写 → None,跨文件消解宁缺毋滥)。
+fn java_fqn_of(entity: &Entity) -> Option<&str> {
+    entity.metadata.get("fqn").and_then(|v| v.as_str())
+}
+
+/// AspectJ 类/方法模式 → 锚定正则:`..`(递归通配,零或多段)→ `(?:\.[^.]+)*\.?`,
+/// `*`(单段)→ `[^.]*`,其余(含 `.`)字面转义。例:`com.ruoyi..*Service` 匹配
+/// com.ruoyi.XxxService 与 com.ruoyi.a.b.XxxService,不匹配 org.dromara.…。
+fn aspectj_fqn_regex(pattern: &str) -> String {
+    const RECURSIVE: char = '\u{1}';
+    format!(
+        "^{}$",
+        pattern
+            .replace("..", &RECURSIVE.to_string())
+            .replace('.', "\\.")
+            .replace('*', "[^.]*")
+            .replace(RECURSIVE, "(?:\\.[^.]+)*\\.?")
+    )
+}
+
+fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution {    let mut edges = Vec::new();
     let mut ambiguities: Vec<AmbiguityNote> = Vec::new();
     let mut fields: HashMap<String, Vec<&Entity>> = HashMap::new();
     let mut endpoints = Vec::new();
@@ -1729,34 +1750,96 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
         }
     }
 
-    // Intercepts 边(P1-2):aspect advice method.metadata.pointcut(全限定方法签名)→
-    // 目标方法。取签名末段作方法名全局匹配,唯一命中才建边(Inferred,pointcut 解析有限)。
-    let method_by_name: HashMap<&str, Vec<&EntityId>> = {
-        let mut map: HashMap<&str, Vec<&EntityId>> = HashMap::new();
-        for entity in entities {
-            if entity.kind == EntityKind::Method {
-                map.entry(entity.name.as_str())
-                    .or_default()
-                    .push(&entity.id);
+    // Intercepts 边(P1-2 增强):切面 advice 的 pointcut 跨文件落地。旧实现只认"无通配
+    // execution 全限定签名 + 方法名全局唯一",真实项目(ruoyi 实测全部切面)用
+    // `@annotation(参数名)` 写法,0 边。现两类:
+    // - pointcut_annotation = 注解短名 → 方法 metadata.annotations 含该短名的方法
+    //   (extract 层白名单过滤前全量记录——业务标记注解 @Log 等不产实体但有 metadata)
+    // - pointcut_execution = "FQCN.method"(支持 * 单段 / .. 递归通配)→ 类 FQN(实体 id
+    //   内嵌路径经 src/main/java 标记推导)正则匹配 + Declares 边落到方法,方法名正则匹配
+    // 均 Inferred 0.5;单 advice 命中超 CAP 视为表达式过宽拒边防爆炸。
+    const INTERCEPTS_CAP: usize = 2000;
+    // 注解短名 → 方法集(每方法 metadata.annotations 数组摊平,方法数级线性,不建额外索引)。
+    let mut methods_by_annotation: HashMap<&str, Vec<&Entity>> = HashMap::new();
+    // 类 FQN → 该类 Declares 的方法(execution 落点)。FQN 由实体 id 内嵌路径推导。
+    let mut class_methods: Vec<(String, Vec<&Entity>)> = Vec::new();
+    {
+        let entity_by_id: HashMap<&EntityId, &Entity> =
+            entities.iter().map(|e| (&e.id, e)).collect();
+        let mut methods_of_class: HashMap<&EntityId, Vec<&Entity>> = HashMap::new();
+        for edge in edges.iter().filter(|e| e.kind == EdgeKind::Declares) {
+            if let (Some(cls), Some(m)) =
+                (entity_by_id.get(&edge.source), entity_by_id.get(&edge.target))
+                && m.kind == EntityKind::Method
+            {
+                methods_of_class.entry(&cls.id).or_default().push(m);
             }
         }
-        map
-    };
+        for cls in entities
+            .iter()
+            .filter(|e| matches!(e.kind, EntityKind::Class | EntityKind::Interface))
+        {
+            let Some(fqn) = java_fqn_of(cls).map(|s| s.to_string()) else {
+                continue;
+            };
+            let methods = methods_of_class
+                .get(&cls.id)
+                .cloned()
+                .unwrap_or_default();
+            class_methods.push((fqn, methods));
+        }
+    }
+    for m in entities.iter().filter(|e| e.kind == EntityKind::Method) {
+        if let Some(list) = m.metadata.get("annotations").and_then(|v| v.as_array()) {
+            for ann in list.iter().filter_map(|v| v.as_str()) {
+                methods_by_annotation.entry(ann).or_default().push(m);
+            }
+        }
+    }
     for entity in entities {
         if entity.kind != EntityKind::Method {
             continue;
         }
-        let Some(pointcut) = entity.metadata.get("pointcut").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let Some(target_name) = pointcut.rsplit('.').next() else {
-            continue;
-        };
-        if let Some(targets) = method_by_name.get(target_name)
-            && targets.len() == 1
-            && targets[0] != &entity.id
+        let mut targets: Vec<&Entity> = Vec::new();
+        let reason;
+        if let Some(ann) = entity.metadata.get("pointcut_annotation").and_then(|v| v.as_str()) {
+            reason = format!("@annotation({ann})");
+            if let Some(list) = methods_by_annotation.get(ann) {
+                targets.extend(list.iter().copied());
+            }
+        } else if let Some(sig) = entity.metadata.get("pointcut_execution").and_then(|v| v.as_str())
         {
-            let mut edge = Edge::new(entity.id.clone(), targets[0].clone(), EdgeKind::Intercepts);
+            reason = format!("execution({sig})");
+            let Some((fqcn_pat, method_pat)) = sig.rsplit_once('.') else {
+                continue;
+            };
+            let (Ok(fqcn_re), Ok(method_re)) = (
+                Regex::new(&aspectj_fqn_regex(fqcn_pat)),
+                Regex::new(&aspectj_fqn_regex(method_pat)),
+            ) else {
+                continue;
+            };
+            for (fqn, methods) in &class_methods {
+                if !fqcn_re.is_match(fqn) {
+                    continue;
+                }
+                for m in methods {
+                    if method_re.is_match(&m.name) {
+                        targets.push(m);
+                    }
+                }
+            }
+        } else {
+            continue;
+        }
+        if targets.is_empty() || targets.len() > INTERCEPTS_CAP {
+            continue;
+        }
+        for target in targets {
+            if target.id == entity.id {
+                continue;
+            }
+            let mut edge = Edge::new(entity.id.clone(), target.id.clone(), EdgeKind::Intercepts);
             if let Some(ev) = entity.evidence.first() {
                 edge = edge.with_evidence(
                     &ev.file,
@@ -1764,7 +1847,69 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
                     ev.end_line,
                     EvidenceClass::Inferred,
                     0.5,
-                    "AOP advice intercepts target (pointcut signature match)",
+                    format!("AOP advice intercepts target ({reason})"),
+                );
+            }
+            edges.push(edge);
+        }
+    }
+
+    // ReflectsTo 边(P1-3):method metadata.reflects(FQN 数组)→ class/interface 实体。
+    // FQN 精确匹配 0.5;无精确命中时短名(尾段)全图唯一兜底 0.4,歧义即弃。
+    let classes_by_fqn: Vec<(String, &Entity)> = entities
+        .iter()
+        .filter(|e| matches!(e.kind, EntityKind::Class | EntityKind::Interface))
+        .filter_map(|e| java_fqn_of(e).map(|f| (f.to_string(), e)))
+        .collect();
+    let mut classes_by_name: HashMap<&str, Vec<&Entity>> = HashMap::new();
+    for e in entities
+        .iter()
+        .filter(|e| matches!(e.kind, EntityKind::Class | EntityKind::Interface))
+    {
+        classes_by_name.entry(e.name.as_str()).or_default().push(e);
+    }
+    for entity in entities {
+        if entity.kind != EntityKind::Method {
+            continue;
+        }
+        let Some(list) = entity.metadata.get("reflects").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for fqn in list.iter().filter_map(|v| v.as_str()) {
+            let exact: Vec<&Entity> = classes_by_fqn
+                .iter()
+                .filter(|(f, _)| f == fqn)
+                .map(|(_, e)| *e)
+                .collect();
+            let (target, confidence, desc) = match exact.as_slice() {
+                [one] => (*one, 0.5_f32, "Class.forName literal matches class FQN"),
+                [] => {
+                    // 短名兜底:尾段唯一命中才连。
+                    let short = fqn.rsplit('.').next().unwrap_or(fqn);
+                    let empty: Vec<&Entity> = Vec::new();
+                    let cands: &[&Entity] = classes_by_name
+                        .get(short)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&empty);
+                    match cands {
+                        [one] => (*one, 0.4_f32, "Class.forName literal unique short-name fallback"),
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            };
+            if target.id == entity.id {
+                continue;
+            }
+            let mut edge = Edge::new(entity.id.clone(), target.id.clone(), EdgeKind::ReflectsTo);
+            if let Some(ev) = entity.evidence.first() {
+                edge = edge.with_evidence(
+                    &ev.file,
+                    ev.start_line,
+                    ev.end_line,
+                    EvidenceClass::Inferred,
+                    confidence,
+                    desc,
                 );
             }
             edges.push(edge);
@@ -2223,5 +2368,48 @@ fn plane_rank(kind: EntityKind) -> u8 {
         | EntityKind::Column => 2,
         EntityKind::Field => 1,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aspectj_regex_handles_recursive_and_suffix_wildcards() {
+        let re = Regex::new(&aspectj_fqn_regex("com.ruoyi..*Service")).unwrap();
+        // .. 递归:任意深度子包;* 单段尾缀通配
+        assert!(re.is_match("com.ruoyi.SysUserService"));
+        assert!(re.is_match("com.ruoyi.system.service.impl.SysUserService"));
+        // 不跨包前缀:org.dromara 不在 com.ruoyi 下
+        assert!(!re.is_match("org.dromara.common.Service"));
+        // 尾段必须以 Service 结尾:Impl 不命中(cb 评测里 ORDER BY 静默不排序的教训——匹配语义要可解释)
+        assert!(!re.is_match("com.ruoyi.system.service.impl.SysUserServiceImpl"));
+    }
+
+    #[test]
+    fn aspectj_regex_exact_pattern_is_literal() {
+        let re = Regex::new(&aspectj_fqn_regex("com.ruoyi.web.controller.SysUserController")).unwrap();
+        assert!(re.is_match("com.ruoyi.web.controller.SysUserController"));
+        assert!(!re.is_match("com.ruoyi.web.controller.other.SysUserController"));
+    }
+
+    #[test]
+    fn java_fqn_of_reads_metadata_written_by_extractor() {
+        let mk = |fqn: Option<&str>| {
+            let mut meta = serde_json::Map::new();
+            if let Some(f) = fqn {
+                meta.insert("fqn".into(), json!(f));
+            }
+            Entity::new(
+                EntityId::stable("workspace", "p/A.java", EntityKind::Class, "A", ""),
+                EntityKind::Class,
+                "A",
+                "A",
+            )
+            .with_metadata(serde_json::Value::Object(meta))
+        };
+        assert_eq!(java_fqn_of(&mk(Some("org.dromara.common.log.aspect.LogAspect"))), Some("org.dromara.common.log.aspect.LogAspect"));
+        assert_eq!(java_fqn_of(&mk(None)), None);
     }
 }

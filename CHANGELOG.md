@@ -7,6 +7,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- **AOP 织入索引（`intercepts` 边）**：解析切面 advice 的 pointcut——`@annotation(参数名)`
+  自动消解参数类型、`execution(FQCN.method(..))` 支持通配（`..` 递归/`*` 单段）、
+  `@Pointcut` 方法引用。ruoyi 实测 0 → 329 条（LogAspect 拦截 118 个 @Log 方法，
+  与 metadata 通道逐一核对差集 0）。静态索引首次可答"这个切面拦了谁"。
+- **反射字面量索引（`reflects_to` 边）**：`Class.forName("FQN")` 及同文件
+  `static final String` 常量一级传播，FQN 精确匹配 0.5 / 唯一短名兜底 0.4。
+- 方法 `metadata.annotations` 记录全量注解短名（白名单过滤前），业务标记注解
+  （@Log/@DataScope 等）不产实体但可查。
+- advice/pointcut 声明注解（@Around/@Before/@After*/@Pointcut）入注解白名单。
+
 ## [0.1.41] - 2026-09-21
 
 平台收敛版:支持平台从 5 个收敛为 4 个。

@@ -237,6 +237,11 @@ pub enum EdgeKind {
     Annotated,
     /// aspect_method -[Intercepts]-> target_method:AOP 切面拦截(Inferred,pointcut 解析置信有限)。
     Intercepts,
+    /// caller_method -[ReflectsTo]-> target_class:反射字面量消解——`Class.forName("com.x.Foo")`
+    /// 或 `forName(常量)`(同文件 `static final String` 一级传播)的字符串解析为类实体
+    /// (Inferred 0.5,FQN 精确匹配;0.4 唯一短名兜底)。反射调用的运行时绑定静态不可证,
+    /// 此边只表达"字符串指向"。
+    ReflectsTo,
     /// test_class/method -[Tests]-> 被测类:`XxxTest` 测试覆盖(Inferred,命名约定 + 引用推断)。
     Tests,
     /// interface -[Implements]-> class:接口的实现关系(Fact,编译时生成代码如 MapStruct Impl 补全)。
@@ -282,6 +287,7 @@ impl EdgeKind {
             Self::SubmoduleOf => "submodule_of",
             Self::Annotated => "annotated",
             Self::Intercepts => "intercepts",
+            Self::ReflectsTo => "reflects_to",
             Self::Tests => "tests",
             Self::Implements => "implements",
             Self::Schedules => "schedules",

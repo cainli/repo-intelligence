@@ -92,14 +92,47 @@ static AT_TEST: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@Test\b").unwrap
 // Javadoc / 示例代码里的 "import x.y;" 字样不会误收。
 static JAVA_IMPORT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^\s*import\s+(?:static\s+)?([\w.]+(?:\.\*)?)\s*;").unwrap());
-// AOP advice 注解 + 其 pointcut 字面量(P1-2)。group2 = 参数列表,pointcut 经
-// annotation_path 提取(兼容 value 不在首位)。
+// AOP advice 注解 + 其参数列表(P1-2 增强)。参数列表支持两层嵌套括号——
+// `@AfterReturning(pointcut = "@annotation(x)", returning = "j")` 一层,而
+// `@Around("execution(* a.add*(..))")` 是两层(外层注解 > execution > (..));
+// 旧 [^)]* 连一层都截不完整(实际 bug:字面量切在 repeatSubmit 后)。
 static ADVICE_ANN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"@(Around|Before|After|AfterReturning|AfterThrowing)\s*\(([^)]*)\)"#).unwrap()
+    Regex::new(
+        r#"@(Around|Before|After|AfterReturning|AfterThrowing)\s*\(((?:[^()]|\((?:[^()]|\([^()]*\))*\))*)\)"#,
+    )
+    .unwrap()
 });
-// execution(返回类型 包.类.方法(..)) → 全限定方法签名(组1)。简单版,不处理通配 */||/within。
-static EXECUTION_SIG: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"execution\s*\(\s*\S+\s+([\w.$]+)\s*\(").unwrap());
+// @annotation(X) pointcut:X = 注解 FQN/短名,或 advice 方法参数名(如 @annotation(controllerLog))。
+static PC_ANNOTATION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"@annotation\s*\(\s*([\w.$]+)\s*\)").unwrap());
+// execution(RET FQCN.method(..)) → group1=返回类型 group2=FQCN.method(支持通配 * 与包递归 ..)。
+static EXECUTION_PAT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"execution\s*\(\s*([\w.$*]+)\s+([\w.$*]+)\s*\(").unwrap());
+// 同文件 @Pointcut 方法声明:注解参数(支持嵌套括号)+ 其后 void 方法名。组2=方法名。
+static POINTCUT_DEF: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"@Pointcut\s*\(((?:[^()]|\([^()]*\))*)\)\s*[^;{}]*?\bvoid\s+(\w+)\s*\("#).unwrap()
+});
+// pointcut 整体是一个 @Pointcut 方法引用:"pc()" / "dataScopePoint()"。
+static PC_REF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\w+)\s*\(\s*\)$").unwrap());
+// static final String 常量(反射字面量一级传播)。bare 掩码上收集。
+static CONST_STRING: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"final\s+String\s+([A-Za-z_]\w*)\s*=\s*"([^"]*)""#).unwrap());
+// Class.forName(字面量 | 常量标识符)。code 掩码上。
+static FOR_NAME: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"Class\s*\.\s*forName\s*\(\s*(?:"([^"]+)"|([A-Za-z_]\w*))\s*\)"#).unwrap());
+/// 文件路径 → 类 FQN:src/main/java 或 src/test/java 标记后段目录→包,文件名须与类名
+/// 一致(一个文件多类时非 public 类不可采信)。非标布局返回 None,调用端不写 fqn——
+/// 跨文件消解(execution/反射)宁缺毋滥。Windows 反斜杠先归一。
+fn java_fqn_for_class(path: &str, class_name: &str) -> Option<String> {
+    let norm = path.replace('\\', "/");
+    let marker = ["src/main/java/", "src/test/java/"]
+        .iter()
+        .find_map(|m| norm.find(m).map(|i| i + m.len()))?;
+    let stem = norm[marker..].strip_suffix(".java")?;
+    let (pkg, file_class) = stem.rsplit_once('/')?;
+    (file_class == class_name).then(|| pkg.replace('/', "."))
+}
+
 // class Name(可选泛型/extends)implements Iface1<Gen>, Iface2 { ... —— 组1=类名,
 // 组2=接口列表(含泛型,到 class body 的 {)。跨行靠 [^{] 匹配换行(否定字符类含 \n)。
 // 用 regex 而非 tree-sitter:implements 子句节点结构随 grammar 版本不稳,正则最可靠。
@@ -492,6 +525,12 @@ fn extract_java(
             name.as_str(),
         );
         let mut meta = serde_json::Map::new();
+        // 类 FQN(标准 Maven/Gradle 布局从路径推导)。跨文件 pointcut/反射解析(analysis
+        // 层)靠它把 execution 表达式与 Class.forName 字面量对到类实体;非标布局不写,
+        // 消费端宁缺毋滥。
+        if let Some(fqn) = java_fqn_for_class(path, name.as_str()) {
+            meta.insert("fqn".into(), json!(fqn));
+        }
         if let Some(sig) = signals.get(name.as_str()) {
             if sig.transactional {
                 meta.insert("transactional".into(), json!(true));
@@ -651,6 +690,7 @@ fn extract_java(
     extract_tests(file, path, &masked, &method_spans, entities, edges);
     extract_jobs(file, path, &masked, &method_spans, entities, edges, config);
     extract_aspects(&masked, &method_spans, entities, edges);
+    extract_reflection(&masked, &method_spans, entities);
     Ok(())
 }
 
@@ -1342,17 +1382,28 @@ fn extract_annotations(
     owners.sort_by_key(|(offset, _)| *offset);
     // AT_ANNOTATION 跑在 bare 掩码上:Javadoc/字符串里提及的 @Transactional 等不再
     // 产幻影 Annotation 实体(历史污染 annotation 覆盖指标的主要来源)。
+    // 全量注解短名记录(白名单过滤前):方法 metadata.annotations = 短名数组。业务标记
+    // 注解(@Log/@DataScope 等)不进白名单不产实体,但切面 @annotation(controllerLog)
+    // 的 pointcut 需要知道哪些方法带它——Intercepts 跨文件消解的数据源。
+    let mut anns_by_owner: HashMap<EntityId, Vec<String>> = HashMap::new();
     for capture in AT_ANNOTATION.captures_iter(&masked.bare) {
         let ann_name = capture.get(1).unwrap();
-        if !whitelist.contains(ann_name.as_str()) || blacklist.contains(ann_name.as_str()) {
-            continue;
-        }
         let ann_offset = capture.get(0).unwrap().start();
-        let Some((_, owner_id)) = owners
+        let owner_id = owners
             .iter()
             .filter(|(offset, _)| *offset > ann_offset)
             .min_by_key(|(offset, _)| *offset)
-        else {
+            .map(|(_, id)| id);
+        if let Some(owner_id) = owner_id {
+            anns_by_owner
+                .entry(owner_id.clone())
+                .or_default()
+                .push(ann_name.as_str().to_string());
+        }
+        if !whitelist.contains(ann_name.as_str()) || blacklist.contains(ann_name.as_str()) {
+            continue;
+        }
+        let Some((_, owner_id)) = owner_id.map(|id| (0, id.clone())) else {
             continue;
         };
         let line = line_of(content, ann_offset);
@@ -1388,6 +1439,21 @@ fn extract_annotations(
                 "entity annotated with @…",
             ),
         );
+    }
+    // 回填方法 metadata.annotations(取现有 object 再 insert,与 extract_aspects 的
+    // pointcut 回填互不覆盖)。只回填 method:类/字段的注解已有白名单实体表达。
+    for entity in entities.iter_mut() {
+        if entity.kind != EntityKind::Method {
+            continue;
+        }
+        if let Some(list) = anns_by_owner.get(&entity.id) {
+            let mut meta = match entity.metadata.clone() {
+                serde_json::Value::Object(map) => map,
+                _ => serde_json::Map::new(),
+            };
+            meta.insert("annotations".into(), json!(list));
+            entity.metadata = serde_json::Value::Object(meta);
+        }
     }
 }
 
@@ -1540,28 +1606,43 @@ fn extract_jobs(
     }
 }
 
-/// AOP 切面(P1-2):@Around/@Before/@After 的 execution(pointcut) → 解析出全限定方法签名,
-/// 存到 advice method 的 metadata.pointcut,由 resolve_cross_stack 全局匹配目标方法建
-/// Intercepts 边(Inferred)。仅处理 `execution(返回类型 包.类.方法(..))` 完全签名形式,
-/// 通配 *、组合 ||、within/bean 切点不处理(分阶段)。
+/// AOP 切面(P1-2 增强):@Around/@Before/@After*/@AfterThrowing 的 pointcut 存入 advice
+/// 方法的 metadata,由 resolve_cross_stack 跨文件解析建 Intercepts 边(Inferred 0.5)。
+/// 真实项目(ruoyi 实测)主流写法是 `@annotation(参数名)`——旧实现只认"无通配 execution
+/// 全限定签名",在 ruoyi 上 0 边。现分三类:
+/// - `@annotation(X)`:X 为注解 FQN/短名直接存;X 为 advice 方法参数名时,在注解后方法
+///   签名区消解参数类型短名(`ControllerLog controllerLog` → ControllerLog)
+/// - `execution(RET FQCN.method(..))`:存 FQCN.method 原文(支持通配 * 与 ..),analysis
+///   层编译正则匹配
+/// - `"pcName()"`:引用同文件 @Pointcut 方法(先收集声明表再解引用,一级防环)
+/// 其他形态(within/bean/组合表达式)存 pointcut_raw 供排查,不建边。
 fn extract_aspects(
     masked: &MaskedSource,
     method_spans: &[(usize, EntityId)],
     entities: &mut [Entity],
     _edges: &mut Vec<Edge>,
 ) {
+    // 同文件 @Pointcut 方法声明表:方法名 → 表达式。
+    let pc_defs: HashMap<String, String> = POINTCUT_DEF
+        .captures_iter(&masked.code)
+        .filter_map(|c| {
+            let expr = annotation_path(c.get(1).unwrap().as_str())?;
+            Some((c.get(2)?.as_str().to_string(), expr))
+        })
+        .collect();
     for capture in ADVICE_ANN.captures_iter(&masked.code) {
         let ann_offset = capture.get(0).unwrap().start();
         // group2 = 注解参数列表;pointcut 字面量经 annotation_path 提取(value 任意位)。
         let Some(pointcut_expr) = capture.get(2).and_then(|m| annotation_path(m.as_str())) else {
             continue;
         };
-        let Some(signature) = EXECUTION_SIG
-            .captures(&pointcut_expr)
-            .and_then(|inner| inner.get(1))
-            .map(|m| m.as_str().to_string())
-        else {
-            continue;
+        // @Pointcut 方法引用解引用(一级)。
+        let pointcut_expr = match PC_REF.captures(&pointcut_expr) {
+            Some(ref_m) => pc_defs
+                .get(&ref_m[1])
+                .cloned()
+                .unwrap_or(pointcut_expr),
+            None => pointcut_expr,
         };
         let Some((_, method_id)) = method_spans
             .iter()
@@ -1570,14 +1651,88 @@ fn extract_aspects(
         else {
             continue;
         };
+        // @annotation(X) 的参数名消解:注解后 500 字符(方法签名区)内找 "Type X[,)]",
+        // 类型短名即注解类型。FQN(含 .)不经此步直接存。窗口法对签名写在注解后不远处的
+        // 常规布局成立;方法体内同形文本的误匹配概率低,且最终产物是 Inferred 0.5 边。
+        let resolved_annotation = PC_ANNOTATION
+            .captures(&pointcut_expr)
+            .map(|m| m[1].to_string())
+            .filter(|x| !x.contains('.'))
+            .and_then(|param| {
+                let end = (ann_offset + 500).min(masked.code.len());
+                let window = &masked.code[ann_offset..end];
+                Regex::new(&format!(r"([A-Za-z_]\w*)\s+{}\s*[,)]", regex::escape(&param)))
+                    .ok()?
+                    .captures(window)
+                    .map(|c| c[1].to_string())
+            });
+        let mut meta_patch = serde_json::Map::new();
+        meta_patch.insert("aspect_advice".into(), json!(true));
+        if let Some(pc_cap) = PC_ANNOTATION.captures(&pointcut_expr) {
+            let target = resolved_annotation.unwrap_or_else(|| pc_cap[1].to_string());
+            meta_patch.insert("pointcut_annotation".into(), json!(target));
+        } else if let Some(m) = EXECUTION_PAT.captures(&pointcut_expr) {
+            meta_patch.insert("pointcut_execution".into(), json!(m[2].to_string()));
+        } else {
+            meta_patch.insert("pointcut_raw".into(), json!(pointcut_expr));
+        }
         for entity in entities.iter_mut() {
             if entity.id == *method_id {
                 let mut meta = match entity.metadata.clone() {
                     serde_json::Value::Object(map) => map,
                     _ => serde_json::Map::new(),
                 };
-                meta.insert("pointcut".into(), json!(signature));
-                meta.insert("aspect_advice".into(), json!(true));
+                meta.extend(meta_patch);
+                entity.metadata = serde_json::Value::Object(meta);
+                break;
+            }
+        }
+    }
+}
+
+/// 反射字面量(P1-3):`Class.forName("FQN")` 提取,存所在方法的 metadata.reflects =
+/// [FQN 数组],由 resolve_cross_stack 匹配类实体建 ReflectsTo 边。参数为标识符时查同文件
+/// `static final String` 常量表做一级传播(跨文件/多级不传播——推断边宁缺毋滥)。
+fn extract_reflection(
+    masked: &MaskedSource,
+    method_spans: &[(usize, EntityId)],
+    entities: &mut [Entity],
+) {
+    let consts: HashMap<&str, &str> = CONST_STRING
+        .captures_iter(&masked.code)
+        .map(|c| (c.get(1).unwrap().as_str(), c.get(2).unwrap().as_str()))
+        .collect();
+    let mut by_method: HashMap<EntityId, Vec<String>> = HashMap::new();
+    for capture in FOR_NAME.captures_iter(&masked.code) {
+        let fqn = match (capture.get(1), capture.get(2)) {
+            (Some(lit), _) => Some(lit.as_str().to_string()),
+            (_, Some(ident)) => consts.get(ident.as_str()).map(|s| s.to_string()),
+            _ => None,
+        };
+        let Some(fqn) = fqn else {
+            continue;
+        };
+        // 所在方法:声明 offset <= 调用 offset 的最近一个(调用在方法体内)。
+        let Some((_, method_id)) = method_spans
+            .iter()
+            .filter(|(offset, _)| *offset <= capture.get(0).unwrap().start())
+            .max_by_key(|(offset, _)| *offset)
+        else {
+            continue;
+        };
+        by_method.entry(method_id.clone()).or_default().push(fqn);
+    }
+    for (method_id, mut fqns) in by_method {
+        // 同方法内去重后回填(同 FQN 多次 forName 只记一条)。
+        fqns.sort();
+        fqns.dedup();
+        for entity in entities.iter_mut() {
+            if entity.id == method_id {
+                let mut meta = match entity.metadata.clone() {
+                    serde_json::Value::Object(map) => map,
+                    _ => serde_json::Map::new(),
+                };
+                meta.insert("reflects".into(), json!(fqns));
                 entity.metadata = serde_json::Value::Object(meta);
                 break;
             }
@@ -2369,5 +2524,128 @@ mod tests {
         assert_eq!(camel_to_snake("Id"), "id");
         // 小写后接全大写结尾
         assert_eq!(camel_to_snake("userURL"), "user_url");
+    }
+
+    /// ruoyi 真实形态 fixture:@annotation(参数名) pointcut + advice 方法参数消解。
+    /// LogAspect.java:65 的写法(@Around(value = "@annotation(controllerLog)"))。
+    #[test]
+    fn aspect_annotation_pointcut_resolves_param_name_to_type() {
+        let src = r#"
+@Aspect
+@Component
+public class LogAspect {
+    @Around(value = "@annotation(controllerLog)")
+    public void doAround(JoinPoint joinPoint, ControllerLog controllerLog) throws Throwable {
+    }
+}
+"#;
+        let path = "src/main/java/org/dromara/log/aspect/LogAspect.java";
+        let masked = mask_java(src);
+        let id = EntityId::stable(
+            "workspace",
+            path,
+            EntityKind::Method,
+            "doAround",
+            "",
+        );
+        let mut entities = vec![Entity::new(id.clone(), EntityKind::Method, "doAround", "doAround")];
+        let method_spans = vec![(src.find("doAround").unwrap(), id)];
+        extract_aspects(&masked, &method_spans, &mut entities, &mut Vec::new());
+        let meta = &entities[0].metadata;
+        assert_eq!(
+            meta.get("pointcut_annotation").and_then(|v| v.as_str()),
+            Some("ControllerLog"),
+            "参数名 controllerLog 应消解为注解类型 ControllerLog: {meta}"
+        );
+        assert_eq!(meta.get("aspect_advice"), Some(&json!(true)));
+    }
+
+    /// execution 通配 + @Pointcut 方法引用两形态。旧实现(无通配全签名)在这两种
+    /// 写法上都是 0 边。
+    #[test]
+    fn aspect_extracts_execution_wildcard_and_pointcut_ref() {
+        let src = r#"
+public class DataScopeAspect {
+    @Pointcut("@annotation(dataScope)")
+    public void dataScopePoint() {}
+
+    @Before("dataScopePoint()")
+    public void doBefore(JoinPoint point, DataScope dataScope) {}
+
+    @Around("execution(* com.ruoyi..*Service.add*(..))")
+    public Object aroundAll(ProceedingJoinPoint point) { return null; }
+}
+"#;
+        let path = "src/main/java/org/dromara/aspect/DataScopeAspect.java";
+        let masked = mask_java(src);
+        let mk = |name: &str| {
+            Entity::new(
+                EntityId::stable("workspace", path, EntityKind::Method, name, ""),
+                EntityKind::Method,
+                name,
+                name,
+            )
+        };
+        let mut entities = vec![mk("dataScopePoint"), mk("doBefore"), mk("aroundAll")];
+        let method_spans: Vec<(usize, EntityId)> = ["dataScopePoint", "doBefore", "aroundAll"]
+            .iter()
+            .map(|n| (src.find(n).unwrap(), {
+                EntityId::stable("workspace", path, EntityKind::Method, n, "")
+            }))
+            .collect();
+        extract_aspects(&masked, &method_spans, &mut entities, &mut Vec::new());
+        let meta = |name: &str| {
+            entities
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap()
+                .metadata
+                .clone()
+        };
+        // @Pointcut 引用解引用到 @annotation(参数名) → 消解类型
+        assert_eq!(
+            meta("doBefore").get("pointcut_annotation").and_then(|v| v.as_str()),
+            Some("DataScope"),
+            "{:?}",
+            meta("doBefore")
+        );
+        // execution 通配原文保留(匹配在 analysis 层)
+        assert_eq!(
+            meta("aroundAll").get("pointcut_execution").and_then(|v| v.as_str()),
+            Some("com.ruoyi..*Service.add*"),
+            "{:?}",
+            meta("aroundAll")
+        );
+    }
+
+    /// 反射字面量 + 同文件常量一级传播;同方法去重。
+    #[test]
+    fn reflection_collects_literal_and_constant_forname() {
+        let src = r#"
+public class AnnotationUtils {
+    static final String CONST_FOO = "a.b.Constant";
+
+    public Object resolve(String name) throws Exception {
+        Class<?> direct = Class.forName("a.b.Direct");
+        Class<?> viaConst = Class.forName("a.b.Direct");
+        return Class.forName(CONST_FOO);
+    }
+}
+"#;
+        let path = "src/main/java/org/dromara/AnnotationUtils.java";
+        let masked = mask_java(src);
+        let id = EntityId::stable("workspace", path, EntityKind::Method, "resolve", "");
+        let mut entities = vec![Entity::new(id.clone(), EntityKind::Method, "resolve", "resolve")];
+        let method_spans = vec![(src.find("resolve").unwrap(), id)];
+        extract_reflection(&masked, &method_spans, &mut entities);
+        let reflects = entities[0]
+            .metadata
+            .get("reflects")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(reflects, vec!["a.b.Constant", "a.b.Direct"], "常量解引用 + 字面量 + 去重");
     }
 }
