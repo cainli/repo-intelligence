@@ -1292,15 +1292,16 @@ fn parse_type_list(tokens: &[(String, i32)], from: usize, to: usize) -> Vec<Stri
     out
 }
 
-/// 文件级 imports → 同文件每个 class 的 metadata.imports(全限定名数组,剔通配符)。
-/// 所有 class 统一记录、不做"仅测试类"特判:哪些信号可用由 analysis 层决定,
-/// 提取层保持信号完整。static import 末段是成员名而非类名,匹配时天然落空,无害。
+/// 文件级 imports → 同文件每个 class 的 metadata.imports(全限定名数组,含通配项
+/// `com.acme.*`——analysis 层 import 消歧阶梯的 WildcardImport 档靠它;旧版剔除是因
+/// 下游 tests 边按末段匹配,`*` 末段天然落空,保留无副作用)。所有 class 统一记录、
+/// 不做"仅测试类"特判:哪些信号可用由 analysis 层决定,提取层保持信号完整。
+/// static import 末段是成员名而非类名,匹配时天然落空,无害。
 fn extract_imports(masked: &MaskedSource, entities: &mut [Entity]) {
     let imports: Vec<String> = JAVA_IMPORT
         .captures_iter(&masked.bare)
         .filter_map(|cap| cap.get(1))
         .map(|m| m.as_str().to_string())
-        .filter(|fq| !fq.ends_with('*'))
         .collect();
     if imports.is_empty() {
         return;

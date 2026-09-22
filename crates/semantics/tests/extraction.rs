@@ -343,9 +343,10 @@ fn java_class_records_file_level_imports() {
         imports,
         &[
             serde_json::json!("com.demo.biz.DemoService"),
-            serde_json::json!("com.demo.biz.Util.AID")
+            serde_json::json!("com.demo.biz.Util.AID"),
+            serde_json::json!("org.junit.jupiter.api.*")
         ],
-        "通配符 org.junit.jupiter.api.* 应被剔除"
+        "通配 import 保留(analysis 消歧 WildcardImport 档依赖;tests 边按末段匹配天然落空)"
     );
 
     // 无 import 的文件不产生 metadata.imports 键。

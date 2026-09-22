@@ -861,6 +861,91 @@ fn java_fqn_of(entity: &Entity) -> Option<&str> {
     entity.metadata.get("fqn").and_then(|v| v.as_str())
 }
 
+/// 类/接口的类型画像(import 消歧用):fqn(extract 层按 src/main/java 路径推导,
+/// 非标布局缺省)、import 表(显式 + 通配 `x.y.*`)、包段(fqn 剥末段)。
+struct TypeProfile<'a> {
+    fqn: Option<&'a str>,
+    imports: Vec<&'a str>,
+    package: Option<String>,
+}
+
+/// import 消歧阶梯,逐档要求唯一命中,任何一档多命中落下一档:
+///   fqn exact(implements_full/superclass_full 含 '.' 时与候选 fqn 等值,连 import
+///   都不用看)> 全局唯一(不需要 caller 画像)> 显式 import(import 串 == 候选 fqn,
+///   Java 语法禁同简单名两条显式 import,命中天然 ≤1)> 同包 > 通配 import(`x.y.*`
+///   前缀带点覆盖且候选恰为该前缀直下类)。
+/// 返回 (目标 id, 消歧方式;空串 = 无需消歧),全落空 → None(调用端拒 + note)。
+fn resolve_type<'a>(
+    profiles: &HashMap<&'a EntityId, TypeProfile<'a>>,
+    full: Option<&str>,
+    candidates: &[&'a Entity],
+    caller: &Entity,
+) -> Option<(&'a EntityId, &'static str)> {
+    if let Some(f) = full
+        && f.contains('.')
+    {
+        let hits: Vec<&Entity> = candidates
+            .iter()
+            .copied()
+            .filter(|c| profiles.get(&c.id).and_then(|p| p.fqn) == Some(f))
+            .collect();
+        if hits.len() == 1 {
+            return Some((&hits[0].id, "fqn exact"));
+        }
+    }
+    if candidates.len() == 1 {
+        return Some((&candidates[0].id, ""));
+    }
+    let caller_profile = profiles.get(&caller.id)?;
+    // ① 显式 import
+    let hits: Vec<&Entity> = candidates
+        .iter()
+        .copied()
+        .filter(|c| {
+            let Some(f) = profiles.get(&c.id).and_then(|p| p.fqn) else {
+                return false;
+            };
+            caller_profile.imports.iter().any(|imp| *imp == f)
+        })
+        .collect();
+    if hits.len() == 1 {
+        return Some((&hits[0].id, "via explicit import"));
+    }
+    // ② 同包(无 import 的同包引用)
+    if let Some(pkg) = &caller_profile.package {
+        let hits: Vec<&Entity> = candidates
+            .iter()
+            .copied()
+            .filter(|c| {
+                profiles.get(&c.id).and_then(|p| p.package.as_deref()) == Some(pkg.as_str())
+            })
+            .collect();
+        if hits.len() == 1 {
+            return Some((&hits[0].id, "via same package"));
+        }
+    }
+    // ③ 通配 import:`com.acme.*` → 前缀 "com.acme."(带点,防吞 com.acme2),
+    // 候选 fqn 须恰为前缀直下类(余段不含 '.')。
+    let hits: Vec<&Entity> = candidates
+        .iter()
+        .copied()
+        .filter(|c| {
+            let Some(f) = profiles.get(&c.id).and_then(|p| p.fqn) else {
+                return false;
+            };
+            caller_profile.imports.iter().any(|imp| {
+                imp.ends_with(".*")
+                    && f.starts_with(&imp[..imp.len() - 1])
+                    && !f[imp.len() - 1..].contains('.')
+            })
+        })
+        .collect();
+    if hits.len() == 1 {
+        return Some((&hits[0].id, "via wildcard import"));
+    }
+    None
+}
+
 /// AspectJ 类/方法模式 → 锚定正则:`..`(递归通配,零或多段)→ `(?:\.[^.]+)*\.?`,
 /// `*`(单段)→ `[^.]*`,其余(含 `.`)字面转义。例:`com.ruoyi..*Service` 匹配
 /// com.ruoyi.XxxService 与 com.ruoyi.a.b.XxxService,不匹配 org.dromara.…。
@@ -964,6 +1049,38 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
         out.sort();
         out.dedup();
         out
+    };
+
+    // ---- import 消歧阶梯(mes-activity P0-1 主根因修复)----
+    // 旧闸门要求类型名全局唯一,双 SDK 拷贝/git submodule 仓库(同名类型 ×2)下
+    // implements/superclass/字段/静态/注入五路消解全军覆没。现按 Java 编译器语义
+    // 逐档消歧,任一档唯一命中才连;全落空仍拒+note(A+ 哲学不变,宁缺毋滥)。
+    // 判定逻辑在模块级 resolve_type(需显式生命周期,闭包写不下)。
+    let mut profile_by_id: HashMap<&EntityId, TypeProfile<'_>> = HashMap::new();
+    for entity in entities
+        .iter()
+        .filter(|e| matches!(e.kind, EntityKind::Class | EntityKind::Interface))
+    {
+        let fqn = entity.metadata.get("fqn").and_then(|v| v.as_str());
+        let imports = entity
+            .metadata
+            .get("imports")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+            .unwrap_or_default();
+        let package = fqn.and_then(|f| f.rsplit_once('.')).map(|(p, _)| p.to_string());
+        profile_by_id.insert(&entity.id, TypeProfile { fqn, imports, package });
+    }
+    // 裸名 → 类+接口全量候选(implements/字段/静态/注入共用)。
+    let type_candidates = |name: &str| -> Vec<&Entity> {
+        let mut v: Vec<&Entity> = Vec::new();
+        if let Some(cs) = classes_by_name_all.get(name) {
+            v.extend(cs.iter().copied());
+        }
+        if let Some(is) = ifaces_by_name_all.get(name) {
+            v.extend(is.iter().copied());
+        }
+        v
     };
     let mut class_to_table: HashMap<&str, &EntityId> = HashMap::new();
     for edge in input_edges {
@@ -1100,8 +1217,11 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
     // Controller→Service→Mapper 跨文件调用链(同文件 calls 由 extract_java 产)。
     // 低保真:方法名 + 注入类型匹配;同名歧义(多个注入 type 都有该方法)则跳过。
     // 复用上面的 entity_by_id(同源 entities slice,此前另建一份 entity_by_id_cf 是重复)。
-    let mut type_methods: HashMap<&str, HashMap<&str, &EntityId>> = HashMap::new();
-    let mut method_owner: HashMap<&EntityId, &str> = HashMap::new();
+    // 三张表一律以 owner EntityId 为键:owner 经 Declares 边精确定位,name 键会让
+    // 同名类(双拷贝仓库常态)的条目互相覆盖/合并——这是旧 owner_ambiguous 闸门的
+    // 根因,键化后闸门对字段/静态/注入路径整体失效(名字共享仅记 note 供复核)。
+    let mut type_methods: HashMap<&EntityId, HashMap<&str, &EntityId>> = HashMap::new();
+    let mut method_owner: HashMap<&EntityId, &EntityId> = HashMap::new();
     for edge in input_edges {
         if edge.kind == EdgeKind::Declares
             && let (Some(owner), Some(m)) = (
@@ -1111,14 +1231,14 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
             && matches!(owner.kind, EntityKind::Class | EntityKind::Interface)
             && m.kind == EntityKind::Method
         {
-            method_owner.insert(&edge.target, owner.name.as_str());
+            method_owner.insert(&edge.target, &edge.source);
             type_methods
-                .entry(owner.name.as_str())
+                .entry(&edge.source)
                 .or_default()
                 .insert(m.name.as_str(), &edge.target);
         }
     }
-    let mut owner_injected: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut owner_injected: HashMap<&EntityId, Vec<&str>> = HashMap::new();
     for edge in input_edges {
         if edge.kind == EdgeKind::Injects
             && let (Some(owner), Some(bean)) = (
@@ -1129,7 +1249,7 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
             && bean.kind == EntityKind::SpringBean
         {
             owner_injected
-                .entry(owner.name.as_str())
+                .entry(&edge.source)
                 .or_default()
                 .push(bean.name.as_str());
         }
@@ -1141,41 +1261,43 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
             *type_name_owners.entry(e.name.as_str()).or_insert(0) += 1;
         }
     }
-    // 继承方法上溯(一层):class.metadata.superclass(提取层正则,单继承)且超类名全局唯一
-    // 时,把超类声明的方法并入子类方法表(子类同名优先)——覆盖 `class DateUtils extends
+    // 继承方法上溯(一层):class.metadata.superclass 经 import 消歧到超类 id 后,
+    // 把超类声明的方法并入子类方法表(子类同名优先)——覆盖 `class DateUtils extends
     // commons DateUtils` 后调用继承方法的形态。仅上溯 class extends 链,接口默认方法
-    // 多源歧义不上溯。
+    // 多源歧义不上溯。双拷贝仓库下同名超类由消歧阶梯解析(旧版要求全局唯一,全废)。
     {
-        let mut merges: Vec<(&str, &str)> = Vec::new();
-        for e in entities {
-            if e.kind == EntityKind::Class
-                && let Some(sup) = e.metadata.get("superclass").and_then(|v| v.as_str())
-                && type_name_owners.get(sup).copied().unwrap_or(0) == 1
-                && type_methods.contains_key(sup)
-                && type_methods.contains_key(e.name.as_str())
-            {
-                merges.push((e.name.as_str(), sup));
-            }
-        }
-        for (sub, sup) in merges {
-            let Some(super_ms) = type_methods.get(sup).cloned() else {
+        let merges: Vec<(&EntityId, &EntityId)> = entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Class)
+            .filter_map(
+                |sub| -> Option<(&EntityId, &EntityId)> {
+                    let sup_name = sub.metadata.get("superclass")?.as_str()?;
+                    let sup_full = sub.metadata.get("superclass_full").and_then(|v| v.as_str());
+                    let cands = classes_by_name_all.get(sup_name)?;
+                    let (sup_id, _) = resolve_type(&profile_by_id, sup_full, cands, sub)?;
+                    Some((&sub.id, sup_id))
+                },
+            )
+            .collect();
+        for (sub_id, sup_id) in merges {
+            let Some(super_ms) = type_methods.get(sup_id).cloned() else {
                 continue;
             };
-            if let Some(ms) = type_methods.get_mut(sub) {
+            if let Some(ms) = type_methods.get_mut(sub_id) {
                 for (mn, mid) in super_ms {
                     ms.entry(mn).or_insert(mid);
                 }
             }
         }
     }
-    // owner → {字段名 → 注入类型名}:Step B 把 `this.service.foo()` 的 receiver=service
+    // owner id → {字段名 → 注入类型名}:Step B 把 `this.service.foo()` 的 receiver=service
     // 精确解析到注入类型,消除"多个注入 type 都有同名方法"的歧义(字段名直接锁定单一 type)。
-    let mut owner_fields: HashMap<&str, HashMap<&str, &str>> = HashMap::new();
+    let mut owner_fields: HashMap<&EntityId, HashMap<&str, &str>> = HashMap::new();
     for e in entities {
         if matches!(e.kind, EntityKind::Class | EntityKind::Interface)
             && let Some(arr) = e.metadata.get("injected_fields").and_then(|v| v.as_array())
         {
-            let map = owner_fields.entry(e.name.as_str()).or_default();
+            let map = owner_fields.entry(&e.id).or_default();
             for f in arr {
                 if let (Some(fname), Some(ftype)) = (
                     f.get("name").and_then(|v| v.as_str()),
@@ -1193,31 +1315,40 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
         let Some(invokes) = entity.metadata.get("invokes").and_then(|v| v.as_array()) else {
             continue;
         };
-        let Some(&owner) = method_owner.get(&entity.id) else {
+        let Some(&owner_id) = method_owner.get(&entity.id) else {
             continue;
         };
+        let owner_entity = entity_by_id.get(owner_id).copied().unwrap_or(entity);
         // owner 可能无注入依赖(如纯静态工具调用 JsonUtil.stringify);injected 缺省为空,
         // 静态调用路径(receiver=类型名)不依赖它,不应被此处 continue 卡掉。
-        let injected: &[&str] = owner_injected.get(owner).map(Vec::as_slice).unwrap_or(&[]);
-        // A+:owner 类型名跨包歧义 → 其 type_methods/owner_injected/owner_fields 是被污染的
-        // 聚合(两个同名类的条目互相覆盖/合并)。字段/注入两条路径在 owner 歧义时跳过;
-        // 静态调用路径(priority 1)自带歧义防护,不受影响。记一条 note(按 holder+name 去重)。
-        let owner_ambiguous = type_name_owners.get(owner).copied().unwrap_or(0) > 1;
+        let injected: &[&str] = owner_injected.get(owner_id).map(Vec::as_slice).unwrap_or(&[]);
+        // owner 裸名跨包同名:仅记 note 供人工复核(按 holder+name 去重),不再阻断
+        // 解析——三张表已 id 键化,同名类的条目不再互相污染,后续由 import 消歧兜底。
+        let owner_ambiguous =
+            type_name_owners.get(owner_entity.name.as_str()).copied().unwrap_or(0) > 1;
         if owner_ambiguous {
             let mut cands: Vec<&Entity> = Vec::new();
-            if let Some(v) = classes_by_name_all.get(owner) {
+            if let Some(v) = classes_by_name_all.get(owner_entity.name.as_str()) {
                 cands.extend(v.iter().copied());
             }
-            if let Some(v) = ifaces_by_name_all.get(owner) {
+            if let Some(v) = ifaces_by_name_all.get(owner_entity.name.as_str()) {
                 cands.extend(v.iter().copied());
             }
             ambiguities.push(AmbiguityNote {
                 holder: entity.id.clone(),
                 kind: "call_resolution",
-                name: owner.to_string(),
+                name: owner_entity.name.to_string(),
                 candidates: candidate_files(&cands),
             });
         }
+        // reason 组装:消歧命中时把方式写进 evidence(消费端可辨析 why)。
+        let with_via = |base: &str, via: &str| -> String {
+            if via.is_empty() {
+                base.to_string()
+            } else {
+                format!("{base} ({via})")
+            }
+        };
         for invoke in invokes {
             let Some(callee_name) = invoke.get("name").and_then(|v| v.as_str()) else {
                 continue;
@@ -1232,51 +1363,56 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
 
             let mut resolved: Option<&EntityId> = None;
             let mut confidence: f32 = 0.0;
-            let mut reason: &str = "";
-            // 优先级 0:注入字段调用。receiver=字段名 → 用字段名查 owner 的注入类型,
-            // 再定位该 type 的方法,精确解析 0.7(消除多 type 同名方法歧义)。
+            let mut reason = String::new();
+            // 优先级 0:注入字段调用。receiver=字段名 → 字段锁定注入类型 → 类型经消歧
+            // 阶梯(双拷贝同名不再一票否决)→ 该类型方法表精确解析 0.7。
             // 覆盖两种写法:field=this.service.foo(显式 this)与 name=service.foo
             // (Java 主流省略 this——identifier receiver 先当注入字段试,再当静态类型)。
             let mut via_field = false;
-            // owner 不歧义 + 注入字段类型本身也不歧义,才走精确字段路径。
             if let Some(rv) = receiver
                 && matches!(receiver_kind, "field" | "name")
-                && !owner_ambiguous
-                && let Some(field_map) = owner_fields.get(owner)
+                && let Some(field_map) = owner_fields.get(owner_id)
                 && let Some(&target_type) = field_map.get(rv)
-                && type_name_owners.get(target_type).copied().unwrap_or(0) <= 1
-                && let Some(ms) = type_methods.get(target_type)
-                && let Some(&callee_id) = ms.get(callee_name)
-                && callee_id != &entity.id
             {
-                resolved = Some(callee_id);
-                confidence = 0.7;
-                reason = "cross-file call via injected field receiver";
-                via_field = true;
+                let cands = type_candidates(target_type);
+                if let Some((type_id, via)) = resolve_type(&profile_by_id, None, &cands, owner_entity)
+                    && let Some(ms) = type_methods.get(type_id)
+                    && let Some(&callee_id) = ms.get(callee_name)
+                    && callee_id != &entity.id
+                {
+                    resolved = Some(callee_id);
+                    confidence = 0.7;
+                    reason = with_via("cross-file call via injected field receiver", via);
+                    via_field = true;
+                }
             }
-            // 优先级 1:静态调用(receiver 是全局类型名且非歧义,如 JsonUtil.foo)→ 精确 0.7。
+            // 优先级 1:静态调用(receiver 是类型名,如 JsonUtil.foo)→ 消歧后精确 0.7。
             // receiver_kind=="qualified" 为 FQCN 调用(com.foo.Bar.stat)截末段后的类型名。
             if !via_field
                 && matches!(receiver_kind, "name" | "qualified")
                 && let Some(rv) = receiver
-                && type_name_owners.get(rv).copied().unwrap_or(0) <= 1
-                && let Some(ms) = type_methods.get(rv)
-                && let Some(&callee_id) = ms.get(callee_name)
-                && callee_id != &entity.id
             {
-                resolved = Some(callee_id);
-                confidence = 0.7;
-                reason = "cross-file static call on named type";
+                let cands = type_candidates(rv);
+                if let Some((type_id, via)) = resolve_type(&profile_by_id, None, &cands, owner_entity)
+                    && let Some(ms) = type_methods.get(type_id)
+                    && let Some(&callee_id) = ms.get(callee_name)
+                    && callee_id != &entity.id
+                {
+                    resolved = Some(callee_id);
+                    confidence = 0.7;
+                    reason = with_via("cross-file static call on named type", via);
+                }
             }
             // 优先级 2:裸名 / 未精确解析的 name → 注入依赖类型名匹配(低保真),唯一命中 0.5。
-            // A+:owner 歧义时其 injected 列表被污染 → 跳过;注入类型自身歧义的不参与 hits。
-            if resolved.is_none() && !owner_ambiguous {
+            // 注入类型逐个经消歧阶梯;多命中=歧义跳过避免连错。
+            if resolved.is_none() {
                 let mut hits: Vec<&EntityId> = Vec::new();
                 for type_name in injected {
-                    if type_name_owners.get(*type_name).copied().unwrap_or(0) > 1 {
+                    let cands = type_candidates(type_name);
+                    let Some((type_id, _)) = resolve_type(&profile_by_id, None, &cands, owner_entity) else {
                         continue;
-                    }
-                    if let Some(ms) = type_methods.get(*type_name)
+                    };
+                    if let Some(ms) = type_methods.get(type_id)
                         && let Some(callee_id) = ms.get(callee_name).copied()
                     {
                         hits.push(callee_id);
@@ -1286,7 +1422,7 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
                 if hits.len() == 1 && hits[0] != &entity.id {
                     resolved = Some(hits[0]);
                     confidence = 0.5;
-                    reason = "cross-file call via injected dependency (matched by name)";
+                    reason = "cross-file call via injected dependency (matched by name)".into();
                 }
             }
             if let Some(callee_id) = resolved
@@ -1299,7 +1435,7 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
                         line,
                         EvidenceClass::Inferred,
                         confidence,
-                        reason,
+                        &reason,
                     ),
                 );
             }
@@ -1307,17 +1443,11 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
     }
 
     // implements:跨文件 class.metadata.implements → 全局 interface 实体(EntityId 是
-    // path-scoped,extract 层建不了跨文件边,故 metadata 传递 + 这里按 interface 名解析)。
-    // 同时建 class→interface depends_on 边 + 反向索引 interface→impl,供下面的桥接。
-    // A+:interface 裸名跨包同名(两个 Handler 接口)→ 只保留无歧义的;
-    // 命中歧义名的 class 记 note 不连边。原先 HashMap::collect 在重名上后写覆盖,
-    // 且 implements 边以 1.0/Fact 输出 —— 这是最严重的语义反转(最不确定拿了最高置信)。
-    let interfaces_by_name: HashMap<&str, &EntityId> = ifaces_by_name_all
-        .iter()
-        .filter(|(_, v)| v.len() == 1)
-        .map(|(name, v)| (*name, &v[0].id))
-        .collect();
-    let mut interface_to_impls: HashMap<&str, Vec<&str>> = HashMap::new();
+    // path-scoped,extract 层建不了跨文件边,故 metadata 传递 + 这里消解)。
+    // 同时建 class→interface depends_on 边 + 反向 Implements 边(interface→class)。
+    // 消解走 import 消歧阶梯:全局唯一 → implements_full 等值(fqn exact)→ 显式
+    // import → 同包 → 通配;全落空(含裸名多候选)记 note 不连。消歧成功不记 note。
+    let mut interface_to_impls: HashMap<&EntityId, Vec<&EntityId>> = HashMap::new();
     for entity in entities {
         if entity.kind != EntityKind::Class {
             continue;
@@ -1325,20 +1455,29 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
         let Some(impls) = entity.metadata.get("implements").and_then(|v| v.as_array()) else {
             continue;
         };
-        for iface_val in impls {
+        // implements_full 与 implements 平行(C1 类型头扫描器产出;旧库可能缺失)。
+        let fulls: Vec<Option<&str>> = entity
+            .metadata
+            .get("implements_full")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().map(|x| x.as_str()).collect())
+            .unwrap_or_else(|| vec![None; impls.len()]);
+        for (idx, iface_val) in impls.iter().enumerate() {
             let Some(iface_name) = iface_val.as_str() else {
                 continue;
             };
-            if let Some(cands) = ifaces_by_name_all.get(iface_name).filter(|v| v.len() > 1) {
+            let Some(cands) = ifaces_by_name_all.get(iface_name) else {
+                continue; // 接口不在库内(第三方/未索引),与现状同:静默
+            };
+            let Some((iface_id, _via)) = resolve_type(&profile_by_id, fulls.get(idx).copied().flatten(), cands, entity)
+            else {
+                // 多候选且消歧全落空 → note(0 候选走不到这)
                 ambiguities.push(AmbiguityNote {
                     holder: entity.id.clone(),
                     kind: "implements",
                     name: iface_name.to_string(),
                     candidates: candidate_files(cands),
                 });
-                continue;
-            }
-            let Some(&iface_id) = interfaces_by_name.get(iface_name) else {
                 continue;
             };
             let mut edge = Edge::new(entity.id.clone(), iface_id.clone(), EdgeKind::DependsOn);
@@ -1369,20 +1508,15 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
             }
             edges.push(impl_edge);
             interface_to_impls
-                .entry(iface_name)
+                .entry(iface_id)
                 .or_default()
-                .push(entity.name.as_str());
+                .push(&entity.id);
         }
     }
 
     // 类继承:跨文件 class.metadata.superclass → 全局超类实体,建 SuperclassOf(超类→子类,
     // outbound)。让 trace 从超类(含 abstract 抽象基类)下钻到具体子类——业务逻辑常在子类,
-    // abstract 类自身方法不直接调 Dao,需经此边追到子类的表依赖。与 implements 同模式。
-    let classes_by_name: HashMap<&str, &EntityId> = classes_by_name_all
-        .iter()
-        .filter(|(_, v)| v.len() == 1)
-        .map(|(name, v)| (*name, &v[0].id))
-        .collect();
+    // abstract 类自身方法不直接调 Dao,需经此边追到子类的表依赖。消解同 implements(阶梯)。
     for entity in entities {
         if entity.kind != EntityKind::Class {
             continue;
@@ -1390,25 +1524,17 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
         let Some(superclass) = entity.metadata.get("superclass").and_then(|v| v.as_str()) else {
             continue;
         };
-        // A+:同名超类跨包歧义 → 记 note 不连(此前静默跳过,缺席不可见)。
-        if classes_by_name_all
-            .get(superclass)
-            .is_some_and(|v| v.len() > 1)
-        {
+        let sup_full = entity.metadata.get("superclass_full").and_then(|v| v.as_str());
+        let Some(cands) = classes_by_name_all.get(superclass) else {
+            continue; // 超类不在库内,静默(与现状同)
+        };
+        let Some((super_id, _via)) = resolve_type(&profile_by_id, sup_full, cands, entity) else {
             ambiguities.push(AmbiguityNote {
                 holder: entity.id.clone(),
                 kind: "superclass",
                 name: superclass.to_string(),
-                candidates: candidate_files(
-                    classes_by_name_all
-                        .get(superclass)
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[]),
-                ),
+                candidates: candidate_files(cands),
             });
-            continue;
-        }
-        let Some(&super_id) = classes_by_name.get(superclass) else {
             continue;
         };
         let mut edge = Edge::new(super_id.clone(), entity.id.clone(), EdgeKind::SuperclassOf);
@@ -1424,6 +1550,9 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
         }
         edges.push(edge);
     }
+    // 接口分发桥接:iface method → 实现类同名 method(0.7)。interface_to_impls 已是
+    // 精确 id(消歧产物),实现类裸名唯一性闸门失去对象,删除;多实现仍是真歧义,保留
+    // hits.len()==1 判定。
     for edge in input_edges {
         if edge.kind == EdgeKind::Declares
             && let (Some(iface), Some(m)) = (
@@ -1432,18 +1561,11 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
             )
             && iface.kind == EntityKind::Interface
             && m.kind == EntityKind::Method
-            && let Some(impls) = interface_to_impls.get(iface.name.as_str())
+            && let Some(impl_ids) = interface_to_impls.get(&iface.id)
         {
             let mut hits: Vec<&EntityId> = Vec::new();
-            for impl_name in impls {
-                // A+:实现类裸名跨包同名 → type_methods[impl_name] 被污染,不参与命中。
-                if classes_by_name_all
-                    .get(*impl_name)
-                    .is_some_and(|v| v.len() > 1)
-                {
-                    continue;
-                }
-                if let Some(ms) = type_methods.get(*impl_name)
+            for impl_id in impl_ids {
+                if let Some(ms) = type_methods.get(*impl_id)
                     && let Some(impl_m_id) = ms.get(m.name.as_str()).copied()
                 {
                     hits.push(impl_m_id);
@@ -2412,5 +2534,194 @@ mod tests {
         };
         assert_eq!(java_fqn_of(&mk(Some("org.dromara.common.log.aspect.LogAspect"))), Some("org.dromara.common.log.aspect.LogAspect"));
         assert_eq!(java_fqn_of(&mk(None)), None);
+    }
+
+    // ---- C2:import 消歧阶梯(mes-activity 双拷贝仓库场景)----
+    // mod1/mod2 各有同名接口 Handler(git submodule 双 SDK 拷贝形态),消歧阶梯须
+    // 按 fqn/import/同包/通配唯一落位;无可用信号的调用方仍拒边 + note。
+
+    fn iface_with_method(path: &str, pkg: &str, name: &str, method: &str) -> (Entity, Entity, Edge) {
+        let iface = Entity::new(
+            EntityId::stable("workspace", path, EntityKind::Interface, name, ""),
+            EntityKind::Interface,
+            name,
+            name,
+        )
+        .with_metadata(json!({ "fqn": format!("{pkg}.{name}") }))
+        .with_evidence(path, 1, 1, EvidenceClass::Fact, 1.0, "iface");
+        let m = Entity::new(
+            EntityId::stable("workspace", path, EntityKind::Method, method, ""),
+            EntityKind::Method,
+            method,
+            method,
+        )
+        .with_evidence(path, 2, 2, EvidenceClass::Fact, 1.0, "method");
+        let edge = Edge::new(iface.id.clone(), m.id.clone(), EdgeKind::Declares);
+        (iface, m, edge)
+    }
+
+    fn class_with_method(
+        path: &str,
+        name: &str,
+        method: &str,
+        meta: serde_json::Value,
+    ) -> (Entity, Entity, Edge) {
+        let cls = Entity::new(
+            EntityId::stable("workspace", path, EntityKind::Class, name, ""),
+            EntityKind::Class,
+            name,
+            name,
+        )
+        .with_metadata(meta)
+        .with_evidence(path, 3, 3, EvidenceClass::Fact, 1.0, "class");
+        let m = Entity::new(
+            EntityId::stable("workspace", path, EntityKind::Method, method, ""),
+            EntityKind::Method,
+            method,
+            method,
+        )
+        .with_evidence(path, 4, 4, EvidenceClass::Fact, 1.0, "method");
+        let edge = Edge::new(cls.id.clone(), m.id.clone(), EdgeKind::Declares);
+        (cls, m, edge)
+    }
+
+    fn edges_of_kind<'a>(r: &'a Resolution, kind: EdgeKind) -> Vec<(&'a EntityId, &'a EntityId)> {
+        r.patch
+            .add_edges
+            .iter()
+            .filter(|e| e.kind == kind)
+            .map(|e| (&e.source, &e.target))
+            .collect()
+    }
+
+    /// fqn exact(implements_full 含 FQCN)与 explicit import(implements_full 仅简单名,
+    /// 旧库形态)两档都应把 implements 唯一落到 mod1 的 Handler;无 import 对照类拒边+note。
+    #[test]
+    fn duplicate_interfaces_resolved_by_fqn_and_import_tiers() {
+        let (h1, _, d1) = iface_with_method("mod1/src/main/java/com/a/Handler.java", "com.a", "Handler", "handle");
+        let (h2, _, d2) = iface_with_method("mod2/src/main/java/com/b/Handler.java", "com.b", "Handler", "handle");
+        // ImplA:fqn exact 档
+        let (ia, _, da) = class_with_method(
+            "svc1/src/main/java/com/c/ImplA.java",
+            "ImplA",
+            "run",
+            json!({"fqn": "com.c.ImplA", "imports": ["com.a.Handler"],
+                   "implements": ["Handler"], "implements_full": ["com.a.Handler"]}),
+        );
+        // ImplB:explicit import 档(implements_full 简单名 = 旧库形态)
+        let (ib, _, db) = class_with_method(
+            "svc2/src/main/java/com/d/ImplB.java",
+            "ImplB",
+            "run",
+            json!({"fqn": "com.d.ImplB", "imports": ["com.a.Handler", "java.util.List"],
+                   "implements": ["Handler"], "implements_full": ["Handler"]}),
+        );
+        // ImplC:无 import 信号 → 拒 + note
+        let (ic, _, dc) = class_with_method(
+            "svc3/src/main/java/com/e/ImplC.java",
+            "ImplC",
+            "run",
+            json!({"fqn": "com.e.ImplC", "implements": ["Handler"], "implements_full": ["Handler"]}),
+        );
+        let entities = vec![h1, h2, ia, ib, ic];
+        let extract_edges = vec![d1, d2, da, db, dc];
+        let r = resolve_cross_stack(&entities, &extract_edges);
+        let deps = edges_of_kind(&r, EdgeKind::DependsOn);
+        let h1_id = EntityId::stable("workspace", "mod1/src/main/java/com/a/Handler.java", EntityKind::Interface, "Handler", "");
+        assert_eq!(deps.len(), 2, "ImplA/ImplB 各连一条: {deps:?}");
+        assert!(deps.iter().all(|(_, t)| **t == h1_id), "两条都应落 mod1 副本");
+        let notes: Vec<_> = r.ambiguities.iter().filter(|n| n.kind == "implements").collect();
+        assert_eq!(notes.len(), 1, "仅 ImplC 记 note");
+        assert_eq!(notes[0].name, "Handler");
+        assert_eq!(notes[0].candidates.len(), 2);
+    }
+
+    /// 字段路径 0.7 双拷贝消歧 + 接口分发桥接落实现方法(消歧后 iface id 精确)。
+    #[test]
+    fn field_calls_and_interface_dispatch_resolve_across_copies() {
+        let (h1, hm1, d1) = iface_with_method("mod1/src/main/java/com/a/Handler.java", "com.a", "Handler", "handle");
+        let (h2, hm2, d2) = iface_with_method("mod2/src/main/java/com/b/Handler.java", "com.b", "Handler", "handle");
+        let svc = "svc1/src/main/java/com/c/ImplA.java";
+        let impl_a = Entity::new(
+            EntityId::stable("workspace", svc, EntityKind::Class, "ImplA", ""),
+            EntityKind::Class, "ImplA", "ImplA",
+        )
+        .with_metadata(json!({
+            "fqn": "com.c.ImplA", "imports": ["com.a.Handler"],
+            "implements": ["Handler"], "implements_full": ["Handler"],
+            "injected_fields": [{"name": "h", "type": "Handler"}]}))
+        .with_evidence(svc, 3, 3, EvidenceClass::Fact, 1.0, "class");
+        // run 调 h.handle(receiver=注入字段名);handle 是接口方法的实现
+        let run = Entity::new(
+            EntityId::stable("workspace", svc, EntityKind::Method, "run", ""),
+            EntityKind::Method, "run", "run",
+        )
+        .with_metadata(json!({"invokes": [{"name": "handle", "receiver": "h", "receiver_kind": "name", "line": 5}]}))
+        .with_evidence(svc, 4, 4, EvidenceClass::Fact, 1.0, "method");
+        let impl_handle = Entity::new(
+            EntityId::stable("workspace", svc, EntityKind::Method, "handle", ""),
+            EntityKind::Method, "handle", "handle",
+        )
+        .with_evidence(svc, 6, 6, EvidenceClass::Fact, 1.0, "method");
+        // SpringBean(name=被注入类型名)
+        let bean = Entity::new(
+            EntityId::stable("workspace", svc, EntityKind::SpringBean, "Handler", ""),
+            EntityKind::SpringBean, "Handler", "Handler",
+        );
+        let extract_edges = vec![
+            d1, d2,
+            Edge::new(impl_a.id.clone(), run.id.clone(), EdgeKind::Declares),
+            Edge::new(impl_a.id.clone(), impl_handle.id.clone(), EdgeKind::Declares),
+            Edge::new(impl_a.id.clone(), bean.id.clone(), EdgeKind::Injects),
+        ];
+        let entities = vec![h1, h2, hm1, hm2, impl_a.clone(), run.clone(), impl_handle.clone(), bean];
+        let r = resolve_cross_stack(&entities, &extract_edges);
+        let calls = edges_of_kind(&r, EdgeKind::Calls);
+        eprintln!("DEBUG all edges: {:?}", r.patch.add_edges.iter().map(|e| (format!("{:?}", e.kind), e.source.to_string(), e.target.to_string())).collect::<Vec<_>>());
+        eprintln!("DEBUG notes: {:?}", r.ambiguities);
+        let h1_handle = EntityId::stable("workspace", "mod1/src/main/java/com/a/Handler.java", EntityKind::Method, "handle", "");
+        assert!(
+            calls.iter().any(|(s, t)| **s == run.id && **t == h1_handle),
+            "字段路径 0.7 应落 mod1 副本: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|(s, t)| **s == h1_handle && **t == impl_handle.id),
+            "接口分发应桥到 ImplA.handle: {calls:?}"
+        );
+    }
+
+    /// 同包档(无 import)与通配档(`com.acme.*` 在 com.acme/com.acme2 双候选下唯一命中)。
+    #[test]
+    fn same_package_and_wildcard_tiers() {
+        let (h1, _, d1) = iface_with_method("mod1/src/main/java/com/a/Handler.java", "com.a", "Handler", "handle");
+        let (h2, _, d2) = iface_with_method("mod2/src/main/java/com/b/Handler.java", "com.b", "Handler", "handle");
+        // 同包:Local 在 com.a 包,无 import
+        let (local, _, dl) = class_with_method(
+            "mod1/src/main/java/com/a/Local.java",
+            "Local",
+            "run",
+            json!({"fqn": "com.a.Local", "implements": ["Handler"], "implements_full": ["Handler"]}),
+        );
+        let r = resolve_cross_stack(&vec![h1.clone(), h2.clone(), local], &vec![d1.clone(), d2.clone(), dl]);
+        let deps = edges_of_kind(&r, EdgeKind::DependsOn);
+        let h1_id = EntityId::stable("workspace", "mod1/src/main/java/com/a/Handler.java", EntityKind::Interface, "Handler", "");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].1, &h1_id, "同包档落 com.a 副本");
+
+        // 通配:com.acme.* 在 com.acme/com.acme2 双候选下唯一命中前者
+        let (w1, _, dw1) = iface_with_method("w1/src/main/java/com/acme/Handler.java", "com.acme", "Handler", "handle");
+        let (w2, _, dw2) = iface_with_method("w2/src/main/java/com/acme2/Handler.java", "com.acme2", "Handler", "handle");
+        let (wc, _, dwc) = class_with_method(
+            "wc/src/main/java/com/x/Wild.java",
+            "Wild",
+            "run",
+            json!({"fqn": "com.x.Wild", "imports": ["com.acme.*", "java.util.*"],
+                   "implements": ["Handler"], "implements_full": ["Handler"]}),
+        );
+        let r2 = resolve_cross_stack(&vec![w1, w2, wc], &vec![dw1, dw2, dwc]);
+        let deps2 = edges_of_kind(&r2, EdgeKind::DependsOn);
+        let w1_id = EntityId::stable("workspace", "w1/src/main/java/com/acme/Handler.java", EntityKind::Interface, "Handler", "");
+        assert_eq!(deps2.len(), 1);
+        assert_eq!(deps2[0].1, &w1_id, "通配档应落 com.acme(不带 2)");
     }
 }
