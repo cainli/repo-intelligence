@@ -771,6 +771,15 @@ fn read_manifest(base: &Path) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// manifest repo_path 与 repository 参数匹配:归一全路径 / 尾段 / 短名三档。
+/// Windows canonicalize 产物带 `\\?\` 扩展长度前缀且 \ 分隔,不归一则三档全失配
+/// (曾只被 win runner 测试暴露,mes-activity fail-loud 的短名路由在 Windows 全废)。
+fn manifest_path_matches(stored: &str, repo: &str) -> bool {
+    let normalized = stored.replace('\\', "/");
+    let norm = normalized.trim_start_matches("//?/");
+    norm == repo || norm.ends_with(&format!("/{repo}")) || norm.rsplit('/').next() == Some(repo)
+}
+
 /// 多仓库路由:有 `repository` 参数 → `<base>/repos/<repo_id>.sqlite`
 /// (repo_id = blake3(规范化路径)[:16]);无 → fallback_db(单库兼容,向后兼容 --database)。
 /// repository 约定是 scan_workspace 时的仓库根路径;尾段短名(mes/mos)也接受。
@@ -789,11 +798,7 @@ fn resolve_database(
                 // 非有效路径:试 manifest 尾段短名(repo_path 以 /<repo> 结尾)。
                 let hits: Vec<&(String, String)> = known
                     .iter()
-                    .filter(|(_, p)| {
-                        p == repo
-                            || p.ends_with(&format!("/{repo}"))
-                            || p.rsplit('/').next() == Some(repo)
-                    })
+                    .filter(|(_, p)| manifest_path_matches(p, repo))
                     .collect();
                 match hits.as_slice() {
                     [(_, p)] => std::fs::canonicalize(p).map_err(|e| {
@@ -2405,6 +2410,19 @@ mod tests {
         assert_eq!(list["count"].as_u64(), Some(1));
         assert_eq!(list["repositories"][0]["repo_id"], "default");
         assert_eq!(list["repositories"][0]["repo_path"], "ws.sqlite");
+    }
+
+    /// Windows manifest 存 `\\?\C:\...`(canonicalize 产物):\ 分隔 + 扩展长度前缀,
+    /// 短名/归一全路径都必须命中;非边界尾段不得误命中。纯函数,任何平台可复现。
+    #[test]
+    fn manifest_path_matching_is_separator_agnostic() {
+        assert!(manifest_path_matches(
+            r"\\?\C:\Users\r\AppData\Local\Temp\.tmpX",
+            ".tmpX"
+        ));
+        assert!(manifest_path_matches("/home/u/work/mes", "mes"));
+        assert!(manifest_path_matches(r"\\?\C:\work\mes", "C:/work/mes"));
+        assert!(!manifest_path_matches("/home/u/work/mesx", "mes"));
     }
 
     #[test]
