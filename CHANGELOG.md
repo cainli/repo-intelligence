@@ -7,6 +7,51 @@
 
 ## [Unreleased]
 
+## [0.1.43] - 2026-09-22
+
+mes-activity 实测反馈(40 万实体 git submodule 双 SDK 拷贝仓库,以「独立事件执行
+链路」端到端分析对照源码)六项修复版。**升级后首扫会全量重提 + 重嵌**
+(INDEX_FORMAT 2→4:提取层 metadata 语义变更 + doc 注释通道;ruoyi 790 文件
+~90s,大仓库按比例延长)。
+
+### Fixed
+
+- **跨文件接口分发调用断链(P0)**:双拷贝仓库同名类型 ×2 时 implements/superclass/
+  字段/静态/注入五路消解全军覆没(核心接口对零边,接口分发调用不可见)。新增
+  import 消歧阶梯(fqn exact > 全局唯一 > 显式 import > 同包 > 通配 import,
+  逐档唯一命中才连,全落空仍拒+注记——A+ 哲学不变);四张消解表 name 键改
+  owner EntityId 键(同名类条目不再互相污染);接口分发/继承方法上溯改 id 键。
+  ruoyi 回归零漂移(单拷贝走全局唯一档,行为与旧版逐字节一致)。
+- **implements/superclass 提取四缺陷(P0)**:嵌套泛型逗号泄漏(类型实参基名被
+  split(',')/split('<') 当成接口,幻觉误归的根源)、FQCN 接口整条丢弃、bounded
+  type parameter 吃掉 extends(superclass 曾变 "Comparable"/"com")、同文件同名类
+  按名绑定互相覆盖。改为类型头平衡扫描器(angle-depth 平衡解析,只认顶层
+  extends/implements),enum 产实体,新增 `implements_full`/`superclass_full`
+  平行键,sealed permits 不混入。
+- **repository 参数静默失败(P0)**:传无效短名曾被 canonicalize 吞错后哈希成无关
+  空库 → 查询静默返回 0 条(读起来像无调用关系)且 manifest 被垃圾条目污染。
+  现在 fail-loud 并列出可用值;manifest 仅库已存在才登记;trace 空结果区分
+  「名字没找到」与「路由到空库」;`list_repositories` 单库模式回退 default 条目。
+- **verify_edge 同名盲取(P1)**:spring_bean 影子实体(name=被注入字段类型名,
+  evidence 锚在注入方文件)按 rowid 抢走解析,source 被锚到不相干文件且不可见。
+  改 kind 偏好稳定排序(声明实体优先)+ `resolved`/`candidates` 回显,多命中
+  note 明示。
+- **trace 裸名合并边只有 hash id(P1)**:响应顶层新增 `nodes` 查找表
+  ({hash: {name, qualified_name, kind, file}},仅当前边页端点;verbose 不发),
+  裸名多实体合并时不再需要人工对照尾部 items[]。
+- **query_sql 报错无提示(P2)**:`no such table: edges` 现带 levenshtein 近邻建议
+  与完整表/列清单(`Did you mean `edge`? Names are singular; `kind` is the
+  discriminator column.`);列名错误自动同覆盖。
+
+### Added
+
+- **声明前置注释入 `metadata.doc` → embedding(P2)**:业务语义几乎全在中文注释的
+  仓库,语义搜索此前全败(中文 query 与全英文标识符向量余弦普遍低,排序退化为
+  离语料质心距离,vue_page 短文本同质簇霸榜)。现 javadoc/行注释链(160 chars
+  硬截断,防稀释 128 token 窗口)进向量,ruoyi 3411 实体(48%)覆盖;
+  「用户登录认证」→ LoginBody 0.61 / AuthController#register 0.60(Java 实体凭
+  注释上榜)。frontend(.vue)注释通道后续跟进。
+
 ## [0.1.42] - 2026-09-22
 
 AOP/反射索引能力版(升级后请删除旧 `.repo-intelligence/` 重扫——新 metadata/边在

@@ -73,7 +73,19 @@ sqlite3 "$DB" "SELECT json_extract(json,'\$.evidence[0].confidence'), COUNT(*) F
 ## 构建 / 测试
 
 - `cargo test` —— 全 workspace 单元/集成测试(**不替代**上面的真实项目验证)。
-- 版本号:根 `Cargo.toml` `[workspace.package] version`(当前 0.1.42),所有 crate `version.workspace = true`。
+- 版本号:根 `Cargo.toml` `[workspace.package] version`(当前 0.1.43),所有 crate `version.workspace = true`。
+
+### mes-activity 反馈六项修复(v0.1.43,2026-09-22)
+
+40 万实体 git submodule 双 SDK 拷贝仓库实测反馈的六项修复,验收基线:
+
+- **import 消歧阶梯**(`resolve_type`,analysis):fqn exact > 全局唯一 > 显式 import > 同包 > 通配,逐档唯一命中才连,全落空仍拒+注记。四张消解表(type_methods/method_owner/owner_injected/owner_fields)已 **owner EntityId 键化**——旧 `type_name_owners<=1` 闸门只对 note 保留。验收:双拷贝同名接口 fixture + ruoyi 零漂移(单拷贝走 UniqueGlobal 档,行为与旧闸门逐字节一致)。
+- **类型头平衡扫描器**(`scan_type_headers`,java.rs):替代 IMPLEMENTS/JAVA_EXTENDS 正则——嵌套泛型逗号泄漏(幻觉接口名)、FQCN 丢弃、bounded type param 吃 extends、按名绑定串类四缺陷根治;enum 产实体(kind=Enum,ruoyi +32);`implements_full`/`superclass_full` 平行键存 FQCN 原文。
+- **doc 注释通道**:声明前置注释 → `metadata.doc`(160 chars 截断)→ embedding 文本拼接。ruoyi 3411 实体(48%)带 doc;中文 query 从"Java 实体零上榜"反转为 LoginBody 0.61/AuthController#register 0.60。frontend(.vue)未做(follow-up)。
+- **repository fail-loud**(mcp):无效短名先试 manifest 尾段匹配再 bail;manifest 仅库已存在才登记(查询调用不污染 registry);trace 空结果区分"名字没找到"vs"路由到空库";`list_repositories` 单库回退 `repo_id:"default"`。注意:**repository 参数约定是 scan 时的仓库根路径,尾段短名(mes/mos)也可**。
+- **verify_edge 确定性消解**:kind 偏好排序(声明实体 > spring_bean 影子)+ `resolved`/`candidates` 回显;trace 顶层 `nodes` 查找表(仅当前边页端点)。
+- **query_sql 错误近邻提示**(graph):`no such table/column` 带 levenshtein 建议与完整 schema 清单。
+- **INDEX_FORMAT 现为 4**——旧库升级首扫全量重提+重 embed(ruoyi 790 文件 ~90s 含 embedding 65s;doc 拉长 embedding 文本,比 0.1.42 的 ~20s 慢属预期)。回归基线:实体 7128 / 边 14889 / calls 3004(0.7:2976+0.5:28)与 0.1.42 逐字节一致;plus-ui 三项 11/45/0/490 全对齐。反馈误诊澄清:verify_edge "模糊匹配"实为 spring_bean 影子实体 rowid 盲取;implements "方向疑反"实为反向边(iface→class,正向边 kind 是 DependsOn)。
 - 提交风格:`release vX.Y.Z: ...`(见 git log)。
 
 ## 项目结构
