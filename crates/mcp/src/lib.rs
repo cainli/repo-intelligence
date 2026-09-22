@@ -1867,13 +1867,15 @@ fn trace_graph(
     });
     // Wrap with edge_view (top-level confidence/tentative) and drop edges below
     // `min_confidence`. Conservative: default 0 keeps everything, low-confidence
-    // edges are marked `tentative` rather than silently hidden.
-    let edge_views: Vec<Value> = edges
+    // edges are marked `tentative` rather than silently hidden. 过滤前置到分页前:
+    // total_edges 与分页口径一致(此前 filter 在 map 之后,分页索引错位)。
+    let visible: Vec<&Edge> = edges
         .iter()
-        .map(|edge| edge_view(edge, verbose))
-        .filter(|view| view["confidence"].as_f64().unwrap_or(1.0) >= min_confidence as f64)
+        .filter(|edge| {
+            edge.evidence.first().map(|i| i.confidence).unwrap_or(1.0) >= min_confidence as f32
+        })
         .collect();
-    let edges_empty = edge_views.is_empty();
+    let edges_empty = visible.is_empty();
     let direction = if outbound {
         "outbound (callees)"
     } else {
@@ -1881,14 +1883,18 @@ fn trace_graph(
     };
     // 分页(治 trace 爆炸):edges/items 各自按 limit/offset 截断,peek 法判 has_more。
     let total_items = items.len();
-    let total_edges = edge_views.len();
+    let total_edges = visible.len();
     let items_page: Vec<Value> = items
-        .into_iter()
+        .iter()
         .skip(offset)
         .take(limit)
-        .map(|entity| trace_entity_view(&entity, verbose))
+        .map(|entity| trace_entity_view(entity, verbose))
         .collect();
-    let edges_page: Vec<Value> = edge_views.into_iter().skip(offset).take(limit).collect();
+    let page_edges: Vec<&Edge> = visible.iter().copied().skip(offset).take(limit).collect();
+    let edges_page: Vec<Value> = page_edges
+        .iter()
+        .map(|edge| edge_view(edge, verbose))
+        .collect();
     let has_more = total_items > offset + limit || total_edges > offset + limit;
     let mut result = json!({
         "items": items_page,
@@ -1901,6 +1907,35 @@ fn trace_graph(
         "offset": offset,
         "start_count": starts.len(),
     });
+    // mes-activity 反馈(P1-4):紧凑档边只有 hash id,裸名多实体合并时要人工对照尾部
+    // items[] 才能读。顶层加 nodes 查找表 {hash: {name, qualified_name, kind, file}},
+    // 只为当前边页引用的端点建条目(上限 2×limit,重度去重);verbose 不发(items 全量
+    // 自带名字)。端点必在到达集内(traverse 不变式),查不到即被 to_kind 过滤,可缺席。
+    if !verbose && !page_edges.is_empty() {
+        let by_id: HashMap<&EntityId, &Entity> = items.iter().map(|e| (&e.id, e)).collect();
+        let mut nodes = serde_json::Map::new();
+        for edge in &page_edges {
+            for endpoint in [&edge.source, &edge.target] {
+                if nodes.contains_key(endpoint.0.as_str()) {
+                    continue;
+                }
+                if let Some(e) = by_id.get(endpoint) {
+                    nodes.insert(
+                        endpoint.0.clone(),
+                        json!({
+                            "name": e.name,
+                            "qualified_name": e.qualified_name,
+                            "kind": e.kind.as_str(),
+                            "file": e.evidence.first().map(|ev| ev.file.clone()),
+                        }),
+                    );
+                }
+            }
+        }
+        if !nodes.is_empty() {
+            result["nodes"] = Value::Object(nodes);
+        }
+    }
     // 多同名起点是调用链最关键的分叉点(mos 的 S27204 入口 vs mes 的 S27204 处理器)。
     // 合并 trace 之外,显式列出每个起点的 qualified_name/kind/file,让调用方能按 qn 精确重查。
     if starts.len() > 1 {
@@ -1952,20 +1987,32 @@ fn verify_edge(
     target: &str,
     workspace: &str,
 ) -> Result<Value> {
-    let source_entity = store
-        .search_exact_name(source, 1)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| {
-            anyhow!(
-                "No entity is exactly named `{source}`. verify_edge resolves the source by exact \
-                 name; run search_entities first to find the precise identifier."
-            )
-        })?;
+    // mes-activity 反馈(P1-3):同名多实体时 LIMIT 1 按 rowid 盲取,spring_bean 影子实体
+    // (name=被注入字段类型名,evidence 锚在注入方文件——测试类注入过目标类即产生同名
+    // 影子)会抢走解析,source 被锚到不相干文件。现在取全量候选,按 kind 偏好稳定排序
+    // (声明实体 > 派生实体,再按 qualified_name),多命中回显清单供人工复核。
+    let mut candidates = store.search_exact_name(source, DEFAULT_SEARCH_LIMIT)?;
+    if candidates.is_empty() {
+        anyhow::bail!(
+            "No entity is exactly named `{source}`. verify_edge resolves the source by exact \
+             name; run search_entities first to find the precise identifier."
+        )
+    }
+    let kind_rank = |k: &EntityKind| match k {
+        EntityKind::Class | EntityKind::Interface | EntityKind::Method | EntityKind::Enum => 0,
+        _ => 1,
+    };
+    candidates.sort_by(|a, b| {
+        kind_rank(&a.kind)
+            .cmp(&kind_rank(&b.kind))
+            .then_with(|| a.qualified_name.cmp(&b.qualified_name))
+    });
+    let source_entity = &candidates[0];
     let Some(source_file) = source_entity.evidence.first().map(|item| item.file.clone()) else {
         return Ok(json!({
             "source": source,
             "target": target,
+            "resolved": resolved_json(source_entity),
             "verified": false,
             "match_count": 0,
             "matches": [],
@@ -2002,7 +2049,8 @@ fn verify_edge(
         }
     }
     let verified = match_count > 0;
-    let note = if verified {
+    let ambiguous = candidates.len() > 1;
+    let mut note = if verified {
         format!(
             "`{target}` appears in `{source_file}` — consistent with the edge. Substring match is \
              a heuristic; still confirm the reference is semantic, not a comment or string literal."
@@ -2014,15 +2062,33 @@ fn verify_edge(
              it as unverified."
         )
     };
+    if ambiguous {
+        note.push_str(&format!(
+            " NOTE: `{source}` matched {} entities; resolved to the declaration-kind one below. \
+             If that is not the intended one, re-run with its exact qualified_name.",
+            candidates.len()
+        ));
+    }
     Ok(json!({
         "source": source,
+        "resolved": resolved_json(source_entity),
         "source_file": source_file,
         "target": target,
         "verified": verified,
         "match_count": match_count,
         "matches": matches,
+        "candidates": candidates.iter().take(8).map(homonym_json).collect::<Vec<_>>(),
         "note": note
     }))
+}
+
+/// 解析结果回显(mes-activity P1-3):让「哪个实体被选中」可见,影子实体选中不再隐身。
+fn resolved_json(entity: &Entity) -> Value {
+    json!({
+        "qualified_name": entity.qualified_name,
+        "kind": entity.kind.as_str(),
+        "file": entity.evidence.first().map(|ev| ev.file.clone()),
+    })
 }
 
 /// Relay-schema 生产者(`build_relay_doc` 端点与 `relay` CLI 共用):把目标(按
@@ -2529,6 +2595,85 @@ mod tests {
         assert!(hit["match_count"].as_u64().unwrap() >= 1);
         let miss = verify_edge(&store, "Svc", "nonexistentXYZ", root).unwrap();
         assert_eq!(miss["verified"], false, "不存在的 target 未命中");
+    }
+
+    /// P1-3:同名 class + spring_bean 影子实体并存时,verify_edge 解析到声明实体
+    /// (不再按 rowid 盲取——影子先插入时旧实现会把它锚到注入方测试文件),
+    /// resolved/candidates 回显让「哪个实体被选中」可见。
+    #[test]
+    fn verify_edge_prefers_declaration_over_shadow_bean() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("RealSvc.java"),
+            "class EquityClaimOuterService {}\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("SomeTest.java"), "// 注入方测试文件\n").unwrap();
+        let mut store = SqliteGraphStore::open_in_memory().unwrap();
+        let real = Entity::new(
+            EntityId::stable("w", "RealSvc.java", EntityKind::Class, "EquityClaimOuterService", ""),
+            EntityKind::Class,
+            "EquityClaimOuterService",
+            "EquityClaimOuterService",
+        )
+        .with_evidence("RealSvc.java", 1, 1, EvidenceClass::Fact, 1.0, "declared");
+        // 影子 spring_bean:name = 被注入字段类型名,evidence 锚在注入方(测试文件);
+        // 先插入——旧实现的 rowid 顺序下它会赢。
+        let shadow = Entity::new(
+            EntityId::stable("w", "SomeTest.java", EntityKind::SpringBean, "EquityClaimOuterService", ""),
+            EntityKind::SpringBean,
+            "EquityClaimOuterService",
+            "EquityClaimOuterService",
+        )
+        .with_evidence("SomeTest.java", 2, 2, EvidenceClass::Fact, 0.9, "injected field");
+        store
+            .apply_patch(GraphPatch::add(vec![shadow, real], vec![]))
+            .unwrap();
+        let root = dir.path().to_str().unwrap();
+        let out = verify_edge(
+            &store,
+            "EquityClaimOuterService",
+            "EquityClaimOuterService",
+            root,
+        )
+        .unwrap();
+        assert_eq!(out["resolved"]["kind"], "class", "应解析到声明类而非影子 bean: {out}");
+        assert_eq!(out["resolved"]["file"], "RealSvc.java");
+        assert_eq!(out["candidates"].as_array().unwrap().len(), 2, "多候选回显");
+        assert!(out["note"].as_str().unwrap().contains("matched 2 entities"));
+    }
+
+    /// P1-4:trace 紧凑档顶层 nodes 查找表——只为当前边页端点建条目(name/qn/kind/file),
+    /// 裸名多实体合并时不再需要人工对照尾部 items[];verbose 档不发(items 已全量)。
+    #[test]
+    fn trace_emits_nodes_lookup_for_edge_endpoints() {
+        let mut store = SqliteGraphStore::open_in_memory().unwrap();
+        let svc = Entity::new(id("svc"), EntityKind::Class, "Svc", "com.x.Svc")
+            .with_evidence("Svc.java", 1, 1, EvidenceClass::Fact, 1.0, "declared");
+        let svc_m = Entity::new(id("svc.m"), EntityKind::Method, "doWork", "Svc#doWork")
+            .with_evidence("Svc.java", 2, 2, EvidenceClass::Fact, 1.0, "declared");
+        let edges = vec![Edge::new(id("svc"), id("svc.m"), EdgeKind::Declares).with_evidence(
+            "Svc.java",
+            1,
+            1,
+            EvidenceClass::Fact,
+            1.0,
+            "declares",
+        )];
+        store
+            .apply_patch(GraphPatch::add(vec![svc, svc_m], edges))
+            .unwrap();
+        let kinds = vec![EdgeKind::Declares];
+        // 紧凑档:nodes 表存在,边页两端点都有条目
+        let compact = trace_graph(&store, "Svc", 1, kinds.clone(), true, 0.0, 50, 0, None, false)
+            .unwrap();
+        let nodes = compact["nodes"].as_object().expect("nodes 查找表存在");
+        assert_eq!(nodes.len(), 2, "一条边两个端点: {nodes:?}");
+        assert!(nodes.values().all(|n| n["qualified_name"].is_string() && n["file"].is_string()));
+        // verbose 档:items 已全量带名字,nodes 不发
+        let verbose =
+            trace_graph(&store, "Svc", 1, kinds, true, 0.0, 50, 0, None, true).unwrap();
+        assert!(verbose["nodes"].is_null(), "verbose 档不重复发 nodes");
     }
 
     #[test]
