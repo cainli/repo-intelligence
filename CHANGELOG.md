@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 
+## [0.1.42] - 2026-09-22
+
+AOP/反射索引能力版(升级后请删除旧 `.repo-intelligence/` 重扫——新 metadata/边在
+extract 层,增量扫描不会补齐旧库)。
+
 ### Added
 
 - **AOP 织入索引（`intercepts` 边）**：解析切面 advice 的 pointcut——`@annotation(参数名)`
@@ -18,6 +23,10 @@
 - 方法 `metadata.annotations` 记录全量注解短名（白名单过滤前），业务标记注解
   （@Log/@DataScope 等）不产实体但可查。
 - advice/pointcut 声明注解（@Around/@Before/@After*/@Pointcut）入注解白名单。
+
+### Fixed
+
+- advice 注解参数列表正则支持两层嵌套括号（`execution(* a.add*(..))` 旧正则截断残缺）。
 
 ## [0.1.41] - 2026-09-21
 

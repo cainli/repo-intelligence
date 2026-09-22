@@ -73,7 +73,7 @@ sqlite3 "$DB" "SELECT json_extract(json,'\$.evidence[0].confidence'), COUNT(*) F
 ## 构建 / 测试
 
 - `cargo test` —— 全 workspace 单元/集成测试(**不替代**上面的真实项目验证)。
-- 版本号:根 `Cargo.toml` `[workspace.package] version`(当前 0.1.41),所有 crate `version.workspace = true`。
+- 版本号:根 `Cargo.toml` `[workspace.package] version`(当前 0.1.42),所有 crate `version.workspace = true`。
 - 提交风格:`release vX.Y.Z: ...`(见 git log)。
 
 ## 项目结构
