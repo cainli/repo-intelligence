@@ -397,6 +397,13 @@ fn extract_java(
             &file.content,
         );
     }
+    // 声明前置注释(P2-5):类在实体创建循环按 name offset 写入;方法经 method_spans
+    // 配对写入。doc 进 embedding 文本(中文业务语义通道)。
+    let docs = parsed
+        .tree
+        .as_ref()
+        .map(|tree| collect_docs(tree.root_node(), &file.content))
+        .unwrap_or_default();
     // 同文件 method 调用 → Calls 边。A+ 策略:caller/callee 名字对应多个方法
     // (重载或同文件跨类同名)即歧义 → 跳过不猜连;唯一命中才建边。
     for inv in &invocations {
@@ -569,6 +576,9 @@ fn extract_java(
         if abstract_offsets.contains(offset) {
             meta.insert("abstract".into(), json!(true));
         }
+        if let Some(doc) = docs.get(offset) {
+            meta.insert("doc".into(), json!(doc));
+        }
         if !meta.is_empty() {
             entity = entity.with_metadata(serde_json::Value::Object(meta));
         }
@@ -699,6 +709,23 @@ fn extract_java(
                     "controller method exposes HTTP endpoint",
                 ),
             );
+        }
+    }
+    // 方法/构造器前置注释 → metadata.doc(与 method_spans 按 name 节点 offset 配对)。
+    for (offset, method_id) in &method_spans {
+        let Some(doc) = docs.get(offset) else {
+            continue;
+        };
+        for entity in entities.iter_mut() {
+            if entity.id == *method_id {
+                let mut meta = match entity.metadata.clone() {
+                    serde_json::Value::Object(map) => map,
+                    _ => serde_json::Map::new(),
+                };
+                meta.insert("doc".into(), json!(doc));
+                entity.metadata = serde_json::Value::Object(meta);
+                break;
+            }
         }
     }
     extract_custom_endpoints(file, path, &masked, entities, edges, config);
@@ -1290,6 +1317,73 @@ fn parse_type_list(tokens: &[(String, i32)], from: usize, to: usize) -> Vec<Stri
         out.push(full);
     }
     out
+}
+
+/// 声明前置注释 → metadata.doc(P2-5 中文语义通道):mes-activity 实测业务语义几乎
+/// 全在中文注释里,而注释此前从未进图 → embedding 全英文标识符,中文查询失效。
+/// 沿声明节点的 prev_sibling 回溯连续注释链(注释是声明的**兄弟**节点,modifiers/
+/// 注解是**子**节点,链条天然不被注解打断),剥 markers 合并。单实体 160 chars 硬
+/// 截断(multilingual-MiniLM 窗口 ~128 token,给 embedding 文本里的 kind/qn/注解留
+/// 空间)。返回 name 节点 start_byte → doc(与 class_hits/method_spans 的 offset 同源)。
+fn collect_docs<'a>(root: Node<'a>, src: &'a str) -> HashMap<usize, String> {
+    const DOC_CAP: usize = 160; // chars,防切 UTF-8 用 chars().take
+    let mut out: HashMap<usize, String> = HashMap::new();
+    let mut cursor = root.walk();
+    loop {
+        let node = cursor.node();
+        if matches!(
+            node.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "method_declaration"
+                | "constructor_declaration"
+        ) && let Some(name) = node.child_by_field_name("name")
+        {
+            let mut parts: Vec<&str> = Vec::new();
+            let mut cur = node.prev_sibling();
+            while let Some(c) = cur
+                && matches!(c.kind(), "line_comment" | "block_comment")
+            {
+                parts.push(&src[c.start_byte()..c.end_byte()]);
+                cur = c.prev_sibling();
+            }
+            if !parts.is_empty() {
+                parts.reverse(); // 回溯收集是倒序,还原源码序
+                let cleaned = strip_comment_markers(&parts.join("\n"));
+                let doc: String = cleaned.chars().take(DOC_CAP).collect();
+                if !doc.is_empty() {
+                    out.insert(name.start_byte(), doc);
+                }
+            }
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return out;
+            }
+        }
+    }
+}
+
+/// 剥注释 markers(`/** */`、行首 `*`、`//`、`///`)合并为单行文本;空行过滤。
+fn strip_comment_markers(raw: &str) -> String {
+    raw.lines()
+        .map(str::trim)
+        .filter_map(|line| {
+            let l = line.strip_prefix("//").unwrap_or(line);
+            let l = l.strip_prefix("/**").unwrap_or(l);
+            let l = l.strip_prefix("/*").unwrap_or(l);
+            let l = l.strip_suffix("*/").unwrap_or(l);
+            let l = l.strip_prefix('*').unwrap_or(l);
+            let t = l.trim();
+            (!t.is_empty()).then_some(t)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// 文件级 imports → 同文件每个 class 的 metadata.imports(全限定名数组,含通配项
@@ -2876,5 +2970,103 @@ public abstract class Base implements TopIface {
             true,
             "无 extends 时不得有 superclass_full"
         );
+    }
+
+    /// P2-5:声明前置注释 → metadata.doc。类/方法各归其主;javadoc 续行剥 markers
+    /// 合并;160 chars 截断;无注释声明不产 doc 键。
+    #[test]
+    fn leading_comments_become_doc_metadata() {
+        let src = r#"
+/**
+ * 独立事件实时活动执行链路入口:接收 RMB 交易码并三分流。
+ */
+@Service
+public class EventChainService {
+    /**
+     * 权益发放主流程:校验资格后按活动类型分发。
+     */
+    public void bizProcess(String tradeCode) {
+    }
+
+    public void noDoc() {
+    }
+}
+"#;
+        let path = "src/main/java/com/a/EventChainService.java";
+        let file = SourceFile {
+            id: EntityId::stable("workspace", path, EntityKind::File, "EventChainService", ""),
+            relative_path: std::path::PathBuf::from(path),
+            kind: FileKind::Java,
+            content_hash: String::new(),
+            content: src.into(),
+        };
+        let mut entities = Vec::new();
+        let mut edges = Vec::new();
+        extract_java(&file, path, &mut entities, &mut edges, &SemanticsConfig::default()).unwrap();
+        let meta = |kind: EntityKind, name: &str| {
+            entities
+                .iter()
+                .find(|e| e.kind == kind && e.name == name)
+                .unwrap_or_else(|| panic!("实体缺失 {kind:?} {name}"))
+                .metadata
+                .clone()
+        };
+        let cls = meta(EntityKind::Class, "EventChainService");
+        assert_eq!(
+            cls.get("doc").and_then(|v| v.as_str()),
+            Some("独立事件实时活动执行链路入口:接收 RMB 交易码并三分流。"),
+            "类 javadoc 剥 markers 后归入 metadata.doc: {cls}"
+        );
+        let m = meta(EntityKind::Method, "bizProcess");
+        assert_eq!(
+            m.get("doc").and_then(|v| v.as_str()),
+            Some("权益发放主流程:校验资格后按活动类型分发。"),
+            "方法 javadoc 归方法"
+        );
+        // 注解(@Service)不打断注释链(注释是声明兄弟节点);无注释方法不产 doc
+        assert!(meta(EntityKind::Method, "noDoc").get("doc").is_none());
+    }
+
+    /// P2-5:连续行注释链与截断上限。
+    #[test]
+    fn doc_line_comment_chain_and_truncation() {
+        let long = "很长的中文语义".repeat(60); // > 160 chars
+        let src = format!(
+            r#"
+// 状态机管理器
+// 负责活动状态的流转
+public class StateMachine {{
+    // {long}
+    public void tick() {{}}
+}}
+"#
+        );
+        let path = "src/main/java/com/a/StateMachine.java";
+        let file = SourceFile {
+            id: EntityId::stable("workspace", path, EntityKind::File, "StateMachine", ""),
+            relative_path: std::path::PathBuf::from(path),
+            kind: FileKind::Java,
+            content_hash: String::new(),
+            content: src.clone(),
+        };
+        let mut entities = Vec::new();
+        let mut edges = Vec::new();
+        extract_java(&file, path, &mut entities, &mut edges, &SemanticsConfig::default()).unwrap();
+        let cls = entities
+            .iter()
+            .find(|e| e.kind == EntityKind::Class && e.name == "StateMachine")
+            .expect("StateMachine");
+        assert_eq!(
+            cls.metadata.get("doc").and_then(|v| v.as_str()),
+            Some("状态机管理器 负责活动状态的流转"),
+            "连续行注释链合并: {:?}",
+            cls.metadata.get("doc")
+        );
+        let tick = entities
+            .iter()
+            .find(|e| e.kind == EntityKind::Method && e.name == "tick")
+            .expect("tick");
+        let doc = tick.metadata.get("doc").and_then(|v| v.as_str()).unwrap();
+        assert!(doc.chars().count() <= 160, "doc 须截断到 160 chars, got {}", doc.chars().count());
     }
 }

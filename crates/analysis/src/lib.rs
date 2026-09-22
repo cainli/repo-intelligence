@@ -14,10 +14,11 @@ use repo_intelligence_source::{SourceFile, discover_with_config};
 use serde_json::json;
 
 /// 索引格式版本:EntityId 方案变更(方法 arity 判别符、字段所属类判别符等)或实体
-/// metadata 语义变更(implements/superclass 由类型头扫描器重写、enum 新实体)必须强制
-/// 全量重提,否则增量扫描会让旧 id 实体与新方案边(id 不匹配)并存,边悬空。做法:
-/// file_state 的值带版本前缀,版本变更后首次扫描新旧哈希不等 → 全量重提,之后稳定回增量。
-const INDEX_FORMAT: u32 = 3;
+/// metadata 语义变更(implements/superclass 由类型头扫描器重写、enum 新实体、doc 注释
+/// 通道)必须强制全量重提,否则增量扫描会让旧 id 实体与新方案边(id 不匹配)并存,边
+/// 悬空。做法:file_state 的值带版本前缀,版本变更后首次扫描新旧哈希不等 → 全量重提,
+/// 之后稳定回增量。
+const INDEX_FORMAT: u32 = 4;
 
 #[derive(Clone, Debug, Default)]
 pub struct ScanSummary {
@@ -255,6 +256,12 @@ impl WorkspaceIndexer {
                                 .collect::<Vec<_>>()
                                 .join(" "),
                         );
+                    }
+                    // 声明前置注释(mes-activity P2-5:业务语义全在中文注释里)。
+                    // extract 层已 160 chars 硬截断,这里不再截。
+                    if let Some(doc) = e.metadata.get("doc").and_then(|v| v.as_str()) {
+                        text.push(' ');
+                        text.push_str(doc);
                     }
                     (e.id.clone(), text)
                 })
