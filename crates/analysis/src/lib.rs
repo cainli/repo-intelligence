@@ -912,7 +912,7 @@ fn resolve_type<'a>(
             let Some(f) = profiles.get(&c.id).and_then(|p| p.fqn) else {
                 return false;
             };
-            caller_profile.imports.iter().any(|imp| *imp == f)
+            caller_profile.imports.contains(&f)
         })
         .collect();
     if hits.len() == 1 {
@@ -2637,7 +2637,7 @@ mod tests {
         (cls, m, edge)
     }
 
-    fn edges_of_kind<'a>(r: &'a Resolution, kind: EdgeKind) -> Vec<(&'a EntityId, &'a EntityId)> {
+    fn edges_of_kind(r: &Resolution, kind: EdgeKind) -> Vec<(&EntityId, &EntityId)> {
         r.patch
             .add_edges
             .iter()
@@ -2837,8 +2837,8 @@ mod tests {
             json!({"fqn": "com.a.Local", "implements": ["Handler"], "implements_full": ["Handler"]}),
         );
         let r = resolve_cross_stack(
-            &vec![h1.clone(), h2.clone(), local],
-            &vec![d1.clone(), d2.clone(), dl],
+            &[h1.clone(), h2.clone(), local],
+            &[d1.clone(), d2.clone(), dl],
         );
         let deps = edges_of_kind(&r, EdgeKind::DependsOn);
         let h1_id = EntityId::stable(
@@ -2871,7 +2871,7 @@ mod tests {
             json!({"fqn": "com.x.Wild", "imports": ["com.acme.*", "java.util.*"],
                    "implements": ["Handler"], "implements_full": ["Handler"]}),
         );
-        let r2 = resolve_cross_stack(&vec![w1, w2, wc], &vec![dw1, dw2, dwc]);
+        let r2 = resolve_cross_stack(&[w1, w2, wc], &[dw1, dw2, dwc]);
         let deps2 = edges_of_kind(&r2, EdgeKind::DependsOn);
         let w1_id = EntityId::stable(
             "workspace",

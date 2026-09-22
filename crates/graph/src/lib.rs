@@ -311,11 +311,10 @@ impl SqliteGraphStore {
         if let Ok(mut stmt) = self.connection.prepare(
             "SELECT name FROM sqlite_master WHERE type='table' \
              AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'entity_fts_%'",
-        ) {
-            if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
-                for t in rows.flatten() {
-                    tables.push(t);
-                }
+        ) && let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0))
+        {
+            for t in rows.flatten() {
+                tables.push(t);
             }
         }
         if tables.is_empty() {

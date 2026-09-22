@@ -790,7 +790,7 @@ fn resolve_database(
                 let hits: Vec<&(String, String)> = known
                     .iter()
                     .filter(|(_, p)| {
-                        p == &repo
+                        p == repo
                             || p.ends_with(&format!("/{repo}"))
                             || p.rsplit('/').next() == Some(repo)
                     })
@@ -1876,9 +1876,7 @@ fn trace_graph(
     // total_edges 与分页口径一致(此前 filter 在 map 之后,分页索引错位)。
     let visible: Vec<&Edge> = edges
         .iter()
-        .filter(|edge| {
-            edge.evidence.first().map(|i| i.confidence).unwrap_or(1.0) >= min_confidence as f32
-        })
+        .filter(|edge| edge.evidence.first().map(|i| i.confidence).unwrap_or(1.0) >= min_confidence)
         .collect();
     let edges_empty = visible.is_empty();
     let direction = if outbound {

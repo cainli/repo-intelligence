@@ -1811,6 +1811,7 @@ fn extract_jobs(
 /// - `execution(RET FQCN.method(..))`:存 FQCN.method 原文(支持通配 * 与 ..),analysis
 ///   层编译正则匹配
 /// - `"pcName()"`:引用同文件 @Pointcut 方法(先收集声明表再解引用,一级防环)
+///
 /// 其他形态(within/bean/组合表达式)存 pointcut_raw 供排查,不建边。
 fn extract_aspects(
     masked: &MaskedSource,
@@ -2997,9 +2998,8 @@ public abstract class Base implements TopIface {
         );
         let base = meta(EntityKind::Class, "Base");
         assert_eq!(base.get("abstract"), Some(&json!(true)));
-        assert_eq!(
+        assert!(
             base.get("superclass_full").is_none(),
-            true,
             "无 extends 时不得有 superclass_full"
         );
     }
