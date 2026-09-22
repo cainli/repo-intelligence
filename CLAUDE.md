@@ -73,7 +73,7 @@ sqlite3 "$DB" "SELECT json_extract(json,'\$.evidence[0].confidence'), COUNT(*) F
 ## 构建 / 测试
 
 - `cargo test` —— 全 workspace 单元/集成测试(**不替代**上面的真实项目验证)。
-- 版本号:根 `Cargo.toml` `[workspace.package] version`(当前 0.1.43),所有 crate `version.workspace = true`。
+- 版本号:根 `Cargo.toml` `[workspace.package] version`(当前 0.1.46),所有 crate `version.workspace = true`。
 
 ### mes-activity 反馈六项修复(v0.1.43,2026-09-22)
 
@@ -87,6 +87,15 @@ sqlite3 "$DB" "SELECT json_extract(json,'\$.evidence[0].confidence'), COUNT(*) F
 - **query_sql 错误近邻提示**(graph):`no such table/column` 带 levenshtein 建议与完整 schema 清单。
 - **INDEX_FORMAT 现为 4**——旧库升级首扫全量重提+重 embed(ruoyi 790 文件 ~90s 含 embedding 65s;doc 拉长 embedding 文本,比 0.1.42 的 ~20s 慢属预期)。回归基线:实体 7128 / 边 14889 / calls 3004(0.7:2976+0.5:28)与 0.1.42 逐字节一致;plus-ui 三项 11/45/0/490 全对齐。反馈误诊澄清:verify_edge "模糊匹配"实为 spring_bean 影子实体 rowid 盲取;implements "方向疑反"实为反向边(iface→class,正向边 kind 是 DependsOn)。
 - 提交风格:`release vX.Y.Z: ...`(见 git log)。
+
+### Windows 路径分隔符修复 + CI 三闸清偿(v0.1.44-0.1.46,2026-09-22)
+
+ci 三闸(fmt → clippy -D warnings → cargo test)**串行短路**,fmt 红遮蔽后面所有债两版——0.1.44 清偿时一次性冒出 clippy 六处(collapsible_if/doc_lazy_continuation/contains/useless_vec/op_ref/unnecessary_cast)+ 两个 **Windows-only 测试爆炸**,后者皆为真实产品缺陷:
+
+- **renders/component_ref 边 Windows 全丢**(0.1.45):vue_page `qualified_name` 是 `\` 分隔而 `resolve_import_spec` 恒产 `/`,`page_by_path` 键不归一精确匹配必失。已修:索引键 + spec/from_path 入口归一,`lookup_page` 随键类型;回归单测合成反斜杠实体,**任何平台可复现**(不再依赖 win runner 暴露)。plus-ui 11/45/0/490 与 ruoyi 7128/14889/3004 零漂移。
+- **repository 短名路由 Windows 全废**(0.1.46):manifest 存 canonicalize 产物(`\\?\C:\...` 前缀 + `\` 分隔),`ends_with("/x")` 三档全失配 → fail-loud 误报 "matched no indexed repository"。匹配提纯为纯函数 `manifest_path_matches`(剥前缀归一后三档比对)。
+- **已知残留(静默降级,非测试爆炸,待评估)**:`module_label` 聚类标签、source 排除目录首段检查同病;根修涉及 qualified_name 构造(**EntityId 哈希输入 = 索引格式级变更**),不可顺手改。
+- **发版规则**:版本已上 npm 的不可 force tag(403),重发一律升版本号;0.1.44 为中间版(仅 clippy 清偿),最终交付 0.1.46。
 
 ## 项目结构
 
