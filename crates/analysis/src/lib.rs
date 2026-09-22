@@ -968,7 +968,8 @@ fn aspectj_fqn_regex(pattern: &str) -> String {
     )
 }
 
-fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution {    let mut edges = Vec::new();
+fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution {
+    let mut edges = Vec::new();
     let mut ambiguities: Vec<AmbiguityNote> = Vec::new();
     let mut fields: HashMap<String, Vec<&Entity>> = HashMap::new();
     let mut endpoints = Vec::new();
@@ -1075,8 +1076,17 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
             .unwrap_or_default();
-        let package = fqn.and_then(|f| f.rsplit_once('.')).map(|(p, _)| p.to_string());
-        profile_by_id.insert(&entity.id, TypeProfile { fqn, imports, package });
+        let package = fqn
+            .and_then(|f| f.rsplit_once('.'))
+            .map(|(p, _)| p.to_string());
+        profile_by_id.insert(
+            &entity.id,
+            TypeProfile {
+                fqn,
+                imports,
+                package,
+            },
+        );
     }
     // 裸名 → 类+接口全量候选(implements/字段/静态/注入共用)。
     let type_candidates = |name: &str| -> Vec<&Entity> {
@@ -1276,15 +1286,13 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
         let merges: Vec<(&EntityId, &EntityId)> = entities
             .iter()
             .filter(|e| e.kind == EntityKind::Class)
-            .filter_map(
-                |sub| -> Option<(&EntityId, &EntityId)> {
-                    let sup_name = sub.metadata.get("superclass")?.as_str()?;
-                    let sup_full = sub.metadata.get("superclass_full").and_then(|v| v.as_str());
-                    let cands = classes_by_name_all.get(sup_name)?;
-                    let (sup_id, _) = resolve_type(&profile_by_id, sup_full, cands, sub)?;
-                    Some((&sub.id, sup_id))
-                },
-            )
+            .filter_map(|sub| -> Option<(&EntityId, &EntityId)> {
+                let sup_name = sub.metadata.get("superclass")?.as_str()?;
+                let sup_full = sub.metadata.get("superclass_full").and_then(|v| v.as_str());
+                let cands = classes_by_name_all.get(sup_name)?;
+                let (sup_id, _) = resolve_type(&profile_by_id, sup_full, cands, sub)?;
+                Some((&sub.id, sup_id))
+            })
             .collect();
         for (sub_id, sup_id) in merges {
             let Some(super_ms) = type_methods.get(sup_id).cloned() else {
@@ -1328,11 +1336,17 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
         let owner_entity = entity_by_id.get(owner_id).copied().unwrap_or(entity);
         // owner 可能无注入依赖(如纯静态工具调用 JsonUtil.stringify);injected 缺省为空,
         // 静态调用路径(receiver=类型名)不依赖它,不应被此处 continue 卡掉。
-        let injected: &[&str] = owner_injected.get(owner_id).map(Vec::as_slice).unwrap_or(&[]);
+        let injected: &[&str] = owner_injected
+            .get(owner_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         // owner 裸名跨包同名:仅记 note 供人工复核(按 holder+name 去重),不再阻断
         // 解析——三张表已 id 键化,同名类的条目不再互相污染,后续由 import 消歧兜底。
-        let owner_ambiguous =
-            type_name_owners.get(owner_entity.name.as_str()).copied().unwrap_or(0) > 1;
+        let owner_ambiguous = type_name_owners
+            .get(owner_entity.name.as_str())
+            .copied()
+            .unwrap_or(0)
+            > 1;
         if owner_ambiguous {
             let mut cands: Vec<&Entity> = Vec::new();
             if let Some(v) = classes_by_name_all.get(owner_entity.name.as_str()) {
@@ -1382,7 +1396,8 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
                 && let Some(&target_type) = field_map.get(rv)
             {
                 let cands = type_candidates(target_type);
-                if let Some((type_id, via)) = resolve_type(&profile_by_id, None, &cands, owner_entity)
+                if let Some((type_id, via)) =
+                    resolve_type(&profile_by_id, None, &cands, owner_entity)
                     && let Some(ms) = type_methods.get(type_id)
                     && let Some(&callee_id) = ms.get(callee_name)
                     && callee_id != &entity.id
@@ -1400,7 +1415,8 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
                 && let Some(rv) = receiver
             {
                 let cands = type_candidates(rv);
-                if let Some((type_id, via)) = resolve_type(&profile_by_id, None, &cands, owner_entity)
+                if let Some((type_id, via)) =
+                    resolve_type(&profile_by_id, None, &cands, owner_entity)
                     && let Some(ms) = type_methods.get(type_id)
                     && let Some(&callee_id) = ms.get(callee_name)
                     && callee_id != &entity.id
@@ -1416,7 +1432,9 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
                 let mut hits: Vec<&EntityId> = Vec::new();
                 for type_name in injected {
                     let cands = type_candidates(type_name);
-                    let Some((type_id, _)) = resolve_type(&profile_by_id, None, &cands, owner_entity) else {
+                    let Some((type_id, _)) =
+                        resolve_type(&profile_by_id, None, &cands, owner_entity)
+                    else {
                         continue;
                     };
                     if let Some(ms) = type_methods.get(type_id)
@@ -1476,8 +1494,12 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
             let Some(cands) = ifaces_by_name_all.get(iface_name) else {
                 continue; // 接口不在库内(第三方/未索引),与现状同:静默
             };
-            let Some((iface_id, _via)) = resolve_type(&profile_by_id, fulls.get(idx).copied().flatten(), cands, entity)
-            else {
+            let Some((iface_id, _via)) = resolve_type(
+                &profile_by_id,
+                fulls.get(idx).copied().flatten(),
+                cands,
+                entity,
+            ) else {
                 // 多候选且消歧全落空 → note(0 候选走不到这)
                 ambiguities.push(AmbiguityNote {
                     holder: entity.id.clone(),
@@ -1531,7 +1553,10 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
         let Some(superclass) = entity.metadata.get("superclass").and_then(|v| v.as_str()) else {
             continue;
         };
-        let sup_full = entity.metadata.get("superclass_full").and_then(|v| v.as_str());
+        let sup_full = entity
+            .metadata
+            .get("superclass_full")
+            .and_then(|v| v.as_str());
         let Some(cands) = classes_by_name_all.get(superclass) else {
             continue; // 超类不在库内,静默(与现状同)
         };
@@ -1898,9 +1923,10 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
             entities.iter().map(|e| (&e.id, e)).collect();
         let mut methods_of_class: HashMap<&EntityId, Vec<&Entity>> = HashMap::new();
         for edge in edges.iter().filter(|e| e.kind == EdgeKind::Declares) {
-            if let (Some(cls), Some(m)) =
-                (entity_by_id.get(&edge.source), entity_by_id.get(&edge.target))
-                && m.kind == EntityKind::Method
+            if let (Some(cls), Some(m)) = (
+                entity_by_id.get(&edge.source),
+                entity_by_id.get(&edge.target),
+            ) && m.kind == EntityKind::Method
             {
                 methods_of_class.entry(&cls.id).or_default().push(m);
             }
@@ -1912,10 +1938,7 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
             let Some(fqn) = java_fqn_of(cls).map(|s| s.to_string()) else {
                 continue;
             };
-            let methods = methods_of_class
-                .get(&cls.id)
-                .cloned()
-                .unwrap_or_default();
+            let methods = methods_of_class.get(&cls.id).cloned().unwrap_or_default();
             class_methods.push((fqn, methods));
         }
     }
@@ -1932,12 +1955,19 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
         }
         let mut targets: Vec<&Entity> = Vec::new();
         let reason;
-        if let Some(ann) = entity.metadata.get("pointcut_annotation").and_then(|v| v.as_str()) {
+        if let Some(ann) = entity
+            .metadata
+            .get("pointcut_annotation")
+            .and_then(|v| v.as_str())
+        {
             reason = format!("@annotation({ann})");
             if let Some(list) = methods_by_annotation.get(ann) {
                 targets.extend(list.iter().copied());
             }
-        } else if let Some(sig) = entity.metadata.get("pointcut_execution").and_then(|v| v.as_str())
+        } else if let Some(sig) = entity
+            .metadata
+            .get("pointcut_execution")
+            .and_then(|v| v.as_str())
         {
             reason = format!("execution({sig})");
             let Some((fqcn_pat, method_pat)) = sig.rsplit_once('.') else {
@@ -2022,7 +2052,11 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
                         .map(|v| v.as_slice())
                         .unwrap_or(&empty);
                     match cands {
-                        [one] => (*one, 0.4_f32, "Class.forName literal unique short-name fallback"),
+                        [one] => (
+                            *one,
+                            0.4_f32,
+                            "Class.forName literal unique short-name fallback",
+                        ),
                         _ => continue,
                     }
                 }
@@ -2519,7 +2553,10 @@ mod tests {
 
     #[test]
     fn aspectj_regex_exact_pattern_is_literal() {
-        let re = Regex::new(&aspectj_fqn_regex("com.ruoyi.web.controller.SysUserController")).unwrap();
+        let re = Regex::new(&aspectj_fqn_regex(
+            "com.ruoyi.web.controller.SysUserController",
+        ))
+        .unwrap();
         assert!(re.is_match("com.ruoyi.web.controller.SysUserController"));
         assert!(!re.is_match("com.ruoyi.web.controller.other.SysUserController"));
     }
@@ -2539,7 +2576,10 @@ mod tests {
             )
             .with_metadata(serde_json::Value::Object(meta))
         };
-        assert_eq!(java_fqn_of(&mk(Some("org.dromara.common.log.aspect.LogAspect"))), Some("org.dromara.common.log.aspect.LogAspect"));
+        assert_eq!(
+            java_fqn_of(&mk(Some("org.dromara.common.log.aspect.LogAspect"))),
+            Some("org.dromara.common.log.aspect.LogAspect")
+        );
         assert_eq!(java_fqn_of(&mk(None)), None);
     }
 
@@ -2547,7 +2587,12 @@ mod tests {
     // mod1/mod2 各有同名接口 Handler(git submodule 双 SDK 拷贝形态),消歧阶梯须
     // 按 fqn/import/同包/通配唯一落位;无可用信号的调用方仍拒边 + note。
 
-    fn iface_with_method(path: &str, pkg: &str, name: &str, method: &str) -> (Entity, Entity, Edge) {
+    fn iface_with_method(
+        path: &str,
+        pkg: &str,
+        name: &str,
+        method: &str,
+    ) -> (Entity, Entity, Edge) {
         let iface = Entity::new(
             EntityId::stable("workspace", path, EntityKind::Interface, name, ""),
             EntityKind::Interface,
@@ -2605,8 +2650,18 @@ mod tests {
     /// 旧库形态)两档都应把 implements 唯一落到 mod1 的 Handler;无 import 对照类拒边+note。
     #[test]
     fn duplicate_interfaces_resolved_by_fqn_and_import_tiers() {
-        let (h1, _, d1) = iface_with_method("mod1/src/main/java/com/a/Handler.java", "com.a", "Handler", "handle");
-        let (h2, _, d2) = iface_with_method("mod2/src/main/java/com/b/Handler.java", "com.b", "Handler", "handle");
+        let (h1, _, d1) = iface_with_method(
+            "mod1/src/main/java/com/a/Handler.java",
+            "com.a",
+            "Handler",
+            "handle",
+        );
+        let (h2, _, d2) = iface_with_method(
+            "mod2/src/main/java/com/b/Handler.java",
+            "com.b",
+            "Handler",
+            "handle",
+        );
         // ImplA:fqn exact 档
         let (ia, _, da) = class_with_method(
             "svc1/src/main/java/com/c/ImplA.java",
@@ -2634,10 +2689,23 @@ mod tests {
         let extract_edges = vec![d1, d2, da, db, dc];
         let r = resolve_cross_stack(&entities, &extract_edges);
         let deps = edges_of_kind(&r, EdgeKind::DependsOn);
-        let h1_id = EntityId::stable("workspace", "mod1/src/main/java/com/a/Handler.java", EntityKind::Interface, "Handler", "");
+        let h1_id = EntityId::stable(
+            "workspace",
+            "mod1/src/main/java/com/a/Handler.java",
+            EntityKind::Interface,
+            "Handler",
+            "",
+        );
         assert_eq!(deps.len(), 2, "ImplA/ImplB 各连一条: {deps:?}");
-        assert!(deps.iter().all(|(_, t)| **t == h1_id), "两条都应落 mod1 副本");
-        let notes: Vec<_> = r.ambiguities.iter().filter(|n| n.kind == "implements").collect();
+        assert!(
+            deps.iter().all(|(_, t)| **t == h1_id),
+            "两条都应落 mod1 副本"
+        );
+        let notes: Vec<_> = r
+            .ambiguities
+            .iter()
+            .filter(|n| n.kind == "implements")
+            .collect();
         assert_eq!(notes.len(), 1, "仅 ImplC 记 note");
         assert_eq!(notes[0].name, "Handler");
         assert_eq!(notes[0].candidates.len(), 2);
@@ -2646,12 +2714,24 @@ mod tests {
     /// 字段路径 0.7 双拷贝消歧 + 接口分发桥接落实现方法(消歧后 iface id 精确)。
     #[test]
     fn field_calls_and_interface_dispatch_resolve_across_copies() {
-        let (h1, hm1, d1) = iface_with_method("mod1/src/main/java/com/a/Handler.java", "com.a", "Handler", "handle");
-        let (h2, hm2, d2) = iface_with_method("mod2/src/main/java/com/b/Handler.java", "com.b", "Handler", "handle");
+        let (h1, hm1, d1) = iface_with_method(
+            "mod1/src/main/java/com/a/Handler.java",
+            "com.a",
+            "Handler",
+            "handle",
+        );
+        let (h2, hm2, d2) = iface_with_method(
+            "mod2/src/main/java/com/b/Handler.java",
+            "com.b",
+            "Handler",
+            "handle",
+        );
         let svc = "svc1/src/main/java/com/c/ImplA.java";
         let impl_a = Entity::new(
             EntityId::stable("workspace", svc, EntityKind::Class, "ImplA", ""),
-            EntityKind::Class, "ImplA", "ImplA",
+            EntityKind::Class,
+            "ImplA",
+            "ImplA",
         )
         .with_metadata(json!({
             "fqn": "com.c.ImplA", "imports": ["com.a.Handler"],
@@ -2667,32 +2747,69 @@ mod tests {
         .with_evidence(svc, 4, 4, EvidenceClass::Fact, 1.0, "method");
         let impl_handle = Entity::new(
             EntityId::stable("workspace", svc, EntityKind::Method, "handle", ""),
-            EntityKind::Method, "handle", "handle",
+            EntityKind::Method,
+            "handle",
+            "handle",
         )
         .with_evidence(svc, 6, 6, EvidenceClass::Fact, 1.0, "method");
         // SpringBean(name=被注入类型名)
         let bean = Entity::new(
             EntityId::stable("workspace", svc, EntityKind::SpringBean, "Handler", ""),
-            EntityKind::SpringBean, "Handler", "Handler",
+            EntityKind::SpringBean,
+            "Handler",
+            "Handler",
         );
         let extract_edges = vec![
-            d1, d2,
+            d1,
+            d2,
             Edge::new(impl_a.id.clone(), run.id.clone(), EdgeKind::Declares),
-            Edge::new(impl_a.id.clone(), impl_handle.id.clone(), EdgeKind::Declares),
+            Edge::new(
+                impl_a.id.clone(),
+                impl_handle.id.clone(),
+                EdgeKind::Declares,
+            ),
             Edge::new(impl_a.id.clone(), bean.id.clone(), EdgeKind::Injects),
         ];
-        let entities = vec![h1, h2, hm1, hm2, impl_a.clone(), run.clone(), impl_handle.clone(), bean];
+        let entities = vec![
+            h1,
+            h2,
+            hm1,
+            hm2,
+            impl_a.clone(),
+            run.clone(),
+            impl_handle.clone(),
+            bean,
+        ];
         let r = resolve_cross_stack(&entities, &extract_edges);
         let calls = edges_of_kind(&r, EdgeKind::Calls);
-        eprintln!("DEBUG all edges: {:?}", r.patch.add_edges.iter().map(|e| (format!("{:?}", e.kind), e.source.to_string(), e.target.to_string())).collect::<Vec<_>>());
+        eprintln!(
+            "DEBUG all edges: {:?}",
+            r.patch
+                .add_edges
+                .iter()
+                .map(|e| (
+                    format!("{:?}", e.kind),
+                    e.source.to_string(),
+                    e.target.to_string()
+                ))
+                .collect::<Vec<_>>()
+        );
         eprintln!("DEBUG notes: {:?}", r.ambiguities);
-        let h1_handle = EntityId::stable("workspace", "mod1/src/main/java/com/a/Handler.java", EntityKind::Method, "handle", "");
+        let h1_handle = EntityId::stable(
+            "workspace",
+            "mod1/src/main/java/com/a/Handler.java",
+            EntityKind::Method,
+            "handle",
+            "",
+        );
         assert!(
             calls.iter().any(|(s, t)| **s == run.id && **t == h1_handle),
             "字段路径 0.7 应落 mod1 副本: {calls:?}"
         );
         assert!(
-            calls.iter().any(|(s, t)| **s == h1_handle && **t == impl_handle.id),
+            calls
+                .iter()
+                .any(|(s, t)| **s == h1_handle && **t == impl_handle.id),
             "接口分发应桥到 ImplA.handle: {calls:?}"
         );
     }
@@ -2700,8 +2817,18 @@ mod tests {
     /// 同包档(无 import)与通配档(`com.acme.*` 在 com.acme/com.acme2 双候选下唯一命中)。
     #[test]
     fn same_package_and_wildcard_tiers() {
-        let (h1, _, d1) = iface_with_method("mod1/src/main/java/com/a/Handler.java", "com.a", "Handler", "handle");
-        let (h2, _, d2) = iface_with_method("mod2/src/main/java/com/b/Handler.java", "com.b", "Handler", "handle");
+        let (h1, _, d1) = iface_with_method(
+            "mod1/src/main/java/com/a/Handler.java",
+            "com.a",
+            "Handler",
+            "handle",
+        );
+        let (h2, _, d2) = iface_with_method(
+            "mod2/src/main/java/com/b/Handler.java",
+            "com.b",
+            "Handler",
+            "handle",
+        );
         // 同包:Local 在 com.a 包,无 import
         let (local, _, dl) = class_with_method(
             "mod1/src/main/java/com/a/Local.java",
@@ -2709,15 +2836,34 @@ mod tests {
             "run",
             json!({"fqn": "com.a.Local", "implements": ["Handler"], "implements_full": ["Handler"]}),
         );
-        let r = resolve_cross_stack(&vec![h1.clone(), h2.clone(), local], &vec![d1.clone(), d2.clone(), dl]);
+        let r = resolve_cross_stack(
+            &vec![h1.clone(), h2.clone(), local],
+            &vec![d1.clone(), d2.clone(), dl],
+        );
         let deps = edges_of_kind(&r, EdgeKind::DependsOn);
-        let h1_id = EntityId::stable("workspace", "mod1/src/main/java/com/a/Handler.java", EntityKind::Interface, "Handler", "");
+        let h1_id = EntityId::stable(
+            "workspace",
+            "mod1/src/main/java/com/a/Handler.java",
+            EntityKind::Interface,
+            "Handler",
+            "",
+        );
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].1, &h1_id, "同包档落 com.a 副本");
 
         // 通配:com.acme.* 在 com.acme/com.acme2 双候选下唯一命中前者
-        let (w1, _, dw1) = iface_with_method("w1/src/main/java/com/acme/Handler.java", "com.acme", "Handler", "handle");
-        let (w2, _, dw2) = iface_with_method("w2/src/main/java/com/acme2/Handler.java", "com.acme2", "Handler", "handle");
+        let (w1, _, dw1) = iface_with_method(
+            "w1/src/main/java/com/acme/Handler.java",
+            "com.acme",
+            "Handler",
+            "handle",
+        );
+        let (w2, _, dw2) = iface_with_method(
+            "w2/src/main/java/com/acme2/Handler.java",
+            "com.acme2",
+            "Handler",
+            "handle",
+        );
         let (wc, _, dwc) = class_with_method(
             "wc/src/main/java/com/x/Wild.java",
             "Wild",
@@ -2727,7 +2873,13 @@ mod tests {
         );
         let r2 = resolve_cross_stack(&vec![w1, w2, wc], &vec![dw1, dw2, dwc]);
         let deps2 = edges_of_kind(&r2, EdgeKind::DependsOn);
-        let w1_id = EntityId::stable("workspace", "w1/src/main/java/com/acme/Handler.java", EntityKind::Interface, "Handler", "");
+        let w1_id = EntityId::stable(
+            "workspace",
+            "w1/src/main/java/com/acme/Handler.java",
+            EntityKind::Interface,
+            "Handler",
+            "",
+        );
         assert_eq!(deps2.len(), 1);
         assert_eq!(deps2[0].1, &w1_id, "通配档应落 com.acme(不带 2)");
     }

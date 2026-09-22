@@ -325,11 +325,8 @@ impl SqliteGraphStore {
         tables.dedup(); // 防御:个别环境下 sqlite_master 重名行会让提示清单翻倍
         let mut columns: Vec<(String, String)> = Vec::new(); // (table, column)
         for t in &tables {
-            if let Ok(mut stmt) = self
-                .connection
-                .prepare(&format!("PRAGMA table_info({t})"))
-                && let Ok(rows) =
-                    stmt.query_map([], |r| r.get::<_, String>(1))
+            if let Ok(mut stmt) = self.connection.prepare(&format!("PRAGMA table_info({t})"))
+                && let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(1))
             {
                 for c in rows.flatten() {
                     columns.push((t.clone(), c));
@@ -1168,9 +1165,16 @@ mod tests {
             .read_only_query("SELECT edge_kind FROM edge LIMIT 1", 100)
             .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("Did you mean `kind` (in table edge or entity"), "{msg}");
+        assert!(
+            msg.contains("Did you mean `kind` (in table edge or entity"),
+            "{msg}"
+        );
         // 正常查询不受影响
-        assert!(store.read_only_query("SELECT COUNT(*) FROM entity", 10).is_ok());
+        assert!(
+            store
+                .read_only_query("SELECT COUNT(*) FROM entity", 10)
+                .is_ok()
+        );
     }
 
     #[test]

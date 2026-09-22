@@ -1167,7 +1167,8 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
             // 首建库后登记 manifest(resolve_database 只在库已存在时写,防查询类调用污染
             // registry;scan 是合法的登记时机)。
             if let Ok(canon) = std::fs::canonicalize(repository) {
-                let id = blake3::hash(canon.to_string_lossy().as_bytes()).to_hex()[..16].to_string();
+                let id =
+                    blake3::hash(canon.to_string_lossy().as_bytes()).to_hex()[..16].to_string();
                 record_manifest(base, &id, &canon);
             }
             // Echo the resulting kind distribution and the effective exclusion
@@ -1813,7 +1814,11 @@ fn trace_graph(
                 "No entity is exactly named `{name}`. The start point is resolved by exact \
                  name (not substring), then the {direction} edges of kind {kinds} are walked. \
                  Run search_entities to find the precise identifier.",
-                direction = if outbound { "outbound (callees)" } else { "inbound (callers)" },
+                direction = if outbound {
+                    "outbound (callees)"
+                } else {
+                    "inbound (callers)"
+                },
                 kinds = kinds_label(&edge_kinds),
             )
         };
@@ -2350,7 +2355,10 @@ mod tests {
         .unwrap();
         assert_eq!(db_none, std::path::PathBuf::from("fallback.sqlite"));
         // 库不存在时路由不登记 manifest(防查询类调用污染 registry)
-        assert_eq!(list_repositories(base.path(), None).unwrap()["count"].as_u64(), Some(0));
+        assert_eq!(
+            list_repositories(base.path(), None).unwrap()["count"].as_u64(),
+            Some(0)
+        );
     }
 
     /// P0-2 fail-loud:repository 传无效短名 → 显式报错列出可用值,不再哈希成隐身空库。
@@ -2381,24 +2389,21 @@ mod tests {
         let canon = std::fs::canonicalize(repo.path()).unwrap();
         let id = blake3::hash(canon.to_string_lossy().as_bytes()).to_hex()[..16].to_string();
         std::fs::create_dir_all(base.path().join("repos")).unwrap();
-        std::fs::write(
-            base.path().join("repos").join(format!("{id}.sqlite")),
-            b"",
-        )
-        .unwrap();
+        std::fs::write(base.path().join("repos").join(format!("{id}.sqlite")), b"").unwrap();
         record_manifest(base.path(), &id, &canon);
         // 尾段短名(目录 basename)→ 解析到同一库路径
-        let short = repo.path().file_name().unwrap().to_string_lossy().to_string();
-        let db = resolve_database(
-            &json!({"repository": short}),
-            base.path(),
-            None,
-        )
-        .unwrap();
+        let short = repo
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let db = resolve_database(&json!({"repository": short}), base.path(), None).unwrap();
         assert_eq!(db, base.path().join("repos").join(format!("{id}.sqlite")));
         // 单库模式(无 manifest 时)回退 default 条目
         let empty_base = tempfile::tempdir().unwrap();
-        let list = list_repositories(empty_base.path(), Some(std::path::Path::new("ws.sqlite"))).unwrap();
+        let list =
+            list_repositories(empty_base.path(), Some(std::path::Path::new("ws.sqlite"))).unwrap();
         assert_eq!(list["count"].as_u64(), Some(1));
         assert_eq!(list["repositories"][0]["repo_id"], "default");
         assert_eq!(list["repositories"][0]["repo_path"], "ws.sqlite");
@@ -2611,7 +2616,13 @@ mod tests {
         fs::write(dir.path().join("SomeTest.java"), "// 注入方测试文件\n").unwrap();
         let mut store = SqliteGraphStore::open_in_memory().unwrap();
         let real = Entity::new(
-            EntityId::stable("w", "RealSvc.java", EntityKind::Class, "EquityClaimOuterService", ""),
+            EntityId::stable(
+                "w",
+                "RealSvc.java",
+                EntityKind::Class,
+                "EquityClaimOuterService",
+                "",
+            ),
             EntityKind::Class,
             "EquityClaimOuterService",
             "EquityClaimOuterService",
@@ -2620,12 +2631,25 @@ mod tests {
         // 影子 spring_bean:name = 被注入字段类型名,evidence 锚在注入方(测试文件);
         // 先插入——旧实现的 rowid 顺序下它会赢。
         let shadow = Entity::new(
-            EntityId::stable("w", "SomeTest.java", EntityKind::SpringBean, "EquityClaimOuterService", ""),
+            EntityId::stable(
+                "w",
+                "SomeTest.java",
+                EntityKind::SpringBean,
+                "EquityClaimOuterService",
+                "",
+            ),
             EntityKind::SpringBean,
             "EquityClaimOuterService",
             "EquityClaimOuterService",
         )
-        .with_evidence("SomeTest.java", 2, 2, EvidenceClass::Fact, 0.9, "injected field");
+        .with_evidence(
+            "SomeTest.java",
+            2,
+            2,
+            EvidenceClass::Fact,
+            0.9,
+            "injected field",
+        );
         store
             .apply_patch(GraphPatch::add(vec![shadow, real], vec![]))
             .unwrap();
@@ -2637,7 +2661,10 @@ mod tests {
             root,
         )
         .unwrap();
-        assert_eq!(out["resolved"]["kind"], "class", "应解析到声明类而非影子 bean: {out}");
+        assert_eq!(
+            out["resolved"]["kind"], "class",
+            "应解析到声明类而非影子 bean: {out}"
+        );
         assert_eq!(out["resolved"]["file"], "RealSvc.java");
         assert_eq!(out["candidates"].as_array().unwrap().len(), 2, "多候选回显");
         assert!(out["note"].as_str().unwrap().contains("matched 2 entities"));
@@ -2648,31 +2675,53 @@ mod tests {
     #[test]
     fn trace_emits_nodes_lookup_for_edge_endpoints() {
         let mut store = SqliteGraphStore::open_in_memory().unwrap();
-        let svc = Entity::new(id("svc"), EntityKind::Class, "Svc", "com.x.Svc")
-            .with_evidence("Svc.java", 1, 1, EvidenceClass::Fact, 1.0, "declared");
-        let svc_m = Entity::new(id("svc.m"), EntityKind::Method, "doWork", "Svc#doWork")
-            .with_evidence("Svc.java", 2, 2, EvidenceClass::Fact, 1.0, "declared");
-        let edges = vec![Edge::new(id("svc"), id("svc.m"), EdgeKind::Declares).with_evidence(
+        let svc = Entity::new(id("svc"), EntityKind::Class, "Svc", "com.x.Svc").with_evidence(
             "Svc.java",
             1,
             1,
             EvidenceClass::Fact,
             1.0,
-            "declares",
-        )];
+            "declared",
+        );
+        let svc_m = Entity::new(id("svc.m"), EntityKind::Method, "doWork", "Svc#doWork")
+            .with_evidence("Svc.java", 2, 2, EvidenceClass::Fact, 1.0, "declared");
+        let edges = vec![
+            Edge::new(id("svc"), id("svc.m"), EdgeKind::Declares).with_evidence(
+                "Svc.java",
+                1,
+                1,
+                EvidenceClass::Fact,
+                1.0,
+                "declares",
+            ),
+        ];
         store
             .apply_patch(GraphPatch::add(vec![svc, svc_m], edges))
             .unwrap();
         let kinds = vec![EdgeKind::Declares];
         // 紧凑档:nodes 表存在,边页两端点都有条目
-        let compact = trace_graph(&store, "Svc", 1, kinds.clone(), true, 0.0, 50, 0, None, false)
-            .unwrap();
+        let compact = trace_graph(
+            &store,
+            "Svc",
+            1,
+            kinds.clone(),
+            true,
+            0.0,
+            50,
+            0,
+            None,
+            false,
+        )
+        .unwrap();
         let nodes = compact["nodes"].as_object().expect("nodes 查找表存在");
         assert_eq!(nodes.len(), 2, "一条边两个端点: {nodes:?}");
-        assert!(nodes.values().all(|n| n["qualified_name"].is_string() && n["file"].is_string()));
+        assert!(
+            nodes
+                .values()
+                .all(|n| n["qualified_name"].is_string() && n["file"].is_string())
+        );
         // verbose 档:items 已全量带名字,nodes 不发
-        let verbose =
-            trace_graph(&store, "Svc", 1, kinds, true, 0.0, 50, 0, None, true).unwrap();
+        let verbose = trace_graph(&store, "Svc", 1, kinds, true, 0.0, 50, 0, None, true).unwrap();
         assert!(verbose["nodes"].is_null(), "verbose 档不重复发 nodes");
     }
 

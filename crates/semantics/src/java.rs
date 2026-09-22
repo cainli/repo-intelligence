@@ -121,8 +121,9 @@ static PC_REF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\w+)\s*\(\s*\)$
 static CONST_STRING: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"final\s+String\s+([A-Za-z_]\w*)\s*=\s*"([^"]*)""#).unwrap());
 // Class.forName(字面量 | 常量标识符)。code 掩码上。
-static FOR_NAME: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"Class\s*\.\s*forName\s*\(\s*(?:"([^"]+)"|([A-Za-z_]\w*))\s*\)"#).unwrap());
+static FOR_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"Class\s*\.\s*forName\s*\(\s*(?:"([^"]+)"|([A-Za-z_]\w*))\s*\)"#).unwrap()
+});
 /// 文件路径 → 类 FQN:src/main/java 或 src/test/java 标记后段目录→包,文件名须与类名
 /// 一致(一个文件多类时非 public 类不可采信)。非标布局返回 None,调用端不写 fqn——
 /// 跨文件消解(execution/反射)宁缺毋滥。Windows 反斜杠先归一。
@@ -1252,7 +1253,8 @@ fn scan_type_headers(bare: &str) -> Vec<TypeHeader> {
             .map(|imp| parse_type_list(&tokens, imp + 1, tokens.len()))
             .unwrap_or_default();
         let to_pairs = |fulls: Vec<String>| {
-            fulls.into_iter()
+            fulls
+                .into_iter()
                 .map(|f| {
                     let simple = simple_name_of(&f).to_string();
                     (simple, f)
@@ -1832,10 +1834,7 @@ fn extract_aspects(
         };
         // @Pointcut 方法引用解引用(一级)。
         let pointcut_expr = match PC_REF.captures(&pointcut_expr) {
-            Some(ref_m) => pc_defs
-                .get(&ref_m[1])
-                .cloned()
-                .unwrap_or(pointcut_expr),
+            Some(ref_m) => pc_defs.get(&ref_m[1]).cloned().unwrap_or(pointcut_expr),
             None => pointcut_expr,
         };
         let Some((_, method_id)) = method_spans
@@ -1855,10 +1854,13 @@ fn extract_aspects(
             .and_then(|param| {
                 let end = (ann_offset + 500).min(masked.code.len());
                 let window = &masked.code[ann_offset..end];
-                Regex::new(&format!(r"([A-Za-z_]\w*)\s+{}\s*[,)]", regex::escape(&param)))
-                    .ok()?
-                    .captures(window)
-                    .map(|c| c[1].to_string())
+                Regex::new(&format!(
+                    r"([A-Za-z_]\w*)\s+{}\s*[,)]",
+                    regex::escape(&param)
+                ))
+                .ok()?
+                .captures(window)
+                .map(|c| c[1].to_string())
             });
         let mut meta_patch = serde_json::Map::new();
         meta_patch.insert("aspect_advice".into(), json!(true));
@@ -2735,14 +2737,13 @@ public class LogAspect {
 "#;
         let path = "src/main/java/org/dromara/log/aspect/LogAspect.java";
         let masked = mask_java(src);
-        let id = EntityId::stable(
-            "workspace",
-            path,
+        let id = EntityId::stable("workspace", path, EntityKind::Method, "doAround", "");
+        let mut entities = vec![Entity::new(
+            id.clone(),
             EntityKind::Method,
             "doAround",
-            "",
-        );
-        let mut entities = vec![Entity::new(id.clone(), EntityKind::Method, "doAround", "doAround")];
+            "doAround",
+        )];
         let method_spans = vec![(src.find("doAround").unwrap(), id)];
         extract_aspects(&masked, &method_spans, &mut entities, &mut Vec::new());
         let meta = &entities[0].metadata;
@@ -2783,9 +2784,11 @@ public class DataScopeAspect {
         let mut entities = vec![mk("dataScopePoint"), mk("doBefore"), mk("aroundAll")];
         let method_spans: Vec<(usize, EntityId)> = ["dataScopePoint", "doBefore", "aroundAll"]
             .iter()
-            .map(|n| (src.find(n).unwrap(), {
-                EntityId::stable("workspace", path, EntityKind::Method, n, "")
-            }))
+            .map(|n| {
+                (src.find(n).unwrap(), {
+                    EntityId::stable("workspace", path, EntityKind::Method, n, "")
+                })
+            })
             .collect();
         extract_aspects(&masked, &method_spans, &mut entities, &mut Vec::new());
         let meta = |name: &str| {
@@ -2798,14 +2801,18 @@ public class DataScopeAspect {
         };
         // @Pointcut 引用解引用到 @annotation(参数名) → 消解类型
         assert_eq!(
-            meta("doBefore").get("pointcut_annotation").and_then(|v| v.as_str()),
+            meta("doBefore")
+                .get("pointcut_annotation")
+                .and_then(|v| v.as_str()),
             Some("DataScope"),
             "{:?}",
             meta("doBefore")
         );
         // execution 通配原文保留(匹配在 analysis 层)
         assert_eq!(
-            meta("aroundAll").get("pointcut_execution").and_then(|v| v.as_str()),
+            meta("aroundAll")
+                .get("pointcut_execution")
+                .and_then(|v| v.as_str()),
             Some("com.ruoyi..*Service.add*"),
             "{:?}",
             meta("aroundAll")
@@ -2829,7 +2836,12 @@ public class AnnotationUtils {
         let path = "src/main/java/org/dromara/AnnotationUtils.java";
         let masked = mask_java(src);
         let id = EntityId::stable("workspace", path, EntityKind::Method, "resolve", "");
-        let mut entities = vec![Entity::new(id.clone(), EntityKind::Method, "resolve", "resolve")];
+        let mut entities = vec![Entity::new(
+            id.clone(),
+            EntityKind::Method,
+            "resolve",
+            "resolve",
+        )];
         let method_spans = vec![(src.find("resolve").unwrap(), id)];
         extract_reflection(&masked, &method_spans, &mut entities);
         let reflects = entities[0]
@@ -2840,7 +2852,11 @@ public class AnnotationUtils {
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(reflects, vec!["a.b.Constant", "a.b.Direct"], "常量解引用 + 字面量 + 去重");
+        assert_eq!(
+            reflects,
+            vec!["a.b.Constant", "a.b.Direct"],
+            "常量解引用 + 字面量 + 去重"
+        );
     }
 
     // ---- 类型头平衡扫描器(scan_type_headers):mes-activity 反馈的四类正则缺陷 ----
@@ -2863,9 +2879,7 @@ public class AnnotationUtils {
     /// FQCN 接口合法保留(旧正则整条丢弃),simple/full 平行。
     #[test]
     fn scanner_fqcn_interfaces_kept_whole() {
-        let headers = scan_type_headers(
-            "class Svc implements com.acme.ISvc, LocalIface<Gen> {\n}",
-        );
+        let headers = scan_type_headers("class Svc implements com.acme.ISvc, LocalIface<Gen> {\n}");
         assert_eq!(
             headers[0].implements,
             vec![
@@ -2894,9 +2908,15 @@ public class AnnotationUtils {
     #[test]
     fn scanner_interface_extends_ignored_enum_implements_kept() {
         let ifaces = scan_type_headers("interface BaseMapper<T> extends Mapper<T> {\n}");
-        assert_eq!(ifaces[0].superclass, None, "interface 多继承不采 superclass");
+        assert_eq!(
+            ifaces[0].superclass, None,
+            "interface 多继承不采 superclass"
+        );
         let enums = scan_type_headers("enum Color implements Named {\n  RED, GREEN;\n}");
-        assert_eq!(enums[0].implements, vec![("Named".to_string(), "Named".to_string())]);
+        assert_eq!(
+            enums[0].implements,
+            vec![("Named".to_string(), "Named".to_string())]
+        );
     }
 
     /// sealed permits 子句不属于 implements;同文件两个类不互相偷取(旧正则
@@ -2907,9 +2927,18 @@ public class AnnotationUtils {
             "class Foo implements I1 permits S {\n}\nclass Bar {\n}\nclass Baz implements I2 {\n}",
         );
         assert_eq!(headers.len(), 3);
-        assert_eq!(headers[0].implements, vec![("I1".to_string(), "I1".to_string())]);
-        assert!(headers[1].implements.is_empty(), "Bar 无 implements,不得偷取 Baz 的");
-        assert_eq!(headers[2].implements, vec![("I2".to_string(), "I2".to_string())]);
+        assert_eq!(
+            headers[0].implements,
+            vec![("I1".to_string(), "I1".to_string())]
+        );
+        assert!(
+            headers[1].implements.is_empty(),
+            "Bar 无 implements,不得偷取 Baz 的"
+        );
+        assert_eq!(
+            headers[2].implements,
+            vec![("I2".to_string(), "I2".to_string())]
+        );
     }
 
     /// 全链路:enum 产实体(kind=Enum)、implements/abstract 按 offset 精确绑定到
@@ -2950,7 +2979,10 @@ public abstract class Base implements TopIface {
         // enum 产实体 + implements
         let color = meta(EntityKind::Enum, "Color");
         assert_eq!(
-            color.get("implements").and_then(|v| v.as_array()).map(|a| a.len()),
+            color
+                .get("implements")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
             Some(1),
             "enum 实体应产且带 implements: {color}"
         );
@@ -3002,7 +3034,14 @@ public class EventChainService {
         };
         let mut entities = Vec::new();
         let mut edges = Vec::new();
-        extract_java(&file, path, &mut entities, &mut edges, &SemanticsConfig::default()).unwrap();
+        extract_java(
+            &file,
+            path,
+            &mut entities,
+            &mut edges,
+            &SemanticsConfig::default(),
+        )
+        .unwrap();
         let meta = |kind: EntityKind, name: &str| {
             entities
                 .iter()
@@ -3051,7 +3090,14 @@ public class StateMachine {{
         };
         let mut entities = Vec::new();
         let mut edges = Vec::new();
-        extract_java(&file, path, &mut entities, &mut edges, &SemanticsConfig::default()).unwrap();
+        extract_java(
+            &file,
+            path,
+            &mut entities,
+            &mut edges,
+            &SemanticsConfig::default(),
+        )
+        .unwrap();
         let cls = entities
             .iter()
             .find(|e| e.kind == EntityKind::Class && e.name == "StateMachine")
@@ -3067,6 +3113,10 @@ public class StateMachine {{
             .find(|e| e.kind == EntityKind::Method && e.name == "tick")
             .expect("tick");
         let doc = tick.metadata.get("doc").and_then(|v| v.as_str()).unwrap();
-        assert!(doc.chars().count() <= 160, "doc 须截断到 160 chars, got {}", doc.chars().count());
+        assert!(
+            doc.chars().count() <= 160,
+            "doc 须截断到 160 chars, got {}",
+            doc.chars().count()
+        );
     }
 }
