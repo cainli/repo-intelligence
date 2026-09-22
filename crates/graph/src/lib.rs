@@ -13,6 +13,24 @@ pub struct EntityMatch {
     pub score: f32,
 }
 
+/// 编辑距离(lenvenshtein,64 字符截断足够做 schema 近邻提示)。
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().take(64).collect();
+    let b: Vec<char> = b.chars().take(64).collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            cur[j] = (prev[j] + 1)
+                .min(cur[j - 1] + 1)
+                .min(prev[j - 1] + usize::from(a[i - 1] != b[j - 1]));
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Traversal {
     pub entities: Vec<Entity>,
@@ -228,7 +246,10 @@ impl SqliteGraphStore {
 
     fn run_select(&self, sql: &str, max_rows: usize) -> Result<QueryResult> {
         use rusqlite::types::ValueRef;
-        let mut stmt = self.connection.prepare(sql)?;
+        let mut stmt = self
+            .connection
+            .prepare(sql)
+            .map_err(|e| self.hint_schema_error(e))?;
         let columns: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
         let mut rows = Vec::new();
         let mut truncated = false;
@@ -264,6 +285,100 @@ impl SqliteGraphStore {
             rows,
             truncated,
         })
+    }
+
+    /// schema 可发现性(mes-activity 反馈 P2-6):表名单数(entity/edge)、判别列叫
+    /// kind(非 edge_kind),首猜必错且 SQLite 的 "no such table: edges" 裸透传无任何
+    /// 提示。prepare 失败且消息含 no such table/column 时,读真实 schema 做最近邻提示
+    /// 重写错误文案。零 tools/list 成本(不占 description),列名错误自动同覆盖。
+    fn hint_schema_error(&self, err: rusqlite::Error) -> anyhow::Error {
+        let msg = err.to_string();
+        let lower = msg.to_ascii_lowercase();
+        if !lower.contains("no such table") && !lower.contains("no such column") {
+            return err.into();
+        }
+        // 被拒名字:列错误消息带 SQL 上下文后缀("no such column: edge_kind in SELECT …
+        // at offset 7"),取 ':' 后第一个空白前 token;表错误("no such table: edges")
+        // 同样兼容。
+        let rejected = msg
+            .split(':')
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .map(|s| s.trim_matches('\'').to_string())
+            .unwrap_or_default();
+        // 真实 schema:表清单(FTS shadow 表过滤)+ 各表列名。
+        let mut tables: Vec<String> = Vec::new();
+        if let Ok(mut stmt) = self.connection.prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' \
+             AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'entity_fts_%'",
+        ) {
+            if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+                for t in rows.flatten() {
+                    tables.push(t);
+                }
+            }
+        }
+        if tables.is_empty() {
+            return err.into();
+        }
+        tables.sort();
+        tables.dedup(); // 防御:个别环境下 sqlite_master 重名行会让提示清单翻倍
+        let mut columns: Vec<(String, String)> = Vec::new(); // (table, column)
+        for t in &tables {
+            if let Ok(mut stmt) = self
+                .connection
+                .prepare(&format!("PRAGMA table_info({t})"))
+                && let Ok(rows) =
+                    stmt.query_map([], |r| r.get::<_, String>(1))
+            {
+                for c in rows.flatten() {
+                    columns.push((t.clone(), c));
+                }
+            }
+        }
+        if lower.contains("no such table") {
+            let nearest = tables
+                .iter()
+                .min_by_key(|t| edit_distance(t, &rejected))
+                .map(|t| format!("Did you mean `{t}`? "))
+                .unwrap_or_default();
+            anyhow::anyhow!(
+                "{msg}. {nearest}Tables: {}. Names are singular; `kind` is the discriminator column.",
+                tables.join(", ")
+            )
+        } else {
+            // 始终给最近列建议(阈值会漏 edge_kind→kind 这种"前缀+下划线变体",距离 5);
+            // 平局列出全部归属表(kind 在 entity/edge 都有,不能瞎指一个)。
+            let best = columns
+                .iter()
+                .map(|(t, c)| (edit_distance(c, &rejected), t.clone(), c.clone()))
+                .min_by_key(|(d, _, _)| *d);
+            let hint = match best {
+                Some((d, _, c)) => {
+                    let mut in_tables: Vec<&str> = columns
+                        .iter()
+                        .filter(|(_, col)| edit_distance(col, &rejected) == d)
+                        .map(|(t, _)| t.as_str())
+                        .collect();
+                    in_tables.sort_unstable();
+                    in_tables.dedup();
+                    format!("Did you mean `{c}` (in table {})? ", in_tables.join(" or "))
+                }
+                None => String::new(),
+            };
+            let by_table: Vec<String> = tables
+                .iter()
+                .map(|t| {
+                    let cols: Vec<String> = columns
+                        .iter()
+                        .filter(|(tb, _)| tb == t)
+                        .map(|(_, c)| c.clone())
+                        .collect();
+                    format!("{t}({})", cols.join(", "))
+                })
+                .collect();
+            anyhow::anyhow!("{msg}. {hint}Columns: {}.", by_table.join("; "))
+        }
     }
 
     fn initialize(&self) -> Result<()> {
@@ -1033,6 +1148,29 @@ mod tests {
 
     fn id(value: &str) -> EntityId {
         EntityId(value.to_string())
+    }
+
+    /// P2-6:query_sql 表名/列名首猜必错时,错误文案带 did-you-mean 近邻提示。
+    #[test]
+    fn query_errors_hint_nearest_schema_name() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        // 表名复数误猜(edges)→ 建议 edge,并附完整表清单
+        let err = store
+            .read_only_query("SELECT COUNT(*) FROM edges", 100)
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Did you mean `edge`?"), "{msg}");
+        assert!(msg.contains("Tables: cluster_info, edge, entity"), "{msg}");
+        assert!(msg.contains("`kind` is the discriminator"), "{msg}");
+        // 列名误猜(edge_kind)→ 建议 kind;平局列出全部归属表(kind 在
+        // edge/entity 都有,entity_embedding 的 entity_id 同距,不能瞎指一个)
+        let err = store
+            .read_only_query("SELECT edge_kind FROM edge LIMIT 1", 100)
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Did you mean `kind` (in table edge or entity"), "{msg}");
+        // 正常查询不受影响
+        assert!(store.read_only_query("SELECT COUNT(*) FROM entity", 10).is_ok());
     }
 
     #[test]
