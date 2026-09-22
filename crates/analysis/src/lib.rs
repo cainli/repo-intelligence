@@ -2140,10 +2140,12 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
     // vue_page(qualified_name = 文件路径,路径唯一无歧义,无需 A+ 名字仲裁)。import 语句
     // 是事实(Fact 0.9)。链路价值:route -[renders]-> vue_page -[calls]-> api function,
     // "路由 → 页面 → api" 递归可达。
-    let page_by_path: HashMap<&str, &Entity> = entities
+    // 键归一为 / :Windows 上 qualified_name 是 \ 分隔,而 resolve_import_spec 恒产 /,
+    // 不归一则 renders/component_ref 在 Windows 全丢(曾只被 win runner 的测试暴露)。
+    let page_by_path: HashMap<String, &Entity> = entities
         .iter()
         .filter(|e| e.kind == EntityKind::VuePage)
-        .map(|e| (e.qualified_name.as_str(), e))
+        .map(|e| (e.qualified_name.replace('\\', "/"), e))
         .collect();
     for route in entities.iter().filter(|e| e.kind == EntityKind::Route) {
         let Some(spec) = route
@@ -2229,6 +2231,10 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
 /// `~/x`、相对 `./x`/`../x`(相对 from_path 所在目录归一);裸包名(无路径语义)返回 None。
 /// 只做纯路径运算——不查文件系统,目标存在性由调用方在全图实体索引上精确匹配兜底。
 fn resolve_import_spec(spec: &str, from_path: &str) -> Option<String> {
+    // 入口统一归一为 / :Windows 上 from_path(spec 相对解析的基准)是 \ 分隔,
+    // rsplit_once('/') 会把整条路径当目录;spec 内偶见 \ 也一并兼容。
+    let spec = spec.replace('\\', "/");
+    let from_path = from_path.replace('\\', "/");
     if let Some(rest) = spec.strip_prefix("@/") {
         return Some(format!("src/{rest}"));
     }
@@ -2255,10 +2261,10 @@ fn resolve_import_spec(spec: &str, from_path: &str) -> Option<String> {
 
 /// vue_page 路径索引查找:先精确,失败补 `.vue` 重试——vue-router 的
 /// `component: () => import('@/views/x/index')` 惯例省略后缀(bundler 解析)。
-fn lookup_page<'a>(index: &'a HashMap<&str, &Entity>, path: &str) -> Option<&'a Entity> {
+fn lookup_page<'a>(index: &'a HashMap<String, &Entity>, path: &str) -> Option<&'a Entity> {
     index
         .get(path)
-        .or_else(|| index.get(format!("{path}.vue").as_str()))
+        .or_else(|| index.get(&format!("{path}.vue")))
         .copied()
 }
 
@@ -2882,5 +2888,54 @@ mod tests {
         );
         assert_eq!(deps2.len(), 1);
         assert_eq!(deps2[0].1, &w1_id, "通配档应落 com.acme(不带 2)");
+    }
+
+    #[test]
+    fn renders_edge_matches_windows_backslash_qualified_names() {
+        // Windows 实体 qualified_name 是 \ 分隔,component_spec 解析恒产 /——
+        // 键未归一时 renders/component_ref 全丢(曾只在 win runner 暴露)。
+        // 合成反斜杠实体,任何平台可复现。
+        let route = Entity::new(
+            EntityId::stable(
+                "workspace",
+                "src\\router.ts",
+                EntityKind::Route,
+                "/user/profile",
+                "",
+            ),
+            EntityKind::Route,
+            "/user/profile",
+            "src\\router.ts#/user/profile",
+        )
+        .with_metadata(json!({
+            "path": "/user/profile",
+            "component_spec": "@/views/user/profile.vue"
+        }))
+        .with_evidence("src\\router.ts", 4, 4, EvidenceClass::Fact, 0.9, "route");
+        let page = Entity::new(
+            EntityId::stable(
+                "workspace",
+                "src\\views\\user\\profile.vue",
+                EntityKind::VuePage,
+                "profile",
+                "",
+            ),
+            EntityKind::VuePage,
+            "profile",
+            "src\\views\\user\\profile.vue",
+        )
+        .with_evidence(
+            "src\\views\\user\\profile.vue",
+            1,
+            1,
+            EvidenceClass::Fact,
+            0.9,
+            "page",
+        );
+        let r = resolve_cross_stack(&[route.clone(), page.clone()], &[]);
+        let renders = edges_of_kind(&r, EdgeKind::Renders);
+        assert_eq!(renders.len(), 1, "反斜杠 qualified_name 也要 renders 连通");
+        assert_eq!(renders[0].0, &route.id);
+        assert_eq!(renders[0].1, &page.id);
     }
 }
