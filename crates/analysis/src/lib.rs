@@ -13,10 +13,11 @@ use repo_intelligence_model::{
 use repo_intelligence_source::{SourceFile, discover_with_config};
 use serde_json::json;
 
-/// 索引格式版本:EntityId 方案变更(方法 arity 判别符、字段所属类判别符等)必须强制
+/// 索引格式版本:EntityId 方案变更(方法 arity 判别符、字段所属类判别符等)或实体
+/// metadata 语义变更(implements/superclass 由类型头扫描器重写、enum 新实体)必须强制
 /// 全量重提,否则增量扫描会让旧 id 实体与新方案边(id 不匹配)并存,边悬空。做法:
 /// file_state 的值带版本前缀,版本变更后首次扫描新旧哈希不等 → 全量重提,之后稳定回增量。
-const INDEX_FORMAT: u32 = 2;
+const INDEX_FORMAT: u32 = 3;
 
 #[derive(Clone, Debug, Default)]
 pub struct ScanSummary {

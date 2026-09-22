@@ -16,8 +16,11 @@ use tree_sitter::Node;
 use crate::registry::{ExtractContext, SemanticExtractor};
 use crate::{add_contained, line_of, normalize_path};
 
+// 类型声明锚(class|interface|enum)。enum 产实体(实现策略接口的 enum 在 mes 类项目中
+// 常见);record 上下文关键字误命中风险高且不吃 implements 的场景罕见,本轮不收。
+// implements/superclass 不再用正则抽取——见 scan_type_headers(类型头平衡扫描)。
 static JAVA_CLASS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b(class|interface)\s+([A-Za-z_]\w*)").unwrap());
+    LazyLock::new(|| Regex::new(r"\b(class|interface|enum)\s+([A-Za-z_]\w*)").unwrap());
 static JAVA_FIELD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)\b(?:private|protected|public)\s+[\w<>,.?]+\s+([A-Za-z_]\w*)\s*;").unwrap()
 });
@@ -133,21 +136,8 @@ fn java_fqn_for_class(path: &str, class_name: &str) -> Option<String> {
     (file_class == class_name).then(|| pkg.replace('/', "."))
 }
 
-// class Name(可选泛型/extends)implements Iface1<Gen>, Iface2 { ... —— 组1=类名,
-// 组2=接口列表(含泛型,到 class body 的 {)。跨行靠 [^{] 匹配换行(否定字符类含 \n)。
-// 用 regex 而非 tree-sitter:implements 子句节点结构随 grammar 版本不稳,正则最可靠。
-static JAVA_IMPLEMENTS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"\bclass\s+([A-Za-z_]\w*)[^{]*?\bimplements\s+([^<{]+(?:<[^>]*>)?(?:\s*,\s*[^<{]+(?:<[^>]*>)?)*)",
-    )
-    .unwrap()
-});
-// class Sub extends Super —— 组1=子类,组2=超类简单名(去泛型)。只匹配 class(非 interface),
-// 故不与 BaseMapper 的 interface extends 冲突。跨文件继承边由 resolve_cross_stack 按 superclass 名解析。
-static JAVA_EXTENDS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\bclass\s+([A-Za-z_]\w*)[^{]*?\bextends\s+([A-Za-z_]\w*)").unwrap()
-});
 // abstract class Foo —— abstract 修饰符(不论有无 extends)。存 metadata.abstract 供 trace 标注。
+// 组1 start = 类名 token start,与 class_hits offset 同源(offset 绑定用)。
 static JAVA_ABSTRACT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\babstract\s+class\s+([A-Za-z_]\w*)").unwrap());
 
@@ -503,10 +493,10 @@ fn extract_java(
         .captures_iter(&masked.bare)
         .map(|capture| {
             let name = capture.get(2).unwrap();
-            let kind = if &capture[1] == "interface" {
-                EntityKind::Interface
-            } else {
-                EntityKind::Class
+            let kind = match &capture[1] {
+                "interface" => EntityKind::Interface,
+                "enum" => EntityKind::Enum,
+                _ => EntityKind::Class,
             };
             (name.start(), name.as_str().to_string(), kind)
         })
@@ -515,6 +505,15 @@ fn extract_java(
     let classes: Vec<(usize, String)> = class_hits
         .iter()
         .map(|(offset, name, _)| (*offset, name.clone()))
+        .collect();
+    // implements/superclass/abstract 在实体创建时按 offset 精确绑定——旧实现按名绑定,
+    // 同文件两个同名类(顶层 + 内部类)会互相覆盖/偷取继承关系。
+    let type_headers = scan_type_headers(&masked.bare);
+    let headers_by_offset: HashMap<usize, &TypeHeader> =
+        type_headers.iter().map(|h| (h.decl_offset, h)).collect();
+    let abstract_offsets: HashSet<usize> = JAVA_ABSTRACT
+        .captures_iter(&masked.bare)
+        .filter_map(|c| c.get(1).map(|m| m.start()))
         .collect();
     for (offset, name, kind) in &class_hits {
         let line = line_of(&file.content, *offset);
@@ -547,6 +546,28 @@ fn extract_java(
                 .map(|(f, t)| json!({ "name": f, "type": t }))
                 .collect();
             meta.insert("injected_fields".into(), serde_json::Value::Array(arr));
+        }
+        // implements/superclass(类型头扫描器):简单名键保持旧形态(下游
+        // extract_interface_endpoints / analysis 名字索引不变),*_full 存全名原文
+        // (FQCN 接口/超类时与简单名不同),analysis 消歧优先等值匹配。
+        if let Some(h) = headers_by_offset.get(offset) {
+            if !h.implements.is_empty() {
+                meta.insert(
+                    "implements".into(),
+                    json!(h.implements.iter().map(|(s, _)| s).collect::<Vec<_>>()),
+                );
+                meta.insert(
+                    "implements_full".into(),
+                    json!(h.implements.iter().map(|(_, f)| f).collect::<Vec<_>>()),
+                );
+            }
+            if let Some((simple, full)) = &h.superclass {
+                meta.insert("superclass".into(), json!(simple));
+                meta.insert("superclass_full".into(), json!(full));
+            }
+        }
+        if abstract_offsets.contains(offset) {
+            meta.insert("abstract".into(), json!(true));
         }
         if !meta.is_empty() {
             entity = entity.with_metadata(serde_json::Value::Object(meta));
@@ -682,8 +703,6 @@ fn extract_java(
     }
     extract_custom_endpoints(file, path, &masked, entities, edges, config);
     extract_mybatis_plus(file, path, &masked, entities, edges);
-    extract_implements(&masked, entities);
-    extract_extends(&masked, entities);
     extract_imports(&masked, entities);
     extract_interface_endpoints(file, path, entities, edges, config);
     extract_annotations(file, path, &masked, &method_spans, entities, edges, config);
@@ -1102,95 +1121,175 @@ fn extract_mybatis_plus(
     }
 }
 
-/// implements 关系提取:把 class 实现的接口名列表存入 class 实体 metadata.implements。
-/// EntityId 是 path-scoped(每文件独立命名空间),class 在本文件、interface 实体在定义
-/// 文件,extract 层建不了跨文件边(id 不匹配)。故只传递接口名,由 resolve_cross_stack
-/// 按全局 interface 实体名解析建边(与跨文件 Mapper→Table 同模式)。
-fn extract_implements(masked: &MaskedSource, entities: &mut [Entity]) {
-    let caps: Vec<(String, Vec<serde_json::Value>)> = JAVA_IMPLEMENTS
-        .captures_iter(&masked.bare)
-        .filter_map(|cap| {
-            let class_name = cap[1].to_string();
-            let list = cap.get(2).map(|m| m.as_str()).unwrap_or("");
-            let ifaces: Vec<serde_json::Value> = list
-                .split(',')
-                .filter_map(|raw| {
-                    let iface = raw.split('<').next().unwrap_or("").trim();
-                    // 合法 Java 标识符(首字母、后续字母数字下划线),过滤泛型残余如 "V>"
-                    let valid = !iface.is_empty()
-                        && iface
-                            .chars()
-                            .next()
-                            .is_some_and(|c| c.is_ascii_alphabetic())
-                        && iface.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-                    if valid {
-                        Some(serde_json::Value::String(iface.to_string()))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if ifaces.is_empty() {
-                None
-            } else {
-                Some((class_name, ifaces))
-            }
-        })
-        .collect();
-    for (class_name, ifaces) in caps {
-        for entity in entities.iter_mut() {
-            if entity.kind == EntityKind::Class && entity.name == class_name {
-                let mut meta = match entity.metadata.clone() {
-                    serde_json::Value::Object(map) => map,
-                    _ => serde_json::Map::new(),
-                };
-                meta.insert(
-                    "implements".into(),
-                    serde_json::Value::Array(ifaces.clone()),
-                );
-                entity.metadata = serde_json::Value::Object(meta);
-            }
-        }
-    }
+/// 类型头扫描结果。实体绑定用 decl_offset(class_hits 同源同偏移),不用名字——
+/// 旧正则按名绑定,同文件两个同名类(顶层 + 内部类)互相覆盖继承关系。
+struct TypeHeader {
+    /// 类型名 token 的 start byte。
+    decl_offset: usize,
+    /// (简单名, 全名)。仅 class 的顶层 extends(单继承);interface 的 extends 是
+    /// 多继承不采(BaseMapper 场景由 MP_MAPPER 专门处理),enum 语法上无 extends。
+    superclass: Option<(String, String)>,
+    /// class/enum 的顶层 implements。全名与简单名仅 FQCN 时不同。
+    implements: Vec<(String, String)>,
 }
 
-/// extends 关系 + abstract 标记提取:存 class.metadata.superclass(超类简单名,单继承)与
-/// class.metadata.abstract(true)。跨文件继承边(SuperclassOf)由 resolve_cross_stack 按
-/// superclass 名解析,与 implements 同模式(Extract 层 EntityId path-scoped,建不了跨文件边)。
-fn extract_extends(masked: &MaskedSource, entities: &mut [Entity]) {
-    // superclass:class Sub extends Super(单继承,去泛型)。bare 掩码:Javadoc 里的
-    // "class A extends B" 字样不再污染 metadata.superclass。
-    for cap in JAVA_EXTENDS.captures_iter(&masked.bare) {
-        let class_name = cap[1].to_string();
-        let superclass = cap[2].to_string();
-        for entity in entities.iter_mut() {
-            if entity.kind == EntityKind::Class && entity.name == class_name {
-                let mut meta = match entity.metadata.clone() {
-                    serde_json::Value::Object(map) => map,
-                    _ => serde_json::Map::new(),
-                };
-                meta.insert(
-                    "superclass".into(),
-                    serde_json::Value::String(superclass.clone()),
-                );
-                entity.metadata = serde_json::Value::Object(meta);
+/// full 名取末段简单名。
+fn simple_name_of(full: &str) -> &str {
+    full.rsplit('.').next().unwrap_or(full)
+}
+
+/// 类型头平衡扫描:替代旧 IMPLEMENTS/JAVA_EXTENDS 正则。正则版四个实测缺陷(mes-activity
+/// 反馈)在此根治:① 嵌套泛型逗号泄漏——`implements Map<String, Handler<X>>` 把类型实参
+/// 基名当接口(幻觉误归);② FQCN 接口(`implements com.acme.ISvc`)过不了标识符校验整条
+/// 丢弃;③ bounded type parameter 吃掉 extends——`<T extends Comparable<T>>` 的 superclass
+/// 变 "Comparable",FQCN 超类截成 "com";④ 声明头 `[^{]*?` 跨类偷取后续类的 implements。
+/// 做法:锚与 JAVA_CLASS 同源(decl_offset 对齐 class_hits),从类型名后扫到顶层 `{`,
+/// 按 angle-depth 平衡 token 化,只认 depth==0 的 extends/implements。
+fn scan_type_headers(bare: &str) -> Vec<TypeHeader> {
+    const HEADER_CAP: usize = 2048; // 声明头上限,坏输入防御
+    let bytes = bare.as_bytes();
+    let mut headers = Vec::new();
+    for cap in JAVA_CLASS.captures_iter(bare) {
+        let name_m = cap.get(2).unwrap();
+        let kind = match &cap[1] {
+            "interface" => EntityKind::Interface,
+            "enum" => EntityKind::Enum,
+            _ => EntityKind::Class,
+        };
+        // 头部 token 化:(文本, angle-depth)。词 = ASCII 标识符字符(掩码后源码的
+        // 结构字符全 ASCII,非 ASCII 字节作分隔符);`<`/`>` 实时升降 depth。
+        let mut tokens: Vec<(String, i32)> = Vec::new();
+        let mut angle: i32 = 0;
+        let mut cur = String::new();
+        let mut cur_depth = 0;
+        let mut i = name_m.end();
+        let limit = (i + HEADER_CAP).min(bytes.len());
+        while i < limit {
+            let b = bytes[i];
+            i += 1;
+            if b.is_ascii_alphanumeric() || b == b'_' || b == b'$' {
+                if cur.is_empty() {
+                    cur_depth = angle;
+                }
+                cur.push(b as char);
+                continue;
+            }
+            if !cur.is_empty() {
+                tokens.push((std::mem::take(&mut cur), cur_depth));
+            }
+            match b {
+                b'<' => {
+                    angle += 1;
+                    tokens.push(("<".into(), angle));
+                }
+                b'>' => {
+                    angle -= 1;
+                    tokens.push((">".into(), angle));
+                }
+                b'.' | b',' => tokens.push(((b as char).to_string(), angle)),
+                b'{' if angle == 0 => break,
+                b';' => break,
+                _ => {}
+            }
+            if angle < 0 {
+                break;
             }
         }
-    }
-    // abstract:abstract class Foo(不论有无 extends)。
-    for cap in JAVA_ABSTRACT.captures_iter(&masked.bare) {
-        let class_name = cap[1].to_string();
-        for entity in entities.iter_mut() {
-            if entity.kind == EntityKind::Class && entity.name == class_name {
-                let mut meta = match entity.metadata.clone() {
-                    serde_json::Value::Object(map) => map,
-                    _ => serde_json::Map::new(),
-                };
-                meta.insert("abstract".into(), serde_json::Value::Bool(true));
-                entity.metadata = serde_json::Value::Object(meta);
+        if !cur.is_empty() {
+            tokens.push((cur, cur_depth));
+        }
+        // 顶层(depth==0)关键词条目定位。
+        let mut extends_idx = None;
+        let mut implements_idx = None;
+        for (idx, (text, depth)) in tokens.iter().enumerate() {
+            if *depth != 0 {
+                continue;
+            }
+            match text.as_str() {
+                "extends" if extends_idx.is_none() => extends_idx = Some(idx),
+                "implements" if implements_idx.is_none() => implements_idx = Some(idx),
+                _ => {}
             }
         }
+        let superclass = if kind == EntityKind::Class {
+            extends_idx
+                .map(|ext| {
+                    let to = implements_idx.unwrap_or(tokens.len());
+                    parse_type_list(&tokens, ext + 1, to)
+                })
+                .and_then(|list| list.into_iter().next())
+        } else {
+            None
+        };
+        let implements = implements_idx
+            .map(|imp| parse_type_list(&tokens, imp + 1, tokens.len()))
+            .unwrap_or_default();
+        let to_pairs = |fulls: Vec<String>| {
+            fulls.into_iter()
+                .map(|f| {
+                    let simple = simple_name_of(&f).to_string();
+                    (simple, f)
+                })
+                .collect::<Vec<_>>()
+        };
+        headers.push(TypeHeader {
+            decl_offset: name_m.start(),
+            superclass: superclass.map(|f| {
+                let simple = simple_name_of(&f).to_string();
+                (simple, f)
+            }),
+            implements: to_pairs(implements),
+        });
     }
+    headers
+}
+
+/// 解析继承/实现子句 tokens[from..to]:顶层(depth==0)`.` 连接词组成全名,`<...>`
+/// 泛型段按 angle 平衡跳过(类型实参不进结果),顶层 `,` 切分。遇顶层 permits 终止
+/// (sealed 的允许子类列表不属于 implements)。
+fn parse_type_list(tokens: &[(String, i32)], from: usize, to: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut full = String::new();
+    let mut i = from;
+    while i < to {
+        let (text, depth) = &tokens[i];
+        if *depth > 0 {
+            if text == "<" {
+                let mut inner = 0i32;
+                while i < to {
+                    match tokens[i].0.as_str() {
+                        "<" => inner += 1,
+                        ">" => {
+                            inner -= 1;
+                            if inner == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        match text.as_str() {
+            "." if full.is_empty() => {} // 前导点:坏输入,忽略
+            "." => full.push('.'),
+            "," => {
+                if !full.is_empty() {
+                    out.push(std::mem::take(&mut full));
+                }
+            }
+            "permits" => break,
+            word => full.push_str(word),
+        }
+        i += 1;
+    }
+    if !full.is_empty() {
+        out.push(full);
+    }
+    out
 }
 
 /// 文件级 imports → 同文件每个 class 的 metadata.imports(全限定名数组,剔通配符)。
@@ -1230,7 +1329,7 @@ fn extract_imports(masked: &MaskedSource, entities: &mut [Entity]) {
 /// implements 约定接口(ApiHandler/IBizProcess 等)的类视为自研 RPC 入口,补一个 HttpEndpoint
 /// 实体(name=类名,即交易码/业务码),让 find_endpoint 能命中——mes/mos 的 RMB 入口普遍用
 /// `@MosApi + implements ApiHandler` 这套自定义框架,纯注解识别覆盖不到。metadata.implements
-/// 已由 extract_implements 填(接口名去泛型),故须在其后调用。
+/// 已由实体创建阶段的类型头扫描器(scan_type_headers)写入,时序天然满足。
 fn extract_interface_endpoints(
     file: &SourceFile,
     path: &str,
@@ -2647,5 +2746,134 @@ public class AnnotationUtils {
             .map(|v| v.as_str().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(reflects, vec!["a.b.Constant", "a.b.Direct"], "常量解引用 + 字面量 + 去重");
+    }
+
+    // ---- 类型头平衡扫描器(scan_type_headers):mes-activity 反馈的四类正则缺陷 ----
+
+    /// 嵌套泛型逗号泄漏(旧正则 split(',') 切进泛型、split('<') 把类型实参基名当接口):
+    /// `implements Map<String, Handler<X>>` 曾产出幻觉接口 ["Map","Handler"]。
+    #[test]
+    fn scanner_nested_generic_args_not_treated_as_interfaces() {
+        let headers = scan_type_headers(
+            "class DataFieldConstants implements Map<String, PfHandler<Req>> {\n}",
+        );
+        assert_eq!(headers.len(), 1);
+        assert_eq!(
+            headers[0].implements,
+            vec![("Map".to_string(), "Map".to_string())],
+            "泛型实参基名不得进 implements"
+        );
+    }
+
+    /// FQCN 接口合法保留(旧正则整条丢弃),simple/full 平行。
+    #[test]
+    fn scanner_fqcn_interfaces_kept_whole() {
+        let headers = scan_type_headers(
+            "class Svc implements com.acme.ISvc, LocalIface<Gen> {\n}",
+        );
+        assert_eq!(
+            headers[0].implements,
+            vec![
+                ("ISvc".to_string(), "com.acme.ISvc".to_string()),
+                ("LocalIface".to_string(), "LocalIface".to_string()),
+            ]
+        );
+    }
+
+    /// bounded type parameter 的 extends 不吃掉顶层 extends(旧正则 superclass 变
+    /// "Comparable");FQCN 超类不截断(旧正则得 "com")。
+    #[test]
+    fn scanner_bounded_type_param_and_fqcn_superclass() {
+        let headers = scan_type_headers(
+            "class Foo<T extends Comparable<T>> extends com.acme.Base<T> implements Handler {\n}",
+        );
+        assert_eq!(
+            headers[0].superclass,
+            Some(("Base".to_string(), "com.acme.Base".to_string())),
+            "只认顶层 extends,超类全名保留"
+        );
+        assert_eq!(headers[0].implements.len(), 1);
+    }
+
+    /// interface 的 extends 是多继承,不写 superclass;enum 的 implements 有效。
+    #[test]
+    fn scanner_interface_extends_ignored_enum_implements_kept() {
+        let ifaces = scan_type_headers("interface BaseMapper<T> extends Mapper<T> {\n}");
+        assert_eq!(ifaces[0].superclass, None, "interface 多继承不采 superclass");
+        let enums = scan_type_headers("enum Color implements Named {\n  RED, GREEN;\n}");
+        assert_eq!(enums[0].implements, vec![("Named".to_string(), "Named".to_string())]);
+    }
+
+    /// sealed permits 子句不属于 implements;同文件两个类不互相偷取(旧正则
+    /// `[^{]*?` 跨 brace-free 区让前一个类偷走后一个类的 implements)。
+    #[test]
+    fn scanner_permits_stops_and_no_cross_class_theft() {
+        let headers = scan_type_headers(
+            "class Foo implements I1 permits S {\n}\nclass Bar {\n}\nclass Baz implements I2 {\n}",
+        );
+        assert_eq!(headers.len(), 3);
+        assert_eq!(headers[0].implements, vec![("I1".to_string(), "I1".to_string())]);
+        assert!(headers[1].implements.is_empty(), "Bar 无 implements,不得偷取 Baz 的");
+        assert_eq!(headers[2].implements, vec![("I2".to_string(), "I2".to_string())]);
+    }
+
+    /// 全链路:enum 产实体(kind=Enum)、implements/abstract 按 offset 精确绑定到
+    /// 同文件的正确类(同名内部类不串)。
+    #[test]
+    fn extract_binds_implements_by_offset_not_name() {
+        let src = r#"
+public class Outer {
+    class Handler implements IInner {
+    }
+}
+enum Color implements Named {
+    RED
+}
+public abstract class Base implements TopIface {
+}
+"#;
+        let path = "src/main/java/com/a/Outer.java";
+        let file = SourceFile {
+            id: EntityId::stable("workspace", path, EntityKind::File, "Outer", ""),
+            relative_path: std::path::PathBuf::from(path),
+            kind: FileKind::Java,
+            content_hash: String::new(),
+            content: src.into(),
+        };
+        let config = SemanticsConfig::default();
+        let mut entities = Vec::new();
+        let mut edges = Vec::new();
+        extract_java(&file, path, &mut entities, &mut edges, &config).unwrap();
+        let meta = |kind: EntityKind, name: &str| {
+            entities
+                .iter()
+                .find(|e| e.kind == kind && e.name == name)
+                .unwrap_or_else(|| panic!("实体缺失 {kind:?} {name}"))
+                .metadata
+                .clone()
+        };
+        // enum 产实体 + implements
+        let color = meta(EntityKind::Enum, "Color");
+        assert_eq!(
+            color.get("implements").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(1),
+            "enum 实体应产且带 implements: {color}"
+        );
+        // 同文件内部类 Handler 与 enum/其他类按 offset 绑定,不串
+        let handler = meta(EntityKind::Class, "Handler");
+        assert_eq!(
+            handler
+                .get("implements")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a[0].as_str()),
+            Some("IInner")
+        );
+        let base = meta(EntityKind::Class, "Base");
+        assert_eq!(base.get("abstract"), Some(&json!(true)));
+        assert_eq!(
+            base.get("superclass_full").is_none(),
+            true,
+            "无 extends 时不得有 superclass_full"
+        );
     }
 }
