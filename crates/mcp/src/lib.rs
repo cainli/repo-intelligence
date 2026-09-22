@@ -757,20 +757,80 @@ fn dispatch_tool_call(request: &Value, database: Option<&Path>, base: &Path, id:
     }
 }
 
+/// manifest 读 id → repo_path(resolve 短名匹配 / list_repositories / fail-loud 提示共用)。
+fn read_manifest(base: &Path) -> Vec<(String, String)> {
+    std::fs::read(base.join("manifest.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v.as_object().cloned())
+        .map(|map| {
+            map.into_iter()
+                .map(|(id, p)| (id, p.as_str().unwrap_or("?").to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// 多仓库路由:有 `repository` 参数 → `<base>/repos/<repo_id>.sqlite`
 /// (repo_id = blake3(规范化路径)[:16]);无 → fallback_db(单库兼容,向后兼容 --database)。
+/// repository 约定是 scan_workspace 时的仓库根路径;尾段短名(mes/mos)也接受。
+/// mes-activity 反馈(P0-2):传 "mes" 曾被 canonicalize 吞错 → 哈希成无关空库 →
+/// 静默返回 0 结果且污染 manifest。现在无法解析即 fail-loud 并列出可用值。
 fn resolve_database(
     arguments: &Value,
     base: &Path,
     fallback: Option<&Path>,
 ) -> Result<std::path::PathBuf> {
     if let Some(repo) = arguments["repository"].as_str().filter(|s| !s.is_empty()) {
-        let canon = std::fs::canonicalize(repo).unwrap_or_else(|_| std::path::PathBuf::from(repo));
+        let known = read_manifest(base);
+        let canon = match std::fs::canonicalize(repo) {
+            Ok(p) => p,
+            Err(_) => {
+                // 非有效路径:试 manifest 尾段短名(repo_path 以 /<repo> 结尾)。
+                let hits: Vec<&(String, String)> = known
+                    .iter()
+                    .filter(|(_, p)| {
+                        p == &repo
+                            || p.ends_with(&format!("/{repo}"))
+                            || p.rsplit('/').next() == Some(repo)
+                    })
+                    .collect();
+                match hits.as_slice() {
+                    [(_, p)] => std::fs::canonicalize(p).map_err(|e| {
+                        anyhow::anyhow!("manifest repo_path `{p}` unreachable: {e}")
+                    })?,
+                    [] => {
+                        let known_list = if known.is_empty() {
+                            "<none> — single-database mode? Drop the repository parameter \
+                             (it takes the repository root path used at scan_workspace time)."
+                                .to_string()
+                        } else {
+                            known
+                                .iter()
+                                .map(|(_, p)| p.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
+                        anyhow::bail!(
+                            "repository `{repo}` matched no indexed repository. Known: {known_list}"
+                        )
+                    }
+                    _ => anyhow::bail!(
+                        "repository `{repo}` is ambiguous: {} candidates. Pass the full path.",
+                        hits.len()
+                    ),
+                }
+            }
+        };
         let id = blake3::hash(canon.to_string_lossy().as_bytes()).to_hex()[..16].to_string();
         let dir = base.join("repos");
         std::fs::create_dir_all(&dir).ok();
         let db_path = dir.join(format!("{id}.sqlite"));
-        record_manifest(base, &id, &canon);
+        // 仅当库已存在(已 scan 过)才登记 manifest:查询类调用传未索引路径不再污染
+        // registry;scan_workspace 首建库后由其自身分支补登记。
+        if db_path.exists() {
+            record_manifest(base, &id, &canon);
+        }
         Ok(db_path)
     } else {
         fallback.map(std::path::PathBuf::from).ok_or_else(|| {
@@ -796,17 +856,12 @@ fn record_manifest(base: &Path, id: &str, repo_path: &Path) {
 }
 
 /// 列出多仓库模式下已索引的所有仓库:读 <base>/manifest.json(id→repo_path),
-/// 逐库 open counts。单库模式(--database 无 repository)manifest 不存在 → 返回空列表。
-fn list_repositories(base: &Path) -> Result<Value> {
-    let manifest = base.join("manifest.json");
-    let map = std::fs::read(&manifest)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default();
+/// 逐库 open counts。mes-activity 反馈(P0-2):单库模式(--database)manifest 不存在
+/// 曾返回 count=0,与「没有仓库」不可区分;现回退报 fallback 库条目(repo_id="default",
+/// 不与 hash id 冲突)。
+fn list_repositories(base: &Path, fallback: Option<&Path>) -> Result<Value> {
     let mut repos = Vec::new();
-    for (id, repo_val) in &map {
-        let repo_path = repo_val.as_str().unwrap_or("?");
+    for (id, repo_path) in read_manifest(base) {
         let db = base.join("repos").join(format!("{id}.sqlite"));
         let (entity_count, edge_count) = SqliteGraphStore::open(&db)
             .and_then(|s| s.counts())
@@ -816,6 +871,20 @@ fn list_repositories(base: &Path) -> Result<Value> {
             "repo_path": repo_path,
             "entity_count": entity_count,
             "edge_count": edge_count,
+        }));
+    }
+    if repos.is_empty()
+        && let Some(db) = fallback
+    {
+        let (entity_count, edge_count) = SqliteGraphStore::open(db)
+            .and_then(|s| s.counts())
+            .unwrap_or((0, 0));
+        repos.push(json!({
+            "repo_id": "default",
+            "repo_path": db.to_string_lossy(),
+            "entity_count": entity_count,
+            "edge_count": edge_count,
+            "note": "single-database mode (--database); repository parameter is not needed",
         }));
     }
     Ok(json!({ "repositories": repos, "count": repos.len() }))
@@ -1095,6 +1164,12 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
             let mut store = SqliteGraphStore::open_with_fts(&path, config.index.fts5_fulltext)?;
             let summary =
                 WorkspaceIndexer.scan_with_config(workspace_path, &mut store, &config, |_| {})?;
+            // 首建库后登记 manifest(resolve_database 只在库已存在时写,防查询类调用污染
+            // registry;scan 是合法的登记时机)。
+            if let Ok(canon) = std::fs::canonicalize(repository) {
+                let id = blake3::hash(canon.to_string_lossy().as_bytes()).to_hex()[..16].to_string();
+                record_manifest(base, &id, &canon);
+            }
             // Echo the resulting kind distribution and the effective exclusion
             // list (builtin + configured extras) so a caller can spot a polluted
             // index (e.g. a worktree copy doubling every kind) from the scan
@@ -1141,7 +1216,7 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
             }
             status
         }
-        "list_repositories" => list_repositories(base)?,
+        "list_repositories" => list_repositories(base, database)?,
         "show_system_view" => {
             let store = SqliteGraphStore::open(&path)?;
             let view = arguments["view"].as_str().unwrap_or("repositories");
@@ -1725,18 +1800,29 @@ fn trace_graph(
             .collect();
     }
     if starts.is_empty() {
-        return Ok(json!({
-            "items": [],
-            "edges": [],
-            "count": 0,
-            "start_count": 0,
-            "hint": format!(
+        // mes-activity 反馈(P0-2):空结果要区分「名字没找到」与「路由到了空库」——
+        // 后者读起来像无调用关系,会得出与事实相反的结论。
+        let (total, _) = store.counts().unwrap_or((0, 0));
+        let hint = if total == 0 {
+            "The routed index is EMPTY (entity_count == 0). If you passed a `repository` \
+             parameter it likely matched no indexed repository — run list_repositories \
+             (single-database servers need no repository parameter)."
+                .to_string()
+        } else {
+            format!(
                 "No entity is exactly named `{name}`. The start point is resolved by exact \
                  name (not substring), then the {direction} edges of kind {kinds} are walked. \
                  Run search_entities to find the precise identifier.",
                 direction = if outbound { "outbound (callees)" } else { "inbound (callers)" },
                 kinds = kinds_label(&edge_kinds),
-            ),
+            )
+        };
+        return Ok(json!({
+            "items": [],
+            "edges": [],
+            "count": 0,
+            "start_count": 0,
+            "hint": hint,
         }));
     }
     let mut entities: HashMap<EntityId, Entity> = HashMap::new();
@@ -2197,9 +2283,59 @@ mod tests {
         )
         .unwrap();
         assert_eq!(db_none, std::path::PathBuf::from("fallback.sqlite"));
-        // list_repositories → 2 repos(A, B)
-        let list = list_repositories(base.path()).unwrap();
-        assert_eq!(list["count"].as_u64(), Some(2));
+        // 库不存在时路由不登记 manifest(防查询类调用污染 registry)
+        assert_eq!(list_repositories(base.path(), None).unwrap()["count"].as_u64(), Some(0));
+    }
+
+    /// P0-2 fail-loud:repository 传无效短名 → 显式报错列出可用值,不再哈希成隐身空库。
+    #[test]
+    fn resolve_database_rejects_unknown_repository() {
+        let base = tempfile::tempdir().unwrap();
+        let err = resolve_database(
+            &json!({"repository": "mes"}),
+            base.path(),
+            Some(std::path::Path::new("fallback.sqlite")),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("matched no indexed repository"), "{msg}");
+        assert!(msg.contains("single-database mode"), "{msg}");
+        // 不留垃圾库、不污染 manifest
+        assert!(!base.path().join("repos").join("mes.sqlite").exists());
+        assert!(read_manifest(base.path()).is_empty());
+    }
+
+    /// manifest 已登记(scan 过)后,尾段短名可解析;单库模式 list 回退 default 条目。
+    #[test]
+    fn repository_short_name_resolves_and_single_db_lists_default() {
+        let base = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        // 模拟 scan_workspace 的登记(manifest 键 = blake3(canon)[:16];canonicalize
+        // 解析 /var/folders → /private/var/folders symlink,与 resolve 侧同口径)
+        let canon = std::fs::canonicalize(repo.path()).unwrap();
+        let id = blake3::hash(canon.to_string_lossy().as_bytes()).to_hex()[..16].to_string();
+        std::fs::create_dir_all(base.path().join("repos")).unwrap();
+        std::fs::write(
+            base.path().join("repos").join(format!("{id}.sqlite")),
+            b"",
+        )
+        .unwrap();
+        record_manifest(base.path(), &id, &canon);
+        // 尾段短名(目录 basename)→ 解析到同一库路径
+        let short = repo.path().file_name().unwrap().to_string_lossy().to_string();
+        let db = resolve_database(
+            &json!({"repository": short}),
+            base.path(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(db, base.path().join("repos").join(format!("{id}.sqlite")));
+        // 单库模式(无 manifest 时)回退 default 条目
+        let empty_base = tempfile::tempdir().unwrap();
+        let list = list_repositories(empty_base.path(), Some(std::path::Path::new("ws.sqlite"))).unwrap();
+        assert_eq!(list["count"].as_u64(), Some(1));
+        assert_eq!(list["repositories"][0]["repo_id"], "default");
+        assert_eq!(list["repositories"][0]["repo_path"], "ws.sqlite");
     }
 
     #[test]
