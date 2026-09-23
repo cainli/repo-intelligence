@@ -385,6 +385,9 @@ impl SqliteGraphStore {
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA cache_size = -65536;
+            -- MCP 查询与 scan 写并发时,SQLite 默认立即抛 SQLITE_BUSY;WAL 下短暂等待
+            -- 即可自愈,而不是把瞬时锁竞争以「database is locked」裸错误炸给用户。
+            PRAGMA busy_timeout = 5000;
             PRAGMA temp_store = MEMORY;
             PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS entity (
@@ -836,14 +839,12 @@ impl GraphStore for SqliteGraphStore {
                 &ids,
             )?;
         }
-        // 清理向量层(无开关依赖:有数据则删,no-op 否则)。fts_bulk_in 是通用批量删除 helper。
-        if !ids.is_empty() {
-            Self::fts_bulk_in(
-                &transaction,
-                "DELETE FROM entity_embedding WHERE entity_id IN",
-                &ids,
-            )?;
-        }
+        // 向量层**不**随子树删除(P1-C′,第四轮反馈):实体重提 id 不变,向量按
+        // EntityId + text_hash 判定复用(analysis 筛 text_hash 变化才重算)。此前这里
+        // 级联删向量,而删除阶段先于 embedding——中断/INDEX_FORMAT 升级重跑时向量已
+        // 被清空,text_hash 筛选全部 miss,分批落库的「中断保留」设计失效,52 万实体
+        // 仓中断一次即 1.5-2h 全量重算。真删除文件产生的孤儿向量由 get_all_embeddings
+        // 读时 JOIN entity 过滤,不参与语义检索;rm 库全清。
         {
             let mut delete_edges = transaction
                 .prepare_cached("DELETE FROM edge WHERE source_id = ?1 OR target_id = ?1")?;
@@ -903,9 +904,12 @@ impl GraphStore for SqliteGraphStore {
     }
 
     fn get_all_embeddings(&self) -> Result<Vec<(EntityId, Vec<f32>)>> {
-        let mut stmt = self
-            .connection
-            .prepare("SELECT entity_id, embedding, dim FROM entity_embedding")?;
+        // JOIN entity 过滤孤儿向量:delete_file_subtree 不再级联删向量(P1-C′ 断点续扫),
+        // 真删除文件的向量行残留于此,读时排除,不进语义检索候选。
+        let mut stmt = self.connection.prepare(
+            "SELECT e.entity_id, e.embedding, e.dim FROM entity_embedding e \
+             JOIN entity ON entity.id = e.entity_id",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -1364,5 +1368,64 @@ mod tests {
         // 只剩 Y→G 的 contains;F→C contains 与 X→C resolved 都随 C 删除。
         let (_, edge_count) = store.counts().unwrap();
         assert_eq!(edge_count, 1);
+    }
+
+    /// P1-C′(第四轮反馈):向量不随子树删除——中断/升级重跑时 text_hash 筛选靠存量
+    /// 向量命中跳过,级联删除会让「分批落库 + 中断保留」设计失效(全量重算)。
+    #[test]
+    fn delete_file_subtree_keeps_embeddings_for_resume() {
+        use repo_intelligence_model::{Entity, EntityKind};
+        let mut store = SqliteGraphStore::open_in_memory().unwrap();
+        let f = Entity::new(id("file:F"), EntityKind::File, "F.java", "F.java");
+        let c = Entity::new(id("C"), EntityKind::Class, "C", "C");
+        store
+            .apply_patch(GraphPatch::add(
+                vec![f, c],
+                vec![Edge::new(id("file:F"), id("C"), EdgeKind::Contains)],
+            ))
+            .unwrap();
+        store
+            .set_embeddings(&[(id("C"), vec![0.1, 0.2], "model:hash1".to_string())])
+            .unwrap();
+
+        store.delete_file_subtree(&id("file:F")).unwrap();
+
+        let state = store.get_embedding_state().unwrap();
+        assert!(
+            state.contains_key(&id("C")),
+            "向量应随 EntityId 保留(断点续扫前提): {state:?}"
+        );
+    }
+
+    /// 孤儿向量(实体已删)不进语义检索候选——get_all_embeddings 读时 JOIN entity。
+    #[test]
+    fn get_all_embeddings_filters_orphan_rows() {
+        use repo_intelligence_model::{Entity, EntityKind};
+        let mut store = SqliteGraphStore::open_in_memory().unwrap();
+        let f = Entity::new(id("file:F"), EntityKind::File, "F.java", "F.java");
+        let c = Entity::new(id("C"), EntityKind::Class, "C", "C");
+        let g = Entity::new(id("G"), EntityKind::Class, "G", "G");
+        store
+            .apply_patch(GraphPatch::add(
+                vec![f, c.clone(), g],
+                vec![
+                    Edge::new(id("file:F"), id("C"), EdgeKind::Contains),
+                    Edge::new(id("Y"), id("G"), EdgeKind::Contains),
+                ],
+            ))
+            .unwrap();
+        store
+            .set_embeddings(&[
+                (id("C"), vec![0.1, 0.2], "h1".to_string()),
+                (id("G"), vec![0.3, 0.4], "h2".to_string()),
+            ])
+            .unwrap();
+        assert_eq!(store.get_all_embeddings().unwrap().len(), 2);
+
+        store.delete_file_subtree(&id("file:F")).unwrap();
+
+        let all = store.get_all_embeddings().unwrap();
+        assert_eq!(all.len(), 1, "孤儿 C 的向量不进候选: {all:?}");
+        assert!(all.iter().any(|(eid, _)| *eid == id("G")));
     }
 }

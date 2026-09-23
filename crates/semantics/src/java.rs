@@ -2645,6 +2645,20 @@ fn field_declarator_name(source: &[u8], field_node: Node<'_>) -> Option<String> 
     None
 }
 
+/// 测试源集判定:路径段 `src/<test|itest|integration-test|integrationTest>`(Windows
+/// 反斜杠先归一)。Maven 标准 src/test 与 Gradle 自定义 sourceSet(src/itest 等)都算。
+fn is_test_source_set(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let segs: Vec<&str> = normalized.split('/').collect();
+    segs.windows(2).any(|w| {
+        w[0] == "src"
+            && matches!(
+                w[1],
+                "test" | "itest" | "integration-test" | "integrationTest"
+            )
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn link_bean(
     file: &SourceFile,
@@ -2657,6 +2671,13 @@ fn link_bean(
     entities: &mut Vec<Entity>,
     edges: &mut Vec<Edge>,
 ) {
+    // 测试源集的注入/Mock 字段不建 spring_bean 影子实体(P2-D′,第四轮反馈):测试类
+    // 里的业务类型字段(@Autowired/@Mock)与主代码真 bean 同名,search 结果被 itest
+    // 噪音淹没。测试类自身的 class/method/test_case 实体不受影响,仅排除 bean。
+    // 路径段精确匹配(contains "/src/test/" 会漏掉开头即 src/ 的相对路径)。
+    if is_test_source_set(path) {
+        return;
+    }
     let line = line_of(&file.content, node.start_byte());
     let bean = Entity::new(
         EntityId::stable("workspace", path, EntityKind::SpringBean, type_name, ""),

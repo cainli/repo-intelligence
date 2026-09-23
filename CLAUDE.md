@@ -73,7 +73,7 @@ sqlite3 "$DB" "SELECT json_extract(json,'\$.evidence[0].confidence'), COUNT(*) F
 ## 构建 / 测试
 
 - `cargo test` —— 全 workspace 单元/集成测试(**不替代**上面的真实项目验证)。
-- 版本号:根 `Cargo.toml` `[workspace.package] version`(当前 0.1.49,与 0.1.48 代码逐字节一致——0.1.48 公网五包完整但使用方私源在传播窗口内同步到「主包有/平台包无」快照误报漏发,按「已上 npm 不可 force tag」规则升版重发),所有 crate `version.workspace = true`。
+- 版本号:根 `Cargo.toml` `[workspace.package] version`(当前 0.1.50),所有 crate `version.workspace = true`。
 
 ### mes-activity 反馈六项修复(v0.1.43,2026-09-22)
 
@@ -119,6 +119,16 @@ ci 三闸(fmt → clippy -D warnings → cargo test)**串行短路**,fmt 红遮�
 - **P2-E 类名聚合**(mcp):trace_callers/callees 的 class/interface 起点自动展开 declares 方法进 starts(与类同级 BFS 不耗 depth,双向对称)。`start_count` 反映展开后总数;展开是**名字解析语义**,与 edge_kinds 过滤正交(kinds 不含 declares 仍可达方法,但遍历边集不得出现 declares——测试锁定该边界)。ruoyi 实测 trace_callees(SysUserServiceImpl) start_count 42、calls×30。
 - 测试:镜像方法级收敛 fixture、真多实现全连 fixture、qn 路径化 + Windows 归一 fixture;`trace_from_class_reaches_table_via_declares` 对照分支语义更新。
 - 回归:plus-ui 11/45/0/490 零漂移(frontend qn 未动);ruoyi 三闸全绿。
+
+### 大仓反馈四轮:embedding 断点续扫 + scan 互斥 + 发版卡点(v0.1.50,2026-09-23)
+
+0.1.48 实测反馈(52.9 万实体)四项复核:二轮修复全验收(链路闭环、qn 确认);「平台包再次全部漏发」仍是**私源传播窗口误诊**(公网五包齐全已 tarball 解包验证;但 release_verify 未进 CI 属实);v_edge 已在而澄清三轮未传达;两项真 bug 落地:
+
+- **P1-C′-1 embedding 断点续扫(真 bug)**:`delete_file_subtree` 级联删 `entity_embedding`,而删除阶段先于 embedding → 中断/INDEX_FORMAT 升级重跑时向量已清,text_hash 筛选全部 miss,**分批落库的「中断保留」设计失效**(52 万实体仓中断一次 1.5-2h 全量重算)。修:向量**不**随子树删除(EntityId 不变 + text_hash 判定复用,set_embeddings 本就 upsert);孤儿向量由 `get_all_embeddings` 读时 JOIN entity 过滤(rm 库全清)。
+- **P1-C′-2 scan 互斥**:open 时 `PRAGMA busy_timeout=5000`(WAL 下瞬时锁等待自愈);`{database}.scanlock`(PID+起始秒)探活——活锁报「PID xxx, started Ns ago … --takeover」退出,死锁(kill -9 残留)自动清;`--takeover` 强制接管;Drop 释放。探活用 `ps -p`(零依赖)。
+- **P2-D′ 测试源集 bean 排除**:link_bean 入口判 `src/<test|itest|integration-test|integrationTest>` 路径段(归一 `\`)**直接 return**——测试类注入/Mock 字段不再产 spring_bean 影子与主代码真 bean 混杂;测试类自身实体不受影响。**INDEX_FORMAT 6** 强制重提让存量库生效——配合向量保留,重提时 text_hash 全命中:ruoyi 实测 790 文件全量重提 **4.9s、embedded_count=0**(上版 40s/6580 重嵌)——大仓升级从 1.5-2h 降到分钟级,**「无感升级」路径打通**。
+- **P0-A′ 发版卡点进 CI**:release.yml 新增 `verify-release` job(needs: publish-main)调 release_verify.sh(`RETRIES=10 INTERVAL_SEC=90` 沉降重试,CDN 传播窗口实测 5-10 分钟各包独立交错)——半截发版当轮红灯,不再依赖人工。**P1-B′** v_edge 传达:docs/sql-views.md(字段映射表+示例+常见坑)+ scan 尾部 stderr Tip。
+- 回归:ruoyi 新基线 **7128/15321 零漂移**(src/test 本无 bean,排除功能不误伤;calls 3021/implements_method 415 等全部不变);plus-ui 56/0/490 + embedded_count=0。**ruoyi 升 6 重提即「中断重跑」等价场景,embedded_count==0 即断点续扫的实库验收**。
 
 ## 项目结构
 

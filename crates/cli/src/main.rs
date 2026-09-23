@@ -48,6 +48,9 @@ enum Command {
         workspace: PathBuf,
         #[arg(long, value_enum, default_value = "text")]
         format: OutputFormat,
+        /// 检测到另一 scan 的存活锁时强制接管(覆盖 scanlock)
+        #[arg(long)]
+        takeover: bool,
     },
     Search {
         query: String,
@@ -201,7 +204,13 @@ fn run() -> Result<()> {
                 }),
             )
         }
-        Command::Scan { workspace, format } => {
+        Command::Scan {
+            workspace,
+            format,
+            takeover,
+        } => {
+            // 同库互斥:先拿 scanlock 再开库——否则并发冲突以裸 database is locked 暴露。
+            let _scanlock = ScanLock::acquire(&cli.database, takeover)?;
             // 配置跟 workspace 走:从 workspace 根目录发现 .repo-intelligence.toml,
             // 无文件则 builtin default(scan 行为与历史一致)。
             let config = IndexerConfig::load(&workspace)?;
@@ -213,6 +222,12 @@ fn run() -> Result<()> {
                 &config,
                 log_scan_progress,
             )?;
+            // 直连 SQL 提示(P1-B′,三轮反馈):API 字段与 edge/entity 表列名不同,
+            // v_edge/v_entity 视图暴露 API 同名字段(每次开库 CREATE VIEW IF NOT EXISTS)。
+            eprintln!(
+                "Tip: for direct SQL use views v_edge/v_entity (API field names: \
+                 source/target/confidence/tentative) — see docs/sql-views.md"
+            );
             emit(
                 format,
                 serde_json::json!({
@@ -372,6 +387,77 @@ fn run() -> Result<()> {
             let items = semantic_search_items(&store, &query, limit)?;
             emit(format, items)
         }
+    }
+}
+
+/// 同库 scan 互斥锁(P1-C′-2,第四轮反馈):双 scan 并发在同一 SQLite 上只表现为裸
+/// `database is locked`,读起来像库损坏。锁文件 `{database}.scanlock` 内容
+/// `PID\tstarted_unix_secs`;启动时探活——活锁报友好错误退出,死锁(kill -9 残留)
+/// 自动清除继续。Drop 保证 `?` 早退也释放;kill -9 的残留由下次探活兜底。
+#[derive(Debug)]
+struct ScanLock {
+    path: std::path::PathBuf,
+}
+
+impl ScanLock {
+    fn acquire(database: &std::path::Path, takeover: bool) -> anyhow::Result<Self> {
+        let path = std::path::PathBuf::from(format!("{}.scanlock", database.display()));
+        if path.exists() && !takeover {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                let mut parts = content.trim().split('\t');
+                if let (Some(pid), Some(started)) = (parts.next(), parts.next())
+                    && let (Ok(pid), Ok(started)) = (pid.parse::<u32>(), started.parse::<u64>())
+                    && process_alive(pid)
+                {
+                    let age = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                        .saturating_sub(started);
+                    anyhow::bail!(
+                        "a scan appears to be running on this database (PID {pid}, \
+                         started {age}s ago). If no scan is actually active, rerun with \
+                         --takeover or remove {}",
+                        path.display()
+                    );
+                }
+            }
+            // PID 已死或文件残缺(kill -9 残留/写坏)→ 清除后接管。
+            let _ = std::fs::remove_file(&path);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        std::fs::write(&path, format!("{}\t{}", std::process::id(), now))?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for ScanLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// PID 探活:unix 用 `ps -p`(零依赖;libc kill(2) 需加直接依赖,不值),其余平台
+/// 一律视为存活(保守——错误提示用户 --takeover,不会误杀真并发 scan)。
+fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("ps")
+            .arg("-p")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
     }
 }
 
@@ -672,5 +758,34 @@ mod tests {
         let (matches, unmatched) = match_http_calls(&clients, &endpoints);
         assert!(matches.is_empty(), "method 不同不误连");
         assert_eq!(unmatched.len(), 1);
+    }
+
+    /// P1-C′-2:scanlock 三态——死 PID 自动清、活 PID 拒、--takeover 覆盖。
+    #[test]
+    fn scanlock_rejects_live_pid_and_cleans_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("ws.sqlite");
+        let lock = db.with_file_name(format!("{}.scanlock", "ws.sqlite"));
+
+        // 死 PID:写入后 acquire 自动清除并成功。
+        std::fs::write(&lock, "999999\t1234567890\n").unwrap();
+        let held = ScanLock::acquire(&db, false).unwrap();
+        assert!(lock.exists(), "acquire 后写入自己的锁");
+        drop(held);
+        assert!(!lock.exists(), "Drop 释放");
+
+        // 活 PID(本进程):拒绝 + 文案带 PID 与 --takeover 指引。
+        std::fs::write(&lock, format!("{}\t0\n", std::process::id())).unwrap();
+        let err = ScanLock::acquire(&db, false).unwrap_err().to_string();
+        assert!(
+            err.contains(std::process::id().to_string().as_str()),
+            "{err}"
+        );
+        assert!(err.contains("--takeover"), "{err}");
+
+        // takeover:直接覆盖。
+        let held = ScanLock::acquire(&db, true).unwrap();
+        drop(held);
+        assert!(!lock.exists());
     }
 }

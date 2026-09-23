@@ -114,3 +114,23 @@ jobs:
         working-directory: packages/npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # 发布卡点(P0-A′,第四轮反馈):五包 publish 后强制校验——registry 存在性 +
+  # 干净目录安装冒烟,带沉降重试(CDN 传播窗口实测 5-10 分钟、各包独立交错)。
+  # 真漏发/半截发版在此红灯,发布页直接可见,不再依赖人工跑 scripts/release_verify.sh。
+  verify-release:
+    name: verify release (registry + smoke)
+    needs: publish-main
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Verify five packages + clean install smoke
+        run: RETRIES=10 INTERVAL_SEC=90 bash scripts/release_verify.sh

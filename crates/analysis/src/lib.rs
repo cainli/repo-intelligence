@@ -18,7 +18,7 @@ use serde_json::json;
 /// 通道)必须强制全量重提,否则增量扫描会让旧 id 实体与新方案边(id 不匹配)并存,边
 /// 悬空。做法:file_state 的值带版本前缀,版本变更后首次扫描新旧哈希不等 → 全量重提,
 /// 之后稳定回增量。
-const INDEX_FORMAT: u32 = 5;
+const INDEX_FORMAT: u32 = 6;
 
 #[derive(Clone, Debug, Default)]
 pub struct ScanSummary {

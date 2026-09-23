@@ -536,3 +536,30 @@ fn windows_backslash_path_normalizes_in_qualified_name() {
         .expect("run method");
     assert_eq!(method.qualified_name, "src/main/java/demo/Svc.java#run");
 }
+
+/// P2-D′(第四轮反馈):测试源集(src/test、src/itest 等)的注入字段不建 spring_bean
+/// 影子实体——与主代码真 bean 同名,search 被 itest 噪音淹没;主源集同构造仍建。
+#[test]
+fn test_source_set_injections_do_not_become_spring_beans() {
+    let body = r#"
+        public class FooIT {
+          @Autowired
+          private FooService fooService;
+        }
+        "#;
+    let main = java_file("src/main/java/it/FooMain.java", body);
+    let itest = java_file("src/itest/java/it/FooIT.java", body);
+    let maven_test = java_file("some-module/src/test/java/it/FooTest.java", body);
+
+    let beans = |sf: &SourceFile| {
+        extract(sf)
+            .unwrap()
+            .add_entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::SpringBean)
+            .count()
+    };
+    assert_eq!(beans(&main), 1, "主源集注入仍建 bean 影子");
+    assert_eq!(beans(&itest), 0, "src/itest 注入不建 bean");
+    assert_eq!(beans(&maven_test), 0, "Maven src/test 注入不建 bean");
+}
