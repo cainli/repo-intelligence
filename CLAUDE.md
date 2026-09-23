@@ -73,7 +73,7 @@ sqlite3 "$DB" "SELECT json_extract(json,'\$.evidence[0].confidence'), COUNT(*) F
 ## 构建 / 测试
 
 - `cargo test` —— 全 workspace 单元/集成测试(**不替代**上面的真实项目验证)。
-- 版本号:根 `Cargo.toml` `[workspace.package] version`(当前 0.1.48),所有 crate `version.workspace = true`。
+- 版本号:根 `Cargo.toml` `[workspace.package] version`(当前 0.1.49,与 0.1.48 代码逐字节一致——0.1.48 公网五包完整但使用方私源在传播窗口内同步到「主包有/平台包无」快照误报漏发,按「已上 npm 不可 force tag」规则升版重发),所有 crate `version.workspace = true`。
 
 ### mes-activity 反馈六项修复(v0.1.43,2026-09-22)
 
