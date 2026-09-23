@@ -23,6 +23,15 @@ pub fn extract(file: &SourceFile) -> Result<GraphPatch> {
     extract_with_config(file, &SemanticsConfig::default())
 }
 
+/// qualified_name 展示字段统一口径:`{归一 path}#{name}`。Windows 反斜杠归一为 `/`,
+/// 跨平台查询稳定(v0.1.45 page_by_path 同病同修;此前仅 method/frontend 路径化,
+/// class/bean/endpoint/table/mapper 裸名在同名类仓里无法区分归属——第三轮反馈 P1-C)。
+/// 注意:EntityId::stable 的 qn 槽维持裸名(身份判别输入,与展示字段解耦);
+/// 改展示格式不动 id,但须升 INDEX_FORMAT 强制全量重提刷新存量行。
+pub(crate) fn path_qualified(path: &str, name: &str) -> String {
+    format!("{}#{}", path.replace('\\', "/"), name)
+}
+
 /// 按 `SemanticsConfig` 提取语义:用 `Registry::default_java_stack()` 分发到
 /// 首个支持该文件类型的提取器。自研 RPC 注解与前端噪声词从配置读取。
 pub fn extract_with_config(file: &SourceFile, config: &SemanticsConfig) -> Result<GraphPatch> {

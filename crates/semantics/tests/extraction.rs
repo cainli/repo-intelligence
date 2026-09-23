@@ -457,3 +457,82 @@ fn bare_method_level_request_mapping_is_wildcard_on_base() {
     assert_eq!(endpoint.name, "ANY /api");
     assert!(endpoint.metadata.get("method").is_none(), "ANY 不带 method");
 }
+
+/// P1-C(第三轮反馈):class/spring_bean/http_endpoint/table/mapper 的 qualified_name
+/// 统一 `{path}#{name}`——此前裸类名,双部署区同名类仓里多条实体无法区分归属。
+/// 展示字段与 EntityId qn 槽解耦(id 靠 relative_path 区分,从不相撞),只断言展示层。
+#[test]
+fn class_bean_endpoint_table_mapper_qn_are_path_scoped() {
+    let sf = java_file(
+        "src/main/java/demo/Svc.java",
+        r#"
+        @TableName("t_user")
+        public class User { private String name; }
+
+        public interface UserMapper extends BaseMapper<User> {}
+
+        @RestController
+        @RequestMapping("/svc")
+        public class Svc {
+          @GetMapping("/list")
+          public String list() { return "ok"; }
+          @Autowired
+          private UserService userService;
+        }
+        "#,
+    );
+    let patch = extract(&sf).unwrap();
+    let qn = |kind: EntityKind, name: &str| {
+        patch
+            .add_entities
+            .iter()
+            .find(|e| e.kind == kind && e.name == name)
+            .map(|e| e.qualified_name.clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        qn(EntityKind::Class, "User"),
+        "src/main/java/demo/Svc.java#User"
+    );
+    assert_eq!(
+        qn(EntityKind::Table, "t_user"),
+        "src/main/java/demo/Svc.java#t_user"
+    );
+    assert_eq!(
+        qn(EntityKind::Mapper, "UserMapper"),
+        "src/main/java/demo/Svc.java#UserMapper"
+    );
+    assert_eq!(
+        qn(EntityKind::HttpEndpoint, "GET /svc/list"),
+        "src/main/java/demo/Svc.java#GET /svc/list"
+    );
+    assert_eq!(
+        qn(EntityKind::SpringBean, "UserService"),
+        "src/main/java/demo/Svc.java#UserService"
+    );
+}
+
+/// P1-C:Windows 反斜杠相对路径在 qualified_name 里归一为 `/`(跨平台查询稳定,
+/// v0.1.45 page_by_path 同病同修)。
+#[test]
+fn windows_backslash_path_normalizes_in_qualified_name() {
+    let sf = java_file(
+        "src\\main\\java\\demo\\Svc.java",
+        r#"
+        public class Svc { void run() {} }
+        "#,
+    );
+    let patch = extract(&sf).unwrap();
+    let class = patch
+        .add_entities
+        .iter()
+        .find(|e| e.kind == EntityKind::Class && e.name == "Svc")
+        .expect("Svc class");
+    assert_eq!(class.qualified_name, "src/main/java/demo/Svc.java#Svc");
+    let method = patch
+        .add_entities
+        .iter()
+        .find(|e| e.kind == EntityKind::Method && e.name == "run")
+        .expect("run method");
+    assert_eq!(method.qualified_name, "src/main/java/demo/Svc.java#run");
+}

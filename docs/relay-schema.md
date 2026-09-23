@@ -86,7 +86,10 @@ edges:
 - 每条边必填 `peer.qn` + `edge_type` + `edge_kind` + `anchor`（file+line）。
 - `edge_kind` 是工具原生 `EdgeKind`（snake_case，见下表），结构层，机器直填。
 - `edge_type` 是语义层标签：机器能机械映射的就填映射值；映射不了或属纯语义判断的填 `custom:needs-review`，由 agent 补。
-- `qn` 是回喂工具的契约键；`short` 仅展示。
+- `qn` 是回喂工具的契约键；`short` 仅展示。**格式**：统一 `{相对路径}#{name}`（如
+  `ruoyi-modules/system/service/impl/SysUserServiceImpl.java#SysUserServiceImpl`，Windows
+  路径分隔符归一为 `/`）；本文示例中的点分写法仅为缩略示意，以工具实际回显值为准
+  （v0.1.48 起全 kind 路径化，同名实体可按完整 qn 消歧）。
 - `layer` 是对端所属架构层，与 `edge_type` 正交。
 - **不维护 `outbound_groups`**：需要按层聚合时，由消费方对 `edges.outbound` 做 `group by layer`。
 

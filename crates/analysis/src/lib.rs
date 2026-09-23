@@ -18,7 +18,7 @@ use serde_json::json;
 /// 通道)必须强制全量重提,否则增量扫描会让旧 id 实体与新方案边(id 不匹配)并存,边
 /// 悬空。做法:file_state 的值带版本前缀,版本变更后首次扫描新旧哈希不等 → 全量重提,
 /// 之后稳定回增量。
-const INDEX_FORMAT: u32 = 4;
+const INDEX_FORMAT: u32 = 5;
 
 #[derive(Clone, Debug, Default)]
 pub struct ScanSummary {
@@ -1625,9 +1625,13 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
         }
         edges.push(edge);
     }
-    // 接口分发桥接:iface method → 实现类同名 method(0.7)。interface_to_impls 已是
-    // 精确 id(消歧产物),实现类裸名唯一性闸门失去对象,删除;多实现仍是真歧义,保留
-    // hits.len()==1 判定。
+    // 接口分发桥接:iface method → 实现类同名 method(Calls 0.7)+ 方法级覆写边
+    // (ImplementsMethod 0.8,impl method → iface method,与类级 Implements 同向)。
+    // interface_to_impls 已是精确 id(消歧产物)。命中集先按实现类 fqn 做镜像收敛
+    // (同 FQCN 双 SDK 拷贝是一份逻辑实现的多个物理副本,组内 evidence.file 字典序
+    // 选代表——unique_or_mirrored 模式;fqn 缺失各自独立组),再按逻辑实现数连边:
+    // 多实现是接口的正常形态而非歧义,全连(evidence 注明 1 of N),P0-A 链路贯通。
+    // 双部署区镜像仓此前恒多命中全拒 → 穷举查询零边,是该闸门的实际病灶。
     for edge in input_edges {
         if edge.kind == EdgeKind::Declares
             && let (Some(iface), Some(m)) = (
@@ -1638,17 +1642,46 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
             && m.kind == EntityKind::Method
             && let Some(impl_ids) = interface_to_impls.get(&iface.id)
         {
-            let mut hits: Vec<&EntityId> = Vec::new();
+            let mut hits: Vec<(&Entity, &EntityId)> = Vec::new();
             for impl_id in impl_ids {
                 if let Some(ms) = type_methods.get(*impl_id)
                     && let Some(impl_m_id) = ms.get(m.name.as_str()).copied()
+                    && let Some(impl_class) = entity_by_id.get(*impl_id)
                 {
-                    hits.push(impl_m_id);
+                    hits.push((impl_class, impl_m_id));
                 }
             }
-            // 唯一实现且非自环时建桥接边;多实现=歧义跳过。
-            if hits.len() == 1 && hits[0] != &edge.target {
-                let mut bridge = Edge::new(edge.target.clone(), hits[0].clone(), EdgeKind::Calls);
+            let mut groups: HashMap<Option<&str>, Vec<(&Entity, &EntityId)>> = HashMap::new();
+            for pair in hits {
+                groups.entry(java_fqn_of(pair.0)).or_default().push(pair);
+            }
+            // 组内代表:文件字典序(增量先后入库不漂移);跨组按 method id 排序保确定性。
+            let mut reps: Vec<(&EntityId, bool)> = groups
+                .into_values()
+                .map(|mut group| {
+                    let mirrored = group.len() > 1;
+                    group.sort_by_key(|(c, _)| {
+                        c.evidence.first().map(|e| e.file.as_str()).unwrap_or("")
+                    });
+                    (group[0].1, mirrored)
+                })
+                .collect();
+            reps.sort_by_key(|(method_id, _)| method_id.0.as_str());
+            let total = reps.len();
+            for (impl_m_id, mirrored) in reps {
+                if impl_m_id == &edge.target {
+                    continue; // 自环防护(接口与实现分属不同文件,理论不可达,保守保留)
+                }
+                let dispatch_reason = if total > 1 {
+                    format!("interface dispatch to 1 of {total} implementations")
+                } else if mirrored {
+                    "interface dispatch to implementation (mirrored duplicate)".to_string()
+                } else {
+                    "interface dispatch to implementation".to_string()
+                };
+                // Calls 桥接(iface method → impl method):默认 trace kinds 即贯通,
+                // 证据锚在接口方法(分发点)。
+                let mut bridge = Edge::new(edge.target.clone(), impl_m_id.clone(), EdgeKind::Calls);
                 if let Some(ev) = m.evidence.first() {
                     bridge = bridge.with_evidence(
                         &ev.file,
@@ -1656,10 +1689,37 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
                         ev.end_line,
                         EvidenceClass::Inferred,
                         0.7,
-                        "interface dispatch to implementation",
+                        &dispatch_reason,
                     );
                 }
                 edges.push(bridge);
+                // ImplementsMethod 层级边(impl method → iface method):显式查询词汇
+                // (接口方法找实现:trace_callers + edge_kinds=["implements_method"]),
+                // 证据锚在实现方法(覆写点)。
+                let overrides_reason = if mirrored {
+                    "method overrides interface method (mirrored duplicate)"
+                } else {
+                    "method overrides interface method (matched by name in implementing class)"
+                };
+                if let Some(ev) = entity_by_id
+                    .get(impl_m_id)
+                    .and_then(|impl_m| impl_m.evidence.first())
+                {
+                    let mut overrides = Edge::new(
+                        impl_m_id.clone(),
+                        edge.target.clone(),
+                        EdgeKind::ImplementsMethod,
+                    );
+                    overrides = overrides.with_evidence(
+                        &ev.file,
+                        ev.start_line,
+                        ev.end_line,
+                        EvidenceClass::Inferred,
+                        0.8,
+                        overrides_reason,
+                    );
+                    edges.push(overrides);
+                }
             }
         }
     }
@@ -2861,6 +2921,134 @@ mod tests {
                 .any(|(s, t)| **s == h1_handle && **t == impl_handle.id),
             "接口分发应桥到 ImplA.handle: {calls:?}"
         );
+    }
+
+    /// P0-A(第三轮反馈):多实现(不同 FQCN)是接口的正常形态而非歧义——全连,
+    /// 每个实现一条 calls 桥接(iface method → impl method)+ 一条 implements_method
+    /// 层级边(impl method → iface method,与类级 Implements 同向)。此前 hits>1 恒拒
+    /// 导致镜像仓「接口方法穷举零出边」。
+    #[test]
+    fn interface_dispatch_bridges_all_implementations() {
+        let (iface, iface_m, d) = iface_with_method(
+            "api/src/main/java/com/a/Handler.java",
+            "com.a",
+            "Handler",
+            "handle",
+        );
+        let (impl_a, a_handle, da) = class_with_method(
+            "svc1/src/main/java/com/c/ImplA.java",
+            "ImplA",
+            "handle",
+            json!({
+                "fqn": "com.c.ImplA", "implements": ["Handler"],
+                "implements_full": ["com.a.Handler"], "imports": ["com.a.Handler"]}),
+        );
+        let (impl_b, b_handle, db) = class_with_method(
+            "svc2/src/main/java/com/d/ImplB.java",
+            "ImplB",
+            "handle",
+            json!({
+                "fqn": "com.d.ImplB", "implements": ["Handler"],
+                "implements_full": ["com.a.Handler"], "imports": ["com.a.Handler"]}),
+        );
+        let entities = vec![
+            iface,
+            iface_m.clone(),
+            impl_a,
+            a_handle.clone(),
+            impl_b,
+            b_handle.clone(),
+        ];
+        let r = resolve_cross_stack(&entities, &[d, da, db]);
+        let calls = edges_of_kind(&r, EdgeKind::Calls);
+        assert_eq!(calls.len(), 2, "两个实现各一条桥接: {calls:?}");
+        assert!(
+            calls
+                .iter()
+                .any(|(s, t)| **s == iface_m.id && **t == a_handle.id)
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(s, t)| **s == iface_m.id && **t == b_handle.id)
+        );
+        let overrides = edges_of_kind(&r, EdgeKind::ImplementsMethod);
+        assert_eq!(overrides.len(), 2, "每个实现一条层级边: {overrides:?}");
+        assert!(
+            overrides
+                .iter()
+                .all(|(s, t)| **t == iface_m.id && (**s == a_handle.id || **s == b_handle.id)),
+            "方向:impl method → iface method: {overrides:?}"
+        );
+        let reason = r
+            .patch
+            .add_edges
+            .iter()
+            .find(|e| e.kind == EdgeKind::Calls && e.target == a_handle.id)
+            .and_then(|e| e.evidence.first().map(|ev| ev.reason.clone()))
+            .unwrap_or_default();
+        assert!(
+            reason.contains("1 of 2"),
+            "多实现 reason 注明数量: {reason}"
+        );
+    }
+
+    /// P0-A:同 FQCN 镜像拷贝(双部署区 SDK)在方法级收敛——组内 evidence.file 字典序
+    /// 选代表,恰一条 calls 桥接 + 一条 implements_method,reason 注明 mirrored。
+    #[test]
+    fn interface_dispatch_mirrored_copies_converge_at_method_level() {
+        let (iface, iface_m, d) = iface_with_method(
+            "api/src/main/java/com/a/Handler.java",
+            "com.a",
+            "Handler",
+            "handle",
+        );
+        let impl_meta = |fqn: &str| {
+            json!({
+                "fqn": fqn, "implements": ["Handler"],
+                "implements_full": ["com.a.Handler"], "imports": ["com.a.Handler"]})
+        };
+        let (c1, m1, d1) = class_with_method(
+            "deploy1/lib/com/c/Impl.java",
+            "Impl",
+            "handle",
+            impl_meta("com.c.Impl"),
+        );
+        let (c2, m2, d2) = class_with_method(
+            "deploy2/lib/com/c/Impl.java",
+            "Impl",
+            "handle",
+            impl_meta("com.c.Impl"),
+        );
+        let entities = vec![iface, iface_m.clone(), c1, m1.clone(), c2, m2];
+        let r = resolve_cross_stack(&entities, &[d, d1, d2]);
+        let calls = edges_of_kind(&r, EdgeKind::Calls);
+        assert_eq!(calls.len(), 1, "镜像收敛后恰一条桥接: {calls:?}");
+        assert!(
+            calls.iter().all(|(s, t)| **s == iface_m.id && **t == m1.id),
+            "代表 = 文件字典序 deploy1: {calls:?}"
+        );
+        let overrides = edges_of_kind(&r, EdgeKind::ImplementsMethod);
+        assert_eq!(overrides.len(), 1, "镜像收敛后恰一条层级边: {overrides:?}");
+        assert!(
+            overrides
+                .iter()
+                .all(|(s, t)| **s == m1.id && **t == iface_m.id),
+            "方向:impl method → iface method: {overrides:?}"
+        );
+        for kind in [EdgeKind::Calls, EdgeKind::ImplementsMethod] {
+            let reason = r
+                .patch
+                .add_edges
+                .iter()
+                .find(|e| e.kind == kind)
+                .and_then(|e| e.evidence.first().map(|ev| ev.reason.clone()))
+                .unwrap_or_default();
+            assert!(
+                reason.contains("mirrored"),
+                "{kind:?} reason 注明镜像: {reason}"
+            );
+        }
     }
 
     /// 同包档(无 import)与通配档(`com.acme.*` 在 com.acme/com.acme2 双候选下唯一命中)。

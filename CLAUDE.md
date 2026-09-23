@@ -73,7 +73,7 @@ sqlite3 "$DB" "SELECT json_extract(json,'\$.evidence[0].confidence'), COUNT(*) F
 ## 构建 / 测试
 
 - `cargo test` —— 全 workspace 单元/集成测试(**不替代**上面的真实项目验证)。
-- 版本号:根 `Cargo.toml` `[workspace.package] version`(当前 0.1.46),所有 crate `version.workspace = true`。
+- 版本号:根 `Cargo.toml` `[workspace.package] version`(当前 0.1.48),所有 crate `version.workspace = true`。
 
 ### mes-activity 反馈六项修复(v0.1.43,2026-09-22)
 
@@ -106,8 +106,19 @@ ci 三闸(fmt → clippy -D warnings → cargo test)**串行短路**,fmt 红遮�
 - **v_edge/v_entity 视图**(graph):API 字段词汇表(source/target/confidence/tentative + evidence_count/metadata)直查,`CREATE VIEW IF NOT EXISTS` 每次开库建(旧库即得);query_sql schema 清单含视图。
 - **npm wrapper 报错**附常见诱因(--no-optional/缓存/镜像)与自检 `npm ls <平台包名>`。
 - 复核澄清(未改):P0-2 误归(Constants implements)为 ≤0.1.42 观察,0.1.43 类型头扫描器已根治(ruoyi Constants 零层级出边);P1-3 verify_edge 静默猜错 / P2-3 repository 均为 0.1.43 已修项(请用户复测);P2-1 两次扫描边集不同 = INDEX_FORMAT 4 升级全量重提 + analysis 层行为变化(**analysis 层升级重扫即应用,不需 rm 库**——resolved 边每轮全量重算,与 HTTP_CALL 提取层变更不同);P2-2 中文语义弱 = 该仓 Java 无 javadoc,doc 通道无文本可用(前端中文文案命中)。
-- 排期未做:P1-1 qualified_name 路径化(class/bean/endpoint 裸名)——EntityId 哈希输入含 qualified_name,**索引格式级变更**,单独版本做。
+- 排期未做:P1-1 qualified_name 路径化(class/bean/endpoint 裸名)——EntityId 哈希输入含 qualified_name,**索引格式级变更**,单独版本做。(→ 已于 v0.1.48 落地,见下节)
 - 回归:ruoyi 7128/14889/3004(0.7:2976+0.5:28)+ depends_on 126/implements 68/superclass_of 75 零漂移;plus-ui 11/45/0/490;新增双拷贝镜像 fixture 单测(收敛+via 标注+方向+桥接+不记 note 五断言)与 `unique_or_mirrored` 单元测试。
+
+### 大仓反馈三轮:方法级贯通 + qn 路径化 + 发版校验(v0.1.48,2026-09-23)
+
+0.1.47 实测反馈(40.3 万实体)五项复核:P0-A/P2-E 成立修复;P0-B 半成立(公网 npm 五包 0.1.47 齐全,win32 晚主包 9 分钟有真实窗口,但反馈者 darwin 的直接诱因是**私源镜像同步延迟**——「装时静默、运行才炸、报错不带版本」是真放大器);P1-D 已修(v_edge/v_entity 即其期望,反馈者直连 sqlite3 查的 edge 表本身没发现视图);P1-C 成立本轮做。
+
+- **P0-A 方法级贯通**(analysis):接口分发桥接的 `hits.len()==1` 闸门在双部署区镜像仓**恒多命中全拒**(穷举零边病灶)。改造:命中按实现类 fqn 镜像分组(组内 evidence.file 字典序选代表,`unique_or_mirrored` 模式推广)+ **多实现全连**(接口的正常形态非歧义,reason 注 `1 of N`)。每组代表产两条边:Calls 桥接(iface method→impl method,0.7,默认 trace kinds 即贯通)+ **ImplementsMethod 层级边**(impl method→iface method,0.8,与类级 Implements 同向;不进默认 edge_kinds——显式查询词汇,`trace_callers + edge_kinds=["implements_method"]` 即"接口方法找实现",避免 outbound 经层级边再经桥接扩散到兄弟实现)。ruoyi:implements_method 415 条,calls 3004→3021(+17 = 6 个多实现接口方法补全,旧闸门已连 398 唯一实现)。
+- **P1-C qn 路径化**(semantics):关键发现——`EntityId::stable` 哈希输入里 `relative_path` 与 qn 槽**独立**,且 qn 槽与 qn 展示字段本就解耦(method 先例)→ **qn 字段统一 `{归一 path}#{name}`、id 槽维持裸名**:id 零变化、边零悬空、~44 处测试构造零改动。覆盖 class/interface/enum/spring_bean/http_endpoint×3/table(java+xml)/mapper;**vue_page 纯路径不动**(动则 page_by_path/renders 全断);`path_qualified` helper 统一 Windows `\`→`/` 归一。**INDEX_FORMAT 5** 强制全量重提刷新存量行 + 重嵌(ruoyi 40s/6580 实体)。**新基线:实体 7128 / 边 15321 / calls 3021(0.7:2993+0.5:28)+ implements_method 415**——id 不动的证明:与中期验证逐字节一致。同名类(4×SecurityConfig)trace 传完整 qn 消歧实测生效(裸名 12 starts → qn 6 starts)。`module_label` 残留随之根修(簇标签变真模块路径 `ruoyi-common/ruoyi-common-mybatis`);**source 排除目录首段检查仍残留**(qn 无关,另行评估)。
+- **P0-B 发版校验**:wrapper 报错读主包 optionalDependencies 带**期望版本号** + registry 镜像排查指引(`npm view <平台包>@<版本>` 区分「私源没同步」vs「没发布」);新增 `scripts/release_verify.sh`(五包 registry 存在性 + 干净目录 npm i 冒烟 + --version),发版后必跑。注意 CDN 传播窗口(checklist 第 8 条):publish 后立即跑可能误报 MISS,以 workflow 日志 `+ @cainli/xxx@版本` 为权威。
+- **P2-E 类名聚合**(mcp):trace_callers/callees 的 class/interface 起点自动展开 declares 方法进 starts(与类同级 BFS 不耗 depth,双向对称)。`start_count` 反映展开后总数;展开是**名字解析语义**,与 edge_kinds 过滤正交(kinds 不含 declares 仍可达方法,但遍历边集不得出现 declares——测试锁定该边界)。ruoyi 实测 trace_callees(SysUserServiceImpl) start_count 42、calls×30。
+- 测试:镜像方法级收敛 fixture、真多实现全连 fixture、qn 路径化 + Windows 归一 fixture;`trace_from_class_reaches_table_via_declares` 对照分支语义更新。
+- 回归:plus-ui 11/45/0/490 零漂移(frontend qn 未动);ruoyi 三闸全绿。
 
 ## 项目结构
 

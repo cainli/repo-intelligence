@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 pub struct EntityId(pub String);
 
 impl EntityId {
+    /// 身份判别输入说明:`qualified_name` 槽与 `Entity.qualified_name` 展示字段**解耦**
+    /// (method 先例:id 槽=裸方法名,qn 字段=`path#name`;同名类 id 靠 `relative_path`
+    /// 区分从不相撞)。改动 qn 展示格式**不需要**动此槽——id 稳定、边不悬空;但须升
+    /// `INDEX_FORMAT`(analysis 层)强制全量重提,否则存量行保留旧 qn。
     pub fn stable(
         source_id: &str,
         relative_path: &str,
@@ -244,8 +248,15 @@ pub enum EdgeKind {
     ReflectsTo,
     /// test_class/method -[Tests]-> 被测类:`XxxTest` 测试覆盖(Inferred,命名约定 + 引用推断)。
     Tests,
-    /// interface -[Implements]-> class:接口的实现关系(Fact,编译时生成代码如 MapStruct Impl 补全)。
+    /// class -[Implements]-> interface:实现关系(Fact 1.0,类级声明;v0.1.47 翻转为
+    /// class→iface——source implements target 读法,"接口找实现"走 trace inbound)。
     Implements,
+    /// impl_method -[ImplementsMethod]-> iface_method:方法级覆写(impl method → 接口同名
+    /// 方法,与类级 Implements 同向)。由「类级 implements 边 + 同名方法匹配」推断
+    /// (Inferred 0.8),不进 trace 默认 edge_kinds——显式查询词汇(接口方法找实现走
+    /// trace_callers + edge_kinds=["implements_method"]),避免 outbound 经层级边再经
+    /// calls 桥接扩散到兄弟实现的链路膨胀。默认贯通由接口分发 Calls 桥接承担。
+    ImplementsMethod,
     /// job -[Schedules]-> handler:调度入口触发的方法(Fact,注解贴在方法前)。
     Schedules,
     /// superclass -[SuperclassOf]-> subclass:类继承(Fact,跨文件按名解析)。outbound 方向
@@ -290,6 +301,7 @@ impl EdgeKind {
             Self::ReflectsTo => "reflects_to",
             Self::Tests => "tests",
             Self::Implements => "implements",
+            Self::ImplementsMethod => "implements_method",
             Self::Schedules => "schedules",
             Self::SuperclassOf => "superclass_of",
             Self::Throws => "throws",

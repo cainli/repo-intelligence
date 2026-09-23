@@ -157,7 +157,7 @@ fn extract_xml(file: &SourceFile, path: &str, entities: &mut Vec<Entity>, edges:
                 EntityId::stable("workspace", path, EntityKind::Table, name.as_str(), ""),
                 EntityKind::Table,
                 name.as_str(),
-                name.as_str(),
+                crate::path_qualified(path, name.as_str()),
             )
             .with_evidence(
                 path,

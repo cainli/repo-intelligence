@@ -409,13 +409,13 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "trace_callers",
-            description: "Inbound BFS (who reaches X). Default kinds: calls/injects/declares/superclass_of. Cross-file links are inferred; ground with verify_edge.",
+            description: "Inbound BFS (who reaches X). Default kinds: calls/injects/declares/superclass_of. Class starts auto-expand to declared methods. Cross-file links are inferred; ground with verify_edge.",
             input_schema: trace_input.clone(),
             output_schema: trace_output.clone(),
         },
         ToolSpec {
             name: "trace_callees",
-            description: "Outbound BFS (what X reaches). Default kinds: calls/injects/declares/superclass_of. Abstract base auto-drills into subclasses via superclass_of.",
+            description: "Outbound BFS (what X reaches). Default kinds: calls/injects/declares/superclass_of. Class starts auto-expand to declared methods; abstract base drills into subclasses via superclass_of.",
             input_schema: trace_input,
             output_schema: trace_output.clone(),
         },
@@ -1835,6 +1835,29 @@ fn trace_graph(
             "hint": hint,
         }));
     }
+    // P2-E(第三轮反馈):class/interface 起点自动下钻到 declares 的方法——方法级
+    // calls 边只挂在 method 实体上,类名查询此前零 calls 极易误判「无调用关系」。
+    // 展开的方法与类同级 BFS(不额外消耗 depth);callers/callees 双向对称
+    // (类的方法的 callers 聚合 = 「谁调用了这个类的任何方法」)。
+    let mut expanded: Vec<Entity> = Vec::new();
+    let mut seen_start: HashSet<EntityId> = starts.iter().map(|s| s.id.clone()).collect();
+    for start in &starts {
+        if !matches!(start.kind, EntityKind::Class | EntityKind::Interface) {
+            continue;
+        }
+        let declared = store.traverse(TraverseQuery {
+            start: start.id.clone(),
+            outbound: true,
+            max_depth: 1,
+            edge_kinds: vec![EdgeKind::Declares],
+        })?;
+        for entity in declared.entities {
+            if entity.kind == EntityKind::Method && seen_start.insert(entity.id.clone()) {
+                expanded.push(entity);
+            }
+        }
+    }
+    starts.extend(expanded);
     let mut entities: HashMap<EntityId, Entity> = HashMap::new();
     let mut edges: Vec<Edge> = Vec::new();
     let mut seen_edge: HashSet<(EntityId, EntityId, EdgeKind)> = HashSet::new();
@@ -2830,7 +2853,10 @@ mod tests {
             "含 declares:从 Svc 类应经 declares→calls→reads_table 到 sys_user, got {qns1:?}"
         );
 
-        // 回归对照:不含 declares 时,从类走不到 method,到不了 table。
+        // 回归对照(P2-E 后语义更新):edge_kinds 不含 declares 时,**遍历**不走
+        // declares——但 class 起点的 declares 方法展开是名字解析语义,与 edge_kinds
+        // 正交,故从类出发仍经展开的方法→calls→reads_table 抵达 table。守护边界:
+        // 可达 = 展开的功劳,遍历边集里不允许出现 declares 边。
         let kinds_without = vec![
             EdgeKind::Calls,
             EdgeKind::Injects,
@@ -2859,8 +2885,18 @@ mod tests {
             .filter_map(|e| e["qualified_name"].as_str())
             .collect();
         assert!(
-            !qns2.contains(&"sys_user"),
-            "不含 declares:从类应到不了 table, got {qns2:?}"
+            qns2.contains(&"sys_user"),
+            "类起点经方法展开仍可达 table(P2-E), got {qns2:?}"
+        );
+        let traverse_kinds2: Vec<&str> = r2["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert!(
+            !traverse_kinds2.contains(&"declares"),
+            "edge_kinds 过滤必须作用于遍历边集: {traverse_kinds2:?}"
         );
     }
 

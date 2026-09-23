@@ -529,7 +529,7 @@ fn extract_java(
             EntityId::stable("workspace", path, *kind, name.as_str(), ""),
             *kind,
             name.as_str(),
-            name.as_str(),
+            crate::path_qualified(path, name.as_str()),
         );
         let mut meta = serde_json::Map::new();
         // 类 FQN(标准 Maven/Gradle 布局从路径推导)。跨文件 pointcut/反射解析(analysis
@@ -684,7 +684,7 @@ fn extract_java(
             EntityId::stable("workspace", path, EntityKind::HttpEndpoint, &name, ""),
             EntityKind::HttpEndpoint,
             &name,
-            &name,
+            crate::path_qualified(path, &name),
         )
         .with_metadata(serde_json::Value::Object(meta))
         .with_evidence(
@@ -803,7 +803,7 @@ fn extract_custom_endpoints(
             ),
             EntityKind::HttpEndpoint,
             &name,
-            &name,
+            crate::path_qualified(path, &name),
         )
         .with_metadata(json!({"path": endpoint_path, "framework": "custom"}))
         .with_evidence(
@@ -923,7 +923,7 @@ fn extract_mybatis_plus(
             EntityId::stable("workspace", path, EntityKind::Table, &table_name_str, ""),
             EntityKind::Table,
             &table_name_str,
-            &table_name_str,
+            crate::path_qualified(path, &table_name_str),
         )
         .with_evidence(
             path,
@@ -1046,7 +1046,7 @@ fn extract_mybatis_plus(
             EntityId::stable("workspace", path, EntityKind::Mapper, mname.as_str(), ""),
             EntityKind::Mapper,
             mname.as_str(),
-            mname.as_str(),
+            crate::path_qualified(path, mname.as_str()),
         )
         .with_metadata(json!({"entity_type": entity_type}))
         .with_evidence(
@@ -1475,7 +1475,7 @@ fn extract_interface_endpoints(
             endpoint_id.clone(),
             EntityKind::HttpEndpoint,
             &class_name,
-            &class_name,
+            crate::path_qualified(path, &class_name),
         )
         .with_metadata(json!({"path": class_name, "framework": format!("implements {iface}")}))
         .with_evidence(
@@ -2433,7 +2433,7 @@ fn visit_methods(
             ),
             EntityKind::Method,
             &name,
-            format!("{path}#{name}"),
+            crate::path_qualified(path, &name),
         )
         .with_evidence(
             path,
@@ -2662,7 +2662,7 @@ fn link_bean(
         EntityId::stable("workspace", path, EntityKind::SpringBean, type_name, ""),
         EntityKind::SpringBean,
         type_name,
-        type_name,
+        crate::path_qualified(path, type_name),
     )
     .with_evidence(
         path,
