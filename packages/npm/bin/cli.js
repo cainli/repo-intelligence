@@ -26,7 +26,17 @@ try {
 
 if (!binary) {
   console.error(
-    `Native package ${packageName} is unavailable. Reinstall @cainli/repo-intelligence for ${process.platform}-${process.arch}.`,
+    `Native package ${packageName} is unavailable. Reinstall @cainli/repo-intelligence for ${process.platform}-${process.arch}.
+
+Common causes (platform binaries ship as optionalDependencies):
+  - installed with --no-optional / --omit=optional
+  - npm cache corruption or an offline/registry-mirror install failure
+
+Self-check:
+  npm ls ${packageName}
+
+Fix:
+  npm install -g @cainli/repo-intelligence --force`,
   );
   process.exit(1);
 }

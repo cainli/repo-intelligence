@@ -876,18 +876,55 @@ struct TypeProfile<'a> {
     package: Option<String>,
 }
 
-/// import 消歧阶梯,逐档要求唯一命中,任何一档多命中落下一档:
+/// 档内命中集收敛:唯一命中直取;多命中但 FQCN 全同(git submodule 双 SDK 拷贝等
+/// 同包同名物理多份,语义上是同一类型)→ 任选其一,evidence.file 字典序保稳定
+/// (增量扫描先后入库不漂移——两次扫描边集漂移是大仓反馈的独立投诉)。
+/// FQCN 互不相同才是真歧义 → None;fqn 缺失(None)不参与镜像判定,保守当真歧义。
+fn unique_or_mirrored<'a>(hits: &[&'a Entity]) -> Option<&'a Entity> {
+    match hits.len() {
+        0 => None,
+        1 => Some(hits[0]),
+        _ => {
+            let f0 = java_fqn_of(hits[0]);
+            if f0.is_some() && hits.iter().all(|h| java_fqn_of(h) == f0) {
+                hits.iter()
+                    .min_by_key(|h| h.evidence.first().map(|e| e.file.as_str()).unwrap_or(""))
+                    .copied()
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// import 消歧阶梯,逐档要求唯一命中(或镜像收敛),任何一档多命中落下一档:
 ///   fqn exact(implements_full/superclass_full 含 '.' 时与候选 fqn 等值,连 import
 ///   都不用看)> 全局唯一(不需要 caller 画像)> 显式 import(import 串 == 候选 fqn,
-///   Java 语法禁同简单名两条显式 import,命中天然 ≤1)> 同包 > 通配 import(`x.y.*`
-///   前缀带点覆盖且候选恰为该前缀直下类)。
-/// 返回 (目标 id, 消歧方式;空串 = 无需消歧),全落空 → None(调用端拒 + note)。
+///   Java 语法禁同简单名两条显式 import;同 FQCN 双拷贝会同时命中两实体,由
+///   unique_or_mirrored 镜像收敛救回)> 同包 > 通配 import(`x.y.*` 前缀带点覆盖
+///   且候选恰为该前缀直下类)。
+/// 返回 (目标 id, 消歧方式;空串 = 无需消歧;镜像命中追加 "(mirrored duplicate)"),
+/// 全落空 → None(调用端拒 + note)。
 fn resolve_type<'a>(
     profiles: &HashMap<&'a EntityId, TypeProfile<'a>>,
     full: Option<&str>,
     candidates: &[&'a Entity],
     caller: &Entity,
-) -> Option<(&'a EntityId, &'static str)> {
+) -> Option<(&'a EntityId, String)> {
+    // 档命中 → 收敛结果;镜像命中(多份同 FQCN)在 via 上注明,消费端可辨识。
+    let settle = |hits: &[&'a Entity], via: &str| -> Option<(&'a EntityId, String)> {
+        let mirrored = hits.len() > 1;
+        unique_or_mirrored(hits).map(|hit| {
+            (
+                &hit.id,
+                if mirrored {
+                    format!("{via} (mirrored duplicate)")
+                } else {
+                    via.to_string()
+                },
+            )
+        })
+    };
     if let Some(f) = full
         && f.contains('.')
     {
@@ -896,12 +933,16 @@ fn resolve_type<'a>(
             .copied()
             .filter(|c| profiles.get(&c.id).and_then(|p| p.fqn) == Some(f))
             .collect();
-        if hits.len() == 1 {
-            return Some((&hits[0].id, "fqn exact"));
+        if let Some(found) = settle(&hits, "fqn exact") {
+            return Some(found);
         }
     }
     if candidates.len() == 1 {
-        return Some((&candidates[0].id, ""));
+        return Some((&candidates[0].id, String::new()));
+    }
+    // 全候选 FQCN 同(纯镜像拷贝,无真歧义混入):无需 caller 画像,直接收敛。
+    if let Some(found) = settle(candidates, "mirrored duplicate") {
+        return Some(found);
     }
     let caller_profile = profiles.get(&caller.id)?;
     // ① 显式 import
@@ -915,8 +956,8 @@ fn resolve_type<'a>(
             caller_profile.imports.contains(&f)
         })
         .collect();
-    if hits.len() == 1 {
-        return Some((&hits[0].id, "via explicit import"));
+    if let Some(found) = settle(&hits, "via explicit import") {
+        return Some(found);
     }
     // ② 同包(无 import 的同包引用)
     if let Some(pkg) = &caller_profile.package {
@@ -927,8 +968,8 @@ fn resolve_type<'a>(
                 profiles.get(&c.id).and_then(|p| p.package.as_deref()) == Some(pkg.as_str())
             })
             .collect();
-        if hits.len() == 1 {
-            return Some((&hits[0].id, "via same package"));
+        if let Some(found) = settle(&hits, "via same package") {
+            return Some(found);
         }
     }
     // ③ 通配 import:`com.acme.*` → 前缀 "com.acme."(带点,防吞 com.acme2),
@@ -947,8 +988,8 @@ fn resolve_type<'a>(
             })
         })
         .collect();
-    if hits.len() == 1 {
-        return Some((&hits[0].id, "via wildcard import"));
+    if let Some(found) = settle(&hits, "via wildcard import") {
+        return Some(found);
     }
     None
 }
@@ -1404,7 +1445,7 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
                 {
                     resolved = Some(callee_id);
                     confidence = 0.7;
-                    reason = with_via("cross-file call via injected field receiver", via);
+                    reason = with_via("cross-file call via injected field receiver", &via);
                     via_field = true;
                 }
             }
@@ -1423,7 +1464,7 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
                 {
                     resolved = Some(callee_id);
                     confidence = 0.7;
-                    reason = with_via("cross-file static call on named type", via);
+                    reason = with_via("cross-file static call on named type", &via);
                 }
             }
             // 优先级 2:裸名 / 未精确解析的 name → 注入依赖类型名匹配(低保真),唯一命中 0.5。
@@ -1521,10 +1562,12 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
                 );
             }
             edges.push(edge);
-            // 反向 Implements 边(interface→class):让"接口有哪些实现"可查(P1-5 MapStruct
-            // Impl 等编译时生成代码补全后,接口到实现的显式语义)。
+            // Implements 边(class→iface):source implements target 读法直觉
+            // (Impl implements Iface)。两位用户先后报 iface→class "方向疑反"后翻转;
+            // "接口有哪些实现"改走 trace direction=inbound。DependsOn(class→iface)
+            // 保留——正向依赖语义,聚类/影响面用。
             let mut impl_edge =
-                Edge::new(iface_id.clone(), entity.id.clone(), EdgeKind::Implements);
+                Edge::new(entity.id.clone(), iface_id.clone(), EdgeKind::Implements);
             if let Some(ev) = entity.evidence.first() {
                 impl_edge = impl_edge.with_evidence(
                     &ev.file,
@@ -1532,7 +1575,7 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
                     ev.end_line,
                     EvidenceClass::Fact,
                     1.0,
-                    "interface implemented by class",
+                    "class implements interface",
                 );
             }
             edges.push(impl_edge);
@@ -2937,5 +2980,165 @@ mod tests {
         assert_eq!(renders.len(), 1, "反斜杠 qualified_name 也要 renders 连通");
         assert_eq!(renders[0].0, &route.id);
         assert_eq!(renders[0].1, &page.id);
+    }
+
+    // ---- 镜像拷贝消歧(大仓反馈 P0-1/P0-2:git submodule 双 SDK 同 FQCN 物理两份)----
+    // 旧阶梯各档 hits.len()>1 全落空 → 注入字段调用无边、implements 边为 0;修复后
+    // 同 FQCN 候选任选其一(file 字典序保确定性),via 标 mirrored duplicate。
+
+    #[test]
+    fn unique_or_mirrored_distinguishes_copies_from_true_ambiguity() {
+        let e = |path: &str, fqn: Option<&str>| {
+            let mut meta = serde_json::Map::new();
+            if let Some(f) = fqn {
+                meta.insert("fqn".into(), json!(f));
+            }
+            Entity::new(
+                EntityId::stable("workspace", path, EntityKind::Interface, "Foo", ""),
+                EntityKind::Interface,
+                "Foo",
+                "Foo",
+            )
+            .with_metadata(serde_json::Value::Object(meta))
+            .with_evidence(path, 1, 1, EvidenceClass::Fact, 1.0, "iface")
+        };
+        let a = e("b/Foo.java", Some("com.x.Foo"));
+        let b = e("a/Foo.java", Some("com.x.Foo"));
+        let c = e("c/Foo.java", Some("com.y.Foo"));
+        let nofqn = e("d/Foo.java", None);
+        assert!(unique_or_mirrored(&[]).is_none());
+        assert_eq!(
+            unique_or_mirrored(&[&a]).map(|x| x.id.clone()),
+            Some(a.id.clone())
+        );
+        // 同 FQCN 两份:字典序第一(a/Foo.java),与入库顺序无关
+        let pick = unique_or_mirrored(&[&a, &b]).unwrap();
+        assert_eq!(pick.evidence.first().unwrap().file, "a/Foo.java");
+        // 异 FQCN / fqn 缺失混入:真歧义,保守拒
+        assert!(unique_or_mirrored(&[&a, &c]).is_none());
+        assert!(unique_or_mirrored(&[&a, &nofqn]).is_none());
+    }
+
+    /// 镜像拷贝下的三连:注入字段 calls 落字典序第一份(via 注明)、implements 消解
+    /// 收敛 + Implements 边方向 class→iface、接口分发桥接到实现方法;不记歧义 note。
+    #[test]
+    fn mirrored_duplicate_copies_converge_instead_of_refusing() {
+        let (h1, hm1, d1) = iface_with_method(
+            "mod1/src/main/java/com/sdk/FooService.java",
+            "com.sdk",
+            "FooService",
+            "bar",
+        );
+        let (h2, hm2, d2) = iface_with_method(
+            "mod2/src/main/java/com/sdk/FooService.java",
+            "com.sdk",
+            "FooService",
+            "bar",
+        );
+        let mod1_bar = hm1.id.clone();
+        let mod1_iface = h1.id.clone();
+        // 宿主:注入字段类型裸名 FooService,run 里 h.bar()
+        let host_path = "app/src/main/java/com/app/Host.java";
+        let host = Entity::new(
+            EntityId::stable("workspace", host_path, EntityKind::Class, "Host", ""),
+            EntityKind::Class,
+            "Host",
+            "Host",
+        )
+        .with_metadata(json!({
+            "fqn": "com.app.Host", "imports": ["com.sdk.FooService"],
+            "injected_fields": [{"name": "h", "type": "FooService"}]}))
+        .with_evidence(host_path, 1, 1, EvidenceClass::Fact, 1.0, "class");
+        let run = Entity::new(
+            EntityId::stable("workspace", host_path, EntityKind::Method, "run", ""),
+            EntityKind::Method,
+            "run",
+            "run",
+        )
+        .with_metadata(json!({"invokes": [{"name": "bar", "receiver": "h", "receiver_kind": "name", "line": 9}]}))
+        .with_evidence(host_path, 2, 2, EvidenceClass::Fact, 1.0, "method");
+        // 实现:implements_full 带 FQCN,fqn exact 档同 FQCN 命中 2 → 镜像收敛
+        let (impl_c, impl_bar, di) = class_with_method(
+            "app/src/main/java/com/app/FooServiceImpl.java",
+            "FooServiceImpl",
+            "bar",
+            json!({"fqn": "com.app.FooServiceImpl", "imports": ["com.sdk.FooService"],
+                   "implements": ["FooService"], "implements_full": ["com.sdk.FooService"]}),
+        );
+        let bean = Entity::new(
+            EntityId::stable(
+                "workspace",
+                host_path,
+                EntityKind::SpringBean,
+                "FooService",
+                "",
+            ),
+            EntityKind::SpringBean,
+            "FooService",
+            "FooService",
+        );
+        let entities = vec![
+            h1,
+            h2,
+            hm1,
+            hm2,
+            host.clone(),
+            run.clone(),
+            impl_c.clone(),
+            impl_bar.clone(),
+            bean.clone(),
+        ];
+        let extract_edges = vec![
+            d1,
+            d2,
+            di,
+            Edge::new(host.id.clone(), run.id.clone(), EdgeKind::Declares),
+            Edge::new(host.id.clone(), bean.id.clone(), EdgeKind::Injects),
+        ];
+        let r = resolve_cross_stack(&entities, &extract_edges);
+        let calls = edges_of_kind(&r, EdgeKind::Calls);
+        // ① 字段路径:run → 字典序第一份(mod1)的 bar
+        assert!(
+            calls.iter().any(|(s, t)| **s == run.id && **t == mod1_bar),
+            "同 FQCN 镜像拷贝字段调用应收敛到字典序第一份: {calls:?}"
+        );
+        // ② via 注明 mirrored duplicate,消费端可辨识
+        let via_note = r
+            .patch
+            .add_edges
+            .iter()
+            .find(|e| e.kind == EdgeKind::Calls && e.source == run.id && e.target == mod1_bar)
+            .and_then(|e| e.evidence.first().map(|ev| ev.reason.as_str()))
+            .unwrap_or_default();
+        assert!(
+            via_note.contains("mirrored duplicate"),
+            "via 应注明镜像: {via_note}"
+        );
+        // ③ implements 镜像收敛 + Implements 边方向 class→iface(翻转后)
+        let impl_edges = edges_of_kind(&r, EdgeKind::Implements);
+        assert_eq!(
+            impl_edges.len(),
+            1,
+            "唯一实现只建一条 Implements: {impl_edges:?}"
+        );
+        assert!(
+            impl_edges
+                .iter()
+                .any(|(s, t)| **s == impl_c.id && **t == mod1_iface),
+            "Implements 方向应为 class→iface: {impl_edges:?}"
+        );
+        // ④ 接口分发桥接:mod1 的 bar → FooServiceImpl#bar
+        assert!(
+            calls
+                .iter()
+                .any(|(s, t)| **s == mod1_bar && **t == impl_bar.id),
+            "镜像收敛后桥接应到 FooServiceImpl#bar: {calls:?}"
+        );
+        // ⑤ 镜像不是歧义:不记 note
+        assert!(
+            r.ambiguities.iter().all(|n| n.name != "FooService"),
+            "镜像收敛不记 note: {:?}",
+            r.ambiguities
+        );
     }
 }

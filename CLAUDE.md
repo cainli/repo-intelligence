@@ -85,7 +85,7 @@ sqlite3 "$DB" "SELECT json_extract(json,'\$.evidence[0].confidence'), COUNT(*) F
 - **repository fail-loud**(mcp):无效短名先试 manifest 尾段匹配再 bail;manifest 仅库已存在才登记(查询调用不污染 registry);trace 空结果区分"名字没找到"vs"路由到空库";`list_repositories` 单库回退 `repo_id:"default"`。注意:**repository 参数约定是 scan 时的仓库根路径,尾段短名(mes/mos)也可**。
 - **verify_edge 确定性消解**:kind 偏好排序(声明实体 > spring_bean 影子)+ `resolved`/`candidates` 回显;trace 顶层 `nodes` 查找表(仅当前边页端点)。
 - **query_sql 错误近邻提示**(graph):`no such table/column` 带 levenshtein 建议与完整 schema 清单。
-- **INDEX_FORMAT 现为 4**——旧库升级首扫全量重提+重 embed(ruoyi 790 文件 ~90s 含 embedding 65s;doc 拉长 embedding 文本,比 0.1.42 的 ~20s 慢属预期)。回归基线:实体 7128 / 边 14889 / calls 3004(0.7:2976+0.5:28)与 0.1.42 逐字节一致;plus-ui 三项 11/45/0/490 全对齐。反馈误诊澄清:verify_edge "模糊匹配"实为 spring_bean 影子实体 rowid 盲取;implements "方向疑反"实为反向边(iface→class,正向边 kind 是 DependsOn)。
+- **INDEX_FORMAT 现为 4**——旧库升级首扫全量重提+重 embed(ruoyi 790 文件 ~90s 含 embedding 65s;doc 拉长 embedding 文本,比 0.1.42 的 ~20s 慢属预期)。回归基线:实体 7128 / 边 14889 / calls 3004(0.7:2976+0.5:28)与 0.1.42 逐字节一致;plus-ui 三项 11/45/0/490 全对齐。反馈误诊澄清:verify_edge "模糊匹配"实为 spring_bean 影子实体 rowid 盲取;implements "方向疑反"当时判定为反向边设计,后经第二位用户再报于 v0.1.47 翻转(见下)。
 - 提交风格:`release vX.Y.Z: ...`(见 git log)。
 
 ### Windows 路径分隔符修复 + CI 三闸清偿(v0.1.44-0.1.46,2026-09-22)
@@ -96,6 +96,18 @@ ci 三闸(fmt → clippy -D warnings → cargo test)**串行短路**,fmt 红遮�
 - **repository 短名路由 Windows 全废**(0.1.46):manifest 存 canonicalize 产物(`\\?\C:\...` 前缀 + `\` 分隔),`ends_with("/x")` 三档全失配 → fail-loud 误报 "matched no indexed repository"。匹配提纯为纯函数 `manifest_path_matches`(剥前缀归一后三档比对)。
 - **已知残留(静默降级,非测试爆炸,待评估)**:`module_label` 聚类标签、source 排除目录首段检查同病;根修涉及 qualified_name 构造(**EntityId 哈希输入 = 索引格式级变更**),不可顺手改。
 - **发版规则**:版本已上 npm 的不可 force tag(403),重发一律升版本号;0.1.44 为中间版(仅 clippy 清偿),最终交付 0.1.46。
+
+### 大仓反馈二轮:镜像拷贝消歧 + Implements 方向翻转(v0.1.47,2026-09-23)
+
+数十万实体大仓(0.1.46 实测)反馈复核:两条 P0 同根——**同 FQCN 镜像拷贝(git submodule 双 SDK)下 resolve_type 五档全拒**。注释"显式 import 命中天然 ≤1"的前提是候选 FQCN 互不相同;镜像拷贝两候选 FQCN 相同,一条 import 同时命中两实体,`hits.len()==2` 逐档落空 → 注入字段 calls 无边(P0-1)+ implements 边为 0(P0-2)。"接口字段无边/具体类字段有边"的分叉 = 接口来自 SDK 双拷贝、具体类业务自写全局唯一。
+
+- **镜像收敛**(`unique_or_mirrored`,analysis):各档命中集内 FQCN 全同 → 任选其一(evidence.file 字典序,增量先后入库不漂移),via 追加 `(mirrored duplicate)`;FQCN 互不相同才是真歧义仍拒+note;fqn 缺失不参与镜像判定。注入字段/静态/implements/superclass/裸名注入全路径救活,接口分发桥接随之连通。
+- **Implements 方向翻转**:iface→class 改 **class→iface**(source implements target 读法;两位用户先后报"方向疑反")。"接口找实现"改走 trace direction=inbound;DependsOn(class→iface)保留。消费端仅聚类(方向无关)零风险;ruoyi implements 68 条仅 source/target 互换。
+- **v_edge/v_entity 视图**(graph):API 字段词汇表(source/target/confidence/tentative + evidence_count/metadata)直查,`CREATE VIEW IF NOT EXISTS` 每次开库建(旧库即得);query_sql schema 清单含视图。
+- **npm wrapper 报错**附常见诱因(--no-optional/缓存/镜像)与自检 `npm ls <平台包名>`。
+- 复核澄清(未改):P0-2 误归(Constants implements)为 ≤0.1.42 观察,0.1.43 类型头扫描器已根治(ruoyi Constants 零层级出边);P1-3 verify_edge 静默猜错 / P2-3 repository 均为 0.1.43 已修项(请用户复测);P2-1 两次扫描边集不同 = INDEX_FORMAT 4 升级全量重提 + analysis 层行为变化(**analysis 层升级重扫即应用,不需 rm 库**——resolved 边每轮全量重算,与 HTTP_CALL 提取层变更不同);P2-2 中文语义弱 = 该仓 Java 无 javadoc,doc 通道无文本可用(前端中文文案命中)。
+- 排期未做:P1-1 qualified_name 路径化(class/bean/endpoint 裸名)——EntityId 哈希输入含 qualified_name,**索引格式级变更**,单独版本做。
+- 回归:ruoyi 7128/14889/3004(0.7:2976+0.5:28)+ depends_on 126/implements 68/superclass_of 75 零漂移;plus-ui 11/45/0/490;新增双拷贝镜像 fixture 单测(收敛+via 标注+方向+桥接+不记 note 五断言)与 `unique_or_mirrored` 单元测试。
 
 ## 项目结构
 

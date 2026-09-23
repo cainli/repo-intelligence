@@ -306,10 +306,12 @@ impl SqliteGraphStore {
             .and_then(|s| s.split_whitespace().next())
             .map(|s| s.trim_matches('\'').to_string())
             .unwrap_or_default();
-        // 真实 schema:表清单(FTS shadow 表过滤)+ 各表列名。
+        // 真实 schema:表+视图清单(FTS shadow 表过滤)+ 各表列名(视图也参与
+        // 近邻提示——v_edge/v_entity 是 API 字段词汇表的官方入口,清单里看不到
+        // 等于没做)。
         let mut tables: Vec<String> = Vec::new();
         if let Ok(mut stmt) = self.connection.prepare(
-            "SELECT name FROM sqlite_master WHERE type='table' \
+            "SELECT name FROM sqlite_master WHERE type IN ('table','view') \
              AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'entity_fts_%'",
         ) && let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0))
         {
@@ -427,6 +429,23 @@ impl SqliteGraphStore {
                 top_nodes TEXT NOT NULL DEFAULT '[]',
                 size INTEGER NOT NULL DEFAULT 0
             );
+            -- API 同名字段兼容视图(大仓反馈 P1-2:trace/query 回包是 source/target/
+            -- confidence/tentative,裸 SQL 直连却是 source_id/target_id/json,两套词汇
+            -- 表只能靠踩坑习得)。v_edge 直接暴露 API 字段名;旧库 execute 时一并建。
+            CREATE VIEW IF NOT EXISTS v_edge AS
+            SELECT e.source_id, e.target_id, e.kind, e.resolved,
+                   e.start_line, e.end_line,
+                   s.qualified_name AS source, t.qualified_name AS target,
+                   json_extract(e.json, '$.evidence[0].confidence') AS confidence,
+                   json_extract(e.json, '$.tentative') AS tentative
+            FROM edge e
+            JOIN entity s ON s.id = e.source_id
+            JOIN entity t ON t.id = e.target_id;
+            CREATE VIEW IF NOT EXISTS v_entity AS
+            SELECT id, kind, name, qualified_name, start_line, end_line,
+                   json_array_length(json, '$.evidence') AS evidence_count,
+                   json_extract(json, '$.metadata') AS metadata
+            FROM entity;
             ",
         )?;
         // 旧库迁移:为已存在的 edge 表补 `resolved` 列(新库已在 CREATE 中带)。
@@ -1140,7 +1159,7 @@ impl GraphStore for SqliteGraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use repo_intelligence_model::EdgeKind;
+    use repo_intelligence_model::{EdgeKind, EntityKind, EvidenceClass};
 
     fn id(value: &str) -> EntityId {
         EntityId(value.to_string())
@@ -1157,6 +1176,7 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("Did you mean `edge`?"), "{msg}");
         assert!(msg.contains("Tables: cluster_info, edge, entity"), "{msg}");
+        assert!(msg.contains("v_edge, v_entity"), "{msg}");
         assert!(msg.contains("`kind` is the discriminator"), "{msg}");
         // 列名误猜(edge_kind)→ 建议 kind;平局列出全部归属表(kind 在
         // edge/entity 都有,entity_embedding 的 entity_id 同距,不能瞎指一个)
@@ -1174,6 +1194,58 @@ mod tests {
                 .read_only_query("SELECT COUNT(*) FROM entity", 10)
                 .is_ok()
         );
+    }
+
+    /// P1-2(大仓反馈):v_edge/v_entity 视图暴露 trace/query API 同名字段,
+    /// 裸 SQL 不必再学 source_id/json 一套词汇表。
+    #[test]
+    fn views_expose_api_field_vocabulary() {
+        let mut store = SqliteGraphStore::open_in_memory().unwrap();
+        let cls = Entity::new(id("host"), EntityKind::Class, "Host", "src/Host.java")
+            .with_evidence("src/Host.java", 1, 9, EvidenceClass::Fact, 1.0, "class");
+        let m = Entity::new(id("run"), EntityKind::Method, "run", "src/Host.java#run")
+            .with_evidence("src/Host.java", 2, 8, EvidenceClass::Fact, 1.0, "method");
+        store
+            .apply_patch(GraphPatch::add(vec![cls, m], Vec::new()))
+            .unwrap();
+        let call = Edge::new(id("run"), id("run2"), EdgeKind::Calls).with_evidence(
+            "src/Host.java",
+            5,
+            5,
+            EvidenceClass::Inferred,
+            0.7,
+            "cross-file call via injected field receiver (mirrored duplicate)",
+        );
+        // run2 实体不存在(v_edge JOIN entity 会过滤悬空边)——补一个最小实体
+        let m2 = Entity::new(id("run2"), EntityKind::Method, "bar", "svc/Foo.java#bar")
+            .with_evidence("svc/Foo.java", 3, 3, EvidenceClass::Fact, 1.0, "method");
+        store
+            .apply_patch(GraphPatch::add(vec![m2], vec![call]))
+            .unwrap();
+        let qr = store
+            .read_only_query(
+                "SELECT source, target, confidence, kind FROM v_edge WHERE kind='calls'",
+                10,
+            )
+            .unwrap();
+        let col = |name: &str| qr.columns.iter().position(|c| c == name).unwrap();
+        assert_eq!(
+            qr.rows[0][col("source")].as_str().unwrap(),
+            "src/Host.java#run"
+        );
+        assert_eq!(
+            qr.rows[0][col("target")].as_str().unwrap(),
+            "svc/Foo.java#bar"
+        );
+        assert!((qr.rows[0][col("confidence")].as_f64().unwrap() - 0.7).abs() < 1e-6);
+        let qr = store
+            .read_only_query(
+                "SELECT name, evidence_count FROM v_entity WHERE id='run'",
+                10,
+            )
+            .unwrap();
+        let col = |name: &str| qr.columns.iter().position(|c| c == name).unwrap();
+        assert_eq!(qr.rows[0][col("evidence_count")].as_i64().unwrap(), 1);
     }
 
     #[test]
