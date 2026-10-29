@@ -130,6 +130,10 @@ ci 三闸(fmt → clippy -D warnings → cargo test)**串行短路**,fmt 红遮�
 - **P0-A′ 发版卡点进 CI**:release.yml 新增 `verify-release` job(needs: publish-main)调 release_verify.sh(`RETRIES=10 INTERVAL_SEC=90` 沉降重试,CDN 传播窗口实测 5-10 分钟各包独立交错)——半截发版当轮红灯,不再依赖人工。**P1-B′** v_edge 传达:docs/sql-views.md(字段映射表+示例+常见坑)+ scan 尾部 stderr Tip。
 - 回归:ruoyi 新基线 **7128/15321 零漂移**(src/test 本无 bean,排除功能不误伤;calls 3021/implements_method 415 等全部不变);plus-ui 56/0/490 + embedded_count=0。**ruoyi 升 6 重提即「中断重跑」等价场景,embedded_count==0 即断点续扫的实库验收**。
 
+### Windows scanlock 探活修复(v0.1.51,2026-10-29)
+
+v0.1.50 带着红 ci 发出(release.yml 与 ci.yml 独立,互不阻塞):Windows runner 上 `scanlock_rejects_live_pid_and_cleans_stale` panic——`process_alive` 的 `not(unix)` 分支恒真,死 PID 999999 被当活锁拒掉。产品缺陷不止测试:Windows 崩溃/强杀残留锁**永不自愈**,用户只能手动 `--takeover`。修:windows 改 `tasklist /FI "PID eq N" /FO CSV /NH`,按**引号锚定的 PID 字段**判定(无匹配的 INFO 文案是本地化的,不能按字面匹配);判定提纯 `tasklist_reports_alive` 纯函数 + 四形态 fixture(英文/中文 miss、CSV hit、`"19999"` 防 `"9999"` 子串误命中)——任何平台可测,不再依赖 win runner 暴露(0.1.45 反斜杠同策略)。探活 spawn 失败仍保守判活。unix 分支零变化。教训:**cfg 门控平台分支的代码,其配套单测在默认平台就是 dead code,clippy -D warnings 会拦**——纯函数要 `#[cfg(any(windows, test))]` 门控。
+
 ## 项目结构
 
 - `crates/` — config / model / source / parsing / semantics / graph / analysis / protocol / mcp / cli

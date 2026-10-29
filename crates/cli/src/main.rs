@@ -440,8 +440,10 @@ impl Drop for ScanLock {
     }
 }
 
-/// PID 探活:unix 用 `ps -p`(零依赖;libc kill(2) 需加直接依赖,不值),其余平台
-/// 一律视为存活(保守——错误提示用户 --takeover,不会误杀真并发 scan)。
+/// PID 探活:unix 用 `ps -p`(零依赖;libc kill(2) 需加直接依赖,不值),windows 用
+/// `tasklist /FI "PID eq N" /FO CSV /NH`(同为系统自带);探活失败与其余平台一律
+/// 视为存活(保守——错误提示用户 --takeover,不会误杀真并发 scan)。0.1.51 前
+/// 非 unix 恒真,Windows 崩溃残留锁永不自愈。
 fn process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -454,11 +456,31 @@ fn process_alive(pid: u32) -> bool {
             .map(|s| s.success())
             .unwrap_or(true)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        match std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+        {
+            Ok(out) => tasklist_reports_alive(&String::from_utf8_lossy(&out.stdout), pid),
+            Err(_) => true,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         true
     }
+}
+
+/// `tasklist /FI "PID eq N" /FO CSV /NH` 输出判定:命中时 CSV 行第二字段是引号
+/// 包裹的 PID,按 `"N"` 整体锚定(防 `"19999"` 误命中 `"9999"`);无匹配时的 INFO
+/// 文案是本地化的(中/英互不相同),不能按字面匹配,但任何形态都不含引号锚定的
+/// PID → 判死自动清锁。纯函数,任何平台可单测(0.1.45 反斜杠 fixture 同策略)。
+/// 生产调用方仅在 windows 分支,unix 下为 fixture 单测保留。
+#[cfg(any(windows, test))]
+fn tasklist_reports_alive(stdout: &str, pid: u32) -> bool {
+    stdout.contains(&format!("\"{pid}\""))
 }
 
 fn log_scan_progress(progress: ScanProgress) {
@@ -758,6 +780,32 @@ mod tests {
         let (matches, unmatched) = match_http_calls(&clients, &endpoints);
         assert!(matches.is_empty(), "method 不同不误连");
         assert_eq!(unmatched.len(), 1);
+    }
+
+    /// tasklist CSV 判定 fixture(Windows-only 行为,纯函数任何平台可测,不再依赖
+    /// win runner 暴露)。样例取自 tasklist 真实输出形态。
+    #[test]
+    fn tasklist_alive_detection_is_locale_safe() {
+        // 命中:CSV 行含引号包裹的 PID(第二字段)。
+        assert!(tasklist_reports_alive(
+            "\"repo-intelligence.exe\",\"9999\",\"Console\",\"1\",\"12,345 K\"\r\n",
+            9999
+        ));
+        // 无匹配(英文文案):不含引号锚定 PID → 判死,scanlock 自动清。
+        assert!(!tasklist_reports_alive(
+            "INFO: No tasks are running which match the specified criteria.\r\n",
+            999999
+        ));
+        // 无匹配(中文文案,GBK 经 from_utf8_lossy 错位):同样判死。
+        assert!(!tasklist_reports_alive(
+            "信息: 没有运行的任务匹配指定标准。\r\n",
+            999999
+        ));
+        // 引号锚定:同数字结尾的他 PID 不误命中。
+        assert!(!tasklist_reports_alive(
+            "\"clippy-driver.exe\",\"19999\",\"Console\",\"1\",\"98,765 K\"\r\n",
+            9999
+        ));
     }
 
     /// P1-C′-2:scanlock 三态——死 PID 自动清、活 PID 拒、--takeover 覆盖。
