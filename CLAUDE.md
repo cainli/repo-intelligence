@@ -130,6 +130,18 @@ ci 三闸(fmt → clippy -D warnings → cargo test)**串行短路**,fmt 红遮�
 - **P0-A′ 发版卡点进 CI**:release.yml 新增 `verify-release` job(needs: publish-main)调 release_verify.sh(`RETRIES=10 INTERVAL_SEC=90` 沉降重试,CDN 传播窗口实测 5-10 分钟各包独立交错)——半截发版当轮红灯,不再依赖人工。**P1-B′** v_edge 传达:docs/sql-views.md(字段映射表+示例+常见坑)+ scan 尾部 stderr Tip。
 - 回归:ruoyi 新基线 **7128/15321 零漂移**(src/test 本无 bean,排除功能不误伤;calls 3021/implements_method 415 等全部不变);plus-ui 56/0/490 + embedded_count=0。**ruoyi 升 6 重提即「中断重跑」等价场景,embedded_count==0 即断点续扫的实库验收**。
 
+### FTS 删除全表扫根除:rowid 对齐 + 批量子树删除(v0.1.52,2026-10-29)
+
+mes-activity(45.9 万实体)升 0.1.51 后全量重提(INDEX_FORMAT 4/5→6)卡死在 `phase=persisting progress=0/30279` 纹丝不动。根因不是锁/死锁,是**FTS5 的二次方**:`entity_fts.entity_id` 是 UNINDEXED 列,`WHERE entity_id IN (...)` 删除是虚拟表**全表 SCAN**(45.9 万行单次 60ms,EXPLAIN 实证);`delete_file_subtree` 逐文件调用 × 30,279 文件 = 1.4×10¹⁰ 行扫描(小时级),且删除循环只在循环前上报一次 0/total——正常推进也显示 0。ruoyi(7128 行 FTS,全扫总成本 <1s)从未暴露,**库大小掩盖二次方**。诊断线索链:doctor 的 `fts reconcile 22.63s` 是 scan 中断后的漂移重建(症状非病因);`discover 26298 < to_delete 30279` 的 3,981 差 = submodule 未 checkout 的消失文件(行为正确,提醒用户确认)。
+
+- **ensure_fts_rowid_aligned**(graph):`fts.rowid := entity.rowid` 一次性迁移,`PRAGMA user_version`(空闲)记 1;**不变量:所有写 entity_fts 的路径(reconcile_fts/ensure_fts_trigram 回填/write_patch)必须显式带 rowid**——破坏即 rowid 删除路径错删/漏删。迁移成本 45.9 万行 ≈22s 只发生一次。fts=false 只推版本号(空表天然对齐,后续开 fts 由 reconcile 行数重建兜底)。
+- **fts_delete_by_entity_ids**(graph):`DELETE ... WHERE rowid IN (SELECT rowid FROM entity WHERE id IN ...)`,FTS5 rowid 索引路径,60ms→0.3ms(200 倍);**实体行必须仍在**(rowid 经 entity 反查),调用点在 entity 删除前/同 id upsert(update 分支 rowid 不变)成立。
+- **delete_file_subtrees_batch**(graph,trait 默认实现=逐文件):TEMP 表集合删除(无 999 绑定上限),一层 contains 展开 + FTS/edge×2/entity 四条集合语句;analysis 层 2000 文件/块分块提交——**块内原子(中断回滚整块,无半删态)**、逐块上报进度(修"进度纹丝不动")。向量仍不随删(P1-C′ 断点续扫不变)。
+- **write_patch add_entity_ids 去重**:patch 内重复实体 id(同实体多 patch,analysis 合并常态;entity UPSERT 幂等容忍)跨 900-块再插同 rowid 炸 PK 1555(plus-ui 首轮即触发);旧 entity_id 路径不炸但留**重复 fts 行**(漂移源之三,顺带根治)。教训:把无唯一约束的列改成有唯一约束的 rowid 时,必须审所有重复输入路径。
+- 回归测试:批量=逐个等价(实体/边/FTS 三层)、删除后 FTS 同步+rowid 对齐不变量、旧库错位迁移、重复 id 容忍(950 重复跨块)、`large_scale_delete_bench`(ignored,手动 `cargo test --release -p repo-intelligence-graph -- --ignored --nocapture`:48 万实体/3 万文件删除 **2.4s**,修复前小时级)。
+- 验证:ruoyi 7128/15321/calls 3021(0.7:2993+0.5:28)/implements_method 415/fts=entity **零漂移**,增量全 unchanged;plus-ui 56/490/0 + fts 3876 对齐;`user_version=1`。
+- **用户侧解困**:升级后重跑 scan;卡住的旧进程 kill 即可(向量保留,无数据损失);首次 open 会做一次 22s 级 rowid 迁移。
+
 ### Windows scanlock 探活修复(v0.1.51,2026-10-29)
 
 v0.1.50 带着红 ci 发出(release.yml 与 ci.yml 独立,互不阻塞):Windows runner 上 `scanlock_rejects_live_pid_and_cleans_stale` panic——`process_alive` 的 `not(unix)` 分支恒真,死 PID 999999 被当活锁拒掉。产品缺陷不止测试:Windows 崩溃/强杀残留锁**永不自愈**,用户只能手动 `--takeover`。修:windows 改 `tasklist /FI "PID eq N" /FO CSV /NH`,按**引号锚定的 PID 字段**判定(无匹配的 INFO 文案是本地化的,不能按字面匹配);判定提纯 `tasklist_reports_alive` 纯函数 + 四形态 fixture(英文/中文 miss、CSV hit、`"19999"` 防 `"9999"` 子串误命中)——任何平台可测,不再依赖 win runner 暴露(0.1.45 反斜杠同策略)。探活 spawn 失败仍保守判活。unix 分支零变化。教训:**cfg 门控平台分支的代码,其配套单测在默认平台就是 dead code,clippy -D warnings 会拦**——纯函数要 `#[cfg(any(windows, test))]` 门控。
