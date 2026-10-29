@@ -167,6 +167,10 @@ impl WorkspaceIndexer {
         }
 
         // 删除阶段:deleted + changed 的旧子树。file_id 与 source::discover 的稳定公式一致。
+        // 批量分块(2000 文件/块,块内单事务原子):大仓全量重提曾逐文件单事务 +
+        // FTS 按 UNINDEXED entity_id IN 删除(虚拟表全表 SCAN),3 万文件 × 45 万行
+        // FTS 实测小时级且进度停在 0——批量化 + rowid 路径后秒级,且每块上报进度。
+        const DELETE_FILE_CHUNK: usize = 2000;
         report(ScanProgress {
             phase: ScanPhase::Persisting,
             processed: 0,
@@ -174,9 +178,21 @@ impl WorkspaceIndexer {
             current_path: None,
             elapsed_ms: started.elapsed().as_millis(),
         });
-        for path in &to_delete {
-            let file_id = EntityId::stable("workspace", path, EntityKind::File, path, "");
-            store.delete_file_subtree(&file_id)?;
+        let file_ids: Vec<EntityId> = to_delete
+            .iter()
+            .map(|path| EntityId::stable("workspace", path, EntityKind::File, path, ""))
+            .collect();
+        let mut deleted_files = 0usize;
+        for chunk in file_ids.chunks(DELETE_FILE_CHUNK) {
+            store.delete_file_subtrees_batch(chunk)?;
+            deleted_files += chunk.len();
+            report(ScanProgress {
+                phase: ScanPhase::Persisting,
+                processed: deleted_files,
+                total: to_delete.len(),
+                current_path: None,
+                elapsed_ms: started.elapsed().as_millis(),
+            });
         }
 
         // 提取 + 写入阶段:changed ∪ added。

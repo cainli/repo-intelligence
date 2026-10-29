@@ -56,6 +56,15 @@ pub trait GraphStore {
     fn replace_resolved_edges(&mut self, edges: Vec<Edge>) -> Result<()>;
     /// 增量更新:删除一个文件贡献的全部实体与边(File 实体 + Contains 子树 + 牵连边)。
     fn delete_file_subtree(&mut self, file_id: &EntityId) -> Result<()>;
+    /// 增量更新:批量删除多个文件的子树(语义 = 逐个调 delete_file_subtree)。
+    /// 大仓全量重提(数万文件)时单文件逐删的每文件事务 + FTS 全表扫是二次方,
+    /// 批量路径一次 TEMP 表集合删除;返回删除的实体行数。默认实现退化为逐文件。
+    fn delete_file_subtrees_batch(&mut self, file_ids: &[EntityId]) -> Result<usize> {
+        for file_id in file_ids {
+            self.delete_file_subtree(file_id)?;
+        }
+        Ok(file_ids.len())
+    }
     /// 增量更新:读取全部事实提取边(resolved=0),供跨文件 resolve 全量重算作输入。
     fn extract_edges(&self) -> Result<Vec<Edge>>;
 
@@ -171,8 +180,9 @@ impl SqliteGraphStore {
         let t = std::time::Instant::now();
         self.connection.execute("DELETE FROM entity_fts", [])?;
         let n = self.connection.execute(
-            "INSERT INTO entity_fts(entity_id, name, qualified_name) \
-             SELECT id, name, qualified_name FROM entity",
+            // rowid 对齐(见 ensure_fts_rowid_aligned):fts 删除走 rowid 索引的前提。
+            "INSERT INTO entity_fts(rowid, entity_id, name, qualified_name) \
+             SELECT rowid, id, name, qualified_name FROM entity",
             [],
         )?;
         eprintln!(
@@ -379,7 +389,7 @@ impl SqliteGraphStore {
         }
     }
 
-    fn initialize(&self) -> Result<()> {
+    fn initialize(&mut self) -> Result<()> {
         self.connection.execute_batch(
             "
             PRAGMA journal_mode = WAL;
@@ -459,6 +469,8 @@ impl SqliteGraphStore {
         // entity_fts tokenizer 迁移:旧库 unicode61 → trigram(对 camelCase 标识符召回
         // 追平 LIKE);不存在则按 trigram 建;开启 FTS 时旧库数据一次性全量回填。
         self.ensure_fts_trigram()?;
+        // entity_fts rowid 对齐迁移:FTS 删除走 rowid 索引的前提(见函数注释)。
+        self.ensure_fts_rowid_aligned()?;
         Ok(())
     }
 
@@ -498,8 +510,9 @@ impl SqliteGraphStore {
             if self.fts_enabled {
                 let t = std::time::Instant::now();
                 let n = self.connection.execute(
-                    "INSERT INTO entity_fts(entity_id, name, qualified_name) \
-                     SELECT id, name, qualified_name FROM entity",
+                    // rowid 对齐(见 ensure_fts_rowid_aligned):fts 删除走 rowid 索引的前提。
+                    "INSERT INTO entity_fts(rowid, entity_id, name, qualified_name) \
+                     SELECT rowid, id, name, qualified_name FROM entity",
                     [],
                 )?;
                 eprintln!(
@@ -507,6 +520,45 @@ impl SqliteGraphStore {
                     t.elapsed().as_secs_f64()
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// 存量库一次性迁移:把 entity_fts 的 rowid 对齐到 entity 的隐式 rowid
+    /// (INSERT 显式带 rowid),使 `DELETE FROM entity_fts WHERE rowid IN (...)`
+    /// 走 FTS5 的 rowid 索引。此前 entity_id(UNINDEXED)的 IN 删除是虚拟表
+    /// 全表 SCAN——45.9 万行库上单次 60ms,逐文件子树删除 3 万次 = 小时级
+    /// (mes-activity 全量重提"卡死"根因);rowid 路径单次 0.3ms(200 倍)。
+    /// 旧库的 fts rowid 是 FTS5 自动分配的顺序号,与 entity.rowid 无对应,
+    /// 必须全量重建一次对齐(≈22s,与 reconcile 同级,之后不再发生)。
+    /// `PRAGMA user_version` 空闲,用 1 标记"已对齐";新库回填 0 行 no-op。
+    /// 不变量:此后所有写 entity_fts 的路径都显式带 rowid=entity.rowid
+    /// (reconcile_fts / ensure_fts_trigram 回填 / write_patch)。
+    fn ensure_fts_rowid_aligned(&mut self) -> Result<()> {
+        let version: i64 = self
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version >= 1 {
+            return Ok(());
+        }
+        if self.fts_enabled {
+            let t = std::time::Instant::now();
+            let transaction = self.connection.transaction()?;
+            transaction.execute("DELETE FROM entity_fts", [])?;
+            let n = transaction.execute(
+                "INSERT INTO entity_fts(rowid, entity_id, name, qualified_name) \
+                 SELECT rowid, id, name, qualified_name FROM entity",
+                [],
+            )?;
+            transaction.execute_batch("PRAGMA user_version = 1")?;
+            transaction.commit()?;
+            eprintln!(
+                "[ri-diag] fts rowid-align migrate: {n} rows in {:.2}s",
+                t.elapsed().as_secs_f64()
+            );
+        } else {
+            // fts 关闭时不写 fts(空表天然对齐),只推进版本标记。
+            self.connection.execute_batch("PRAGMA user_version = 1")?;
         }
         Ok(())
     }
@@ -643,8 +695,13 @@ impl SqliteGraphStore {
             // trigram 对 camelCase 召回追平 LIKE(unicode61 近全空)。详见 ensure_fts_trigram。
             let n_ent = patch.add_entities.len();
             // 先快照本次新增/更新实体 id(循环将 move add_entities),供 FTS 批量回填。
-            let add_entity_ids: Vec<String> =
+            // 必须去重:add_entities 常含重复 id(同实体多 patch,entity UPSERT 幂等),
+            // 而 fts 的 rowid 有唯一约束——重复 id 跨 900-块再 INSERT 同 rowid 即
+            // PRIMARY KEY 冲突;旧 entity_id 路径虽不炸但会插重复 fts 行(漂移源)。
+            let mut add_entity_ids: Vec<String> =
                 patch.add_entities.iter().map(|e| e.id.0.clone()).collect();
+            add_entity_ids.sort_unstable();
+            add_entity_ids.dedup();
             let t = std::time::Instant::now();
             for entity in patch.add_entities {
                 let json = serde_json::to_string(&entity)?;
@@ -670,21 +727,19 @@ impl SqliteGraphStore {
 
             // FTS 批量回填(仅 fts_enabled)。replacing_snapshot 先清空;增量先删旧避免重复行。
             // INSERT...SELECT 必须在 entity upsert 之后(entity 表需已有这些行)。
+            // 删除走 rowid 路径(经 entity 反查 rowid,见 fts_delete_by_entity_ids):
+            // entity_id 是 UNINDEXED 列,IN 删除是 FTS 虚拟表全表 SCAN。
             if fts_enabled && !add_entity_ids.is_empty() {
                 let t_fts = std::time::Instant::now();
                 if replacing_snapshot {
                     transaction.execute("DELETE FROM entity_fts", [])?;
                 } else {
-                    Self::fts_bulk_in(
-                        transaction,
-                        "DELETE FROM entity_fts WHERE entity_id IN",
-                        &add_entity_ids,
-                    )?;
+                    Self::fts_delete_by_entity_ids(transaction, &add_entity_ids)?;
                 }
                 Self::fts_bulk_in(
                     transaction,
-                    "INSERT INTO entity_fts(entity_id, name, qualified_name) \
-                     SELECT id, name, qualified_name FROM entity WHERE id IN",
+                    "INSERT INTO entity_fts(rowid, entity_id, name, qualified_name) \
+                     SELECT rowid, id, name, qualified_name FROM entity WHERE id IN",
                     &add_entity_ids,
                 )?;
                 eprintln!(
@@ -731,6 +786,8 @@ impl SqliteGraphStore {
 
     /// 对 `ids` 分批执行 `"<prefix> (?, ?, ...)"`,绕开 SQLite 单语句 999 绑定上限
     /// (SQLITE_MAX_VARIABLE)。FTS 写入/删除复用,把 N 次逐行往返压成 N/900 批。
+    ///
+    /// 仅用于 INSERT 路径;删除必须走 [`Self::fts_delete_by_entity_ids`](rowid 索引)。
     fn fts_bulk_in(
         transaction: &rusqlite::Transaction<'_>,
         prefix: &str,
@@ -739,6 +796,26 @@ impl SqliteGraphStore {
         for chunk in ids.chunks(900) {
             let placeholders: String = (0..chunk.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
             let sql = format!("{prefix} ({placeholders})");
+            transaction.execute(&sql, params_from_iter(chunk.iter()))?;
+        }
+        Ok(())
+    }
+
+    /// 按 entity id 批量删 entity_fts 行,走 rowid 索引而非 UNINDEXED entity_id
+    /// 的全表 SCAN(45.9 万行库:60ms → 0.3ms/次)。依赖 ensure_fts_rowid_aligned
+    /// 建立(及各写入路径维持)的 fts.rowid == entity.rowid 对齐;实体行必须
+    /// 仍存在(rowid 经 entity 反查),调用点均在 entity 删除之前或同 id upsert
+    /// 场景(update 分支 rowid 不变),成立。
+    fn fts_delete_by_entity_ids(
+        transaction: &rusqlite::Transaction<'_>,
+        ids: &[String],
+    ) -> Result<()> {
+        for chunk in ids.chunks(900) {
+            let placeholders: String = (0..chunk.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "DELETE FROM entity_fts WHERE rowid IN \
+                 (SELECT rowid FROM entity WHERE id IN ({placeholders}))"
+            );
             transaction.execute(&sql, params_from_iter(chunk.iter()))?;
         }
         Ok(())
@@ -815,48 +892,71 @@ impl GraphStore for SqliteGraphStore {
     /// 删除一个文件贡献的全部实体与边:File 实体 + 经 `Contains` 边挂载的所有子实体,
     /// 以及这些实体作为 source/target 参与的任何边(含指向它们的跨文件 resolved 边)。
     ///
-    /// 增量 scan 中先按变更文件逐个调用本方法删旧,再 `apply_patch` 提取边,最后
-    /// `replace_resolved_edges` 全量重算跨文件边——指向已删实体的悬空边随实体删除,
-    /// 随后重算不再生成,故无残留。
+    /// 增量 scan 中先按变更文件批量调 `delete_file_subtrees_batch` 删旧,再
+    /// `apply_patch` 提取边,最后 `replace_resolved_edges` 全量重算跨文件边——指向
+    /// 已删实体的悬空边随实体删除,随后重算不再生成,故无残留。
     fn delete_file_subtree(&mut self, file_id: &EntityId) -> Result<()> {
-        let transaction = self.connection.transaction()?;
-        // 待删实体 = file_id 自身 + 经 Contains 边挂载的全部子实体(类/字段/方法…)。
-        let mut ids: Vec<String> = vec![file_id.0.clone()];
-        {
-            let mut select_children = transaction
-                .prepare("SELECT target_id FROM edge WHERE source_id = ?1 AND kind = 'contains'")?;
-            let rows = select_children.query_map([&file_id.0], |row| row.get::<_, String>(0))?;
-            for row in rows {
-                ids.push(row?);
-            }
+        self.delete_file_subtrees_batch(std::slice::from_ref(file_id))
+            .map(|_| ())
+    }
+
+    /// 批量删除多个文件的子树,语义 = 逐个 delete_file_subtree,但单事务集合化:
+    /// 待删 id 收进 TEMP 表(无 999 绑定上限),FTS/edge/entity 各一条集合语句。
+    /// 历史坑:曾逐文件单事务 + FTS 按 entity_id(UNINDEXED)IN 删除,FTS 虚拟表
+    /// 全表 SCAN——mes-activity 45.9 万实体 × 3 万文件全量重提实测小时级且进度条
+    /// 停在 0(循环内无上报);批量化 + FTS rowid 路径后为秒~分钟级。块间由调用方
+    /// 分块提交(analysis 层 2000 文件/块),块内原子——中断回滚整块,无半删状态。
+    /// 向量层不随子树删除(P1-C′ 断点续扫),孤儿向量由 get_all_embeddings 读时
+    /// JOIN entity 过滤;rm 库全清。
+    fn delete_file_subtrees_batch(&mut self, file_ids: &[EntityId]) -> Result<usize> {
+        if file_ids.is_empty() {
+            return Ok(0);
         }
-        // 删除顺序:先批量清 FTS(fts_enabled 时,单语句),再逐实体清牵连边 + 实体本身。
-        // 单文件子树通常几十实体;edge/entity 用 prepare_cached 逐条(避开 999 绑定上限)。
-        if self.fts_enabled && !ids.is_empty() {
-            Self::fts_bulk_in(
-                &transaction,
-                "DELETE FROM entity_fts WHERE entity_id IN",
-                &ids,
+        let transaction = self.connection.transaction()?;
+        transaction.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS del_ids(id TEXT PRIMARY KEY);
+             DELETE FROM del_ids;",
+        )?;
+        for chunk in file_ids.chunks(900) {
+            let values: String = (0..chunk.len())
+                .map(|_| "(?)")
+                .collect::<Vec<_>>()
+                .join(",");
+            transaction.execute(
+                &format!("INSERT OR IGNORE INTO del_ids(id) VALUES {values}"),
+                params_from_iter(chunk.iter().map(|id| id.0.as_str())),
             )?;
         }
-        // 向量层**不**随子树删除(P1-C′,第四轮反馈):实体重提 id 不变,向量按
-        // EntityId + text_hash 判定复用(analysis 筛 text_hash 变化才重算)。此前这里
-        // 级联删向量,而删除阶段先于 embedding——中断/INDEX_FORMAT 升级重跑时向量已
-        // 被清空,text_hash 筛选全部 miss,分批落库的「中断保留」设计失效,52 万实体
-        // 仓中断一次即 1.5-2h 全量重算。真删除文件产生的孤儿向量由 get_all_embeddings
-        // 读时 JOIN entity 过滤,不参与语义检索;rm 库全清。
-        {
-            let mut delete_edges = transaction
-                .prepare_cached("DELETE FROM edge WHERE source_id = ?1 OR target_id = ?1")?;
-            let mut delete_entity =
-                transaction.prepare_cached("DELETE FROM entity WHERE id = ?1")?;
-            for id in &ids {
-                delete_edges.execute([id])?;
-                delete_entity.execute([id])?;
-            }
+        // 一层 Contains 展开(File→类/字段/方法,与单文件版一致):
+        // 语句开始时 del_ids 已含 file ids,SELECT 读到的即它们。
+        transaction.execute(
+            "INSERT OR IGNORE INTO del_ids(id) \
+             SELECT target_id FROM edge \
+             WHERE kind = 'contains' AND source_id IN (SELECT id FROM del_ids)",
+            [],
+        )?;
+        // 删除顺序:先 FTS(rowid 路径,实体行仍在),再边,再实体。
+        if self.fts_enabled {
+            transaction.execute(
+                "DELETE FROM entity_fts WHERE rowid IN \
+                 (SELECT rowid FROM entity WHERE id IN (SELECT id FROM del_ids))",
+                [],
+            )?;
         }
+        transaction.execute(
+            "DELETE FROM edge WHERE source_id IN (SELECT id FROM del_ids)",
+            [],
+        )?;
+        transaction.execute(
+            "DELETE FROM edge WHERE target_id IN (SELECT id FROM del_ids)",
+            [],
+        )?;
+        let deleted = transaction.execute(
+            "DELETE FROM entity WHERE id IN (SELECT id FROM del_ids)",
+            [],
+        )?;
         transaction.commit()?;
-        Ok(())
+        Ok(deleted)
     }
 
     fn extract_edges(&self) -> Result<Vec<Edge>> {
@@ -1427,5 +1527,278 @@ mod tests {
         let all = store.get_all_embeddings().unwrap();
         assert_eq!(all.len(), 1, "孤儿 C 的向量不进候选: {all:?}");
         assert!(all.iter().any(|(eid, _)| *eid == id("G")));
+    }
+
+    /// 批量删除 = 逐个删除的等价性守卫(实体/边/FTS 三层全等)。
+    #[test]
+    fn delete_file_subtrees_batch_matches_per_file_deletion() {
+        use repo_intelligence_model::{Entity, EntityKind};
+        let build = || {
+            let f1 = Entity::new(id("file:F1"), EntityKind::File, "F1.java", "F1.java");
+            let f2 = Entity::new(id("file:F2"), EntityKind::File, "F2.java", "F2.java");
+            let f3 = Entity::new(id("file:F3"), EntityKind::File, "F3.java", "F3.java");
+            let c1 = Entity::new(id("C1"), EntityKind::Class, "AlphaService", "C1");
+            let c2 = Entity::new(id("C2"), EntityKind::Class, "BetaMapper", "C2");
+            let c3 = Entity::new(id("C3"), EntityKind::Class, "GammaUtil", "C3");
+            let entities = vec![f1, f2, f3, c1.clone(), c2.clone(), c3.clone()];
+            let edges = vec![
+                Edge::new(id("file:F1"), id("C1"), EdgeKind::Contains),
+                Edge::new(id("file:F2"), id("C2"), EdgeKind::Contains),
+                Edge::new(id("file:F3"), id("C3"), EdgeKind::Contains),
+                // 跨文件 resolved 边:C3 calls C2 —— 删 F2 或 F3 时应随端点清除。
+                Edge::new(id("C3"), id("C2"), EdgeKind::Calls),
+            ];
+            (entities, edges)
+        };
+        let mut per_file = SqliteGraphStore::open_in_memory().unwrap();
+        let mut batch = SqliteGraphStore::open_in_memory().unwrap();
+        let (entities, edges) = build();
+        per_file
+            .apply_patch(GraphPatch::add(entities, edges))
+            .unwrap();
+        let (entities, edges) = build();
+        batch.apply_patch(GraphPatch::add(entities, edges)).unwrap();
+
+        let targets = [id("file:F1"), id("file:F3")];
+        for file_id in &targets {
+            per_file.delete_file_subtree(file_id).unwrap();
+        }
+        let deleted = batch.delete_file_subtrees_batch(&targets).unwrap();
+
+        assert_eq!(deleted, 4, "两个文件 + 各自子类");
+        assert_eq!(per_file.counts().unwrap(), batch.counts().unwrap());
+        let fts_of = |store: &SqliteGraphStore| -> Vec<String> {
+            let mut stmt = store
+                .connection
+                .prepare("SELECT entity_id FROM entity_fts ORDER BY entity_id")
+                .unwrap();
+
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(fts_of(&per_file), fts_of(&batch));
+        // F2 的 BetaMapper 仍在,两边召回一致。
+        for store in [&per_file, &batch] {
+            let hits = store.search(SearchQuery::new("BetaMapper")).unwrap();
+            assert_eq!(hits.len(), 1);
+        }
+    }
+
+    /// 批量删除后 FTS 与 entity 行数一致 + rowid 对齐不变量不被破坏
+    /// (对齐是 rowid 删除路径的正确性前提,断言写死防回归)。
+    #[test]
+    fn batch_deletion_keeps_fts_in_sync_and_rowid_aligned() {
+        use repo_intelligence_model::{Entity, EntityKind};
+        let aligned_count = |store: &SqliteGraphStore| -> (i64, i64, i64) {
+            store
+                .connection
+                .query_row(
+                    "SELECT
+                       (SELECT COUNT(*) FROM entity),
+                       (SELECT COUNT(*) FROM entity_fts),
+                       (SELECT COUNT(*) FROM entity_fts f
+                        JOIN entity e ON e.rowid = f.rowid AND e.id = f.entity_id)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap()
+        };
+        let mut store = SqliteGraphStore::open_in_memory().unwrap();
+        let f1 = Entity::new(id("file:F1"), EntityKind::File, "F1.java", "F1.java");
+        let f2 = Entity::new(id("file:F2"), EntityKind::File, "F2.java", "F2.java");
+        let c1 = Entity::new(id("C1"), EntityKind::Class, "AlphaService", "C1");
+        let c2 = Entity::new(id("C2"), EntityKind::Class, "BetaMapper", "C2");
+        store
+            .apply_patch(GraphPatch::add(
+                vec![f1, f2, c1, c2],
+                vec![
+                    Edge::new(id("file:F1"), id("C1"), EdgeKind::Contains),
+                    Edge::new(id("file:F2"), id("C2"), EdgeKind::Contains),
+                ],
+            ))
+            .unwrap();
+        let (entities, fts, aligned) = aligned_count(&store);
+        assert_eq!((entities, fts, aligned), (4, 4, 4), "写路径维持 rowid 对齐");
+
+        store
+            .delete_file_subtrees_batch(&[id("file:F1"), id("file:F2")])
+            .unwrap();
+
+        let (entities, fts, aligned) = aligned_count(&store);
+        assert_eq!(entities, 0, "全部实体随文件删除");
+        assert_eq!(fts, 0, "FTS 行同步删除,无孤儿(免 reconcile 重建)");
+        assert_eq!(aligned, 0);
+    }
+
+    /// patch 内重复实体 id(同实体多 patch 合并)不得让 FTS rowid 插入炸 PK
+    /// 冲突,也不得留重复 fts 行(旧行为的漂移源)。
+    #[test]
+    fn write_patch_tolerates_duplicate_entity_ids_in_fts() {
+        use repo_intelligence_model::{Entity, EntityKind};
+        let mut store = SqliteGraphStore::open_in_memory().unwrap();
+        let a1 = Entity::new(id("C1"), EntityKind::Class, "AlphaService", "C1");
+        let a2 = Entity::new(id("C1"), EntityKind::Class, "AlphaService", "C1");
+        let b = Entity::new(id("C2"), EntityKind::Class, "BetaMapper", "C2");
+        // C1 重复出现 900+ 次,保证跨块(fts_bulk_in 按 900 分块)重复插入同 rowid。
+        let mut entities = vec![a1, b];
+        for _ in 0..950 {
+            entities.push(a2.clone());
+        }
+        store
+            .apply_patch(GraphPatch::add(entities, Vec::new()))
+            .unwrap();
+
+        let (entity_count, fts_count): (i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM entity), (SELECT COUNT(*) FROM entity_fts)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (entity_count, fts_count),
+            (2, 2),
+            "重复 id 不炸且 fts 无重复行"
+        );
+    }
+
+    /// 旧库存量 fts 行 rowid 与 entity.rowid 脱钩(FTS5 自动分配),open 后由
+    /// ensure_fts_rowid_aligned 一次性重建对齐,并对后续 rowid 删除路径生效。
+    #[test]
+    fn legacy_fts_rowids_are_realigned_on_migrate() {
+        use repo_intelligence_model::{Entity, EntityKind};
+        let mut store = SqliteGraphStore::open_in_memory().unwrap();
+        let f = Entity::new(id("file:F"), EntityKind::File, "F.java", "F.java");
+        let c = Entity::new(id("C"), EntityKind::Class, "AlphaService", "C");
+        let g = Entity::new(id("G"), EntityKind::Class, "BetaMapper", "G");
+        store
+            .apply_patch(GraphPatch::add(
+                vec![f, c, g],
+                vec![
+                    Edge::new(id("file:F"), id("C"), EdgeKind::Contains),
+                    Edge::new(id("file:F"), id("G"), EdgeKind::Contains),
+                ],
+            ))
+            .unwrap();
+        // 手工降级成旧形态:fts 不带 rowid 重插(ORDER BY id 制造与 entity 插入序
+        // 的错位)+ user_version 清零,模拟 0.1.51 之前的存量库。
+        store
+            .connection
+            .execute_batch(
+                "PRAGMA user_version = 0;
+                 DELETE FROM entity_fts;
+                 INSERT INTO entity_fts(entity_id, name, qualified_name)
+                 SELECT id, name, qualified_name FROM entity ORDER BY id;",
+            )
+            .unwrap();
+        let misaligned: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM entity_fts f \
+                 JOIN entity e ON e.rowid = f.rowid AND e.id = f.entity_id",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(misaligned < 3, "错位构造失败,测试前提不成立: {misaligned}");
+
+        store.ensure_fts_rowid_aligned().unwrap();
+
+        let aligned: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM entity_fts f \
+                 JOIN entity e ON e.rowid = f.rowid AND e.id = f.entity_id",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(aligned, 3, "迁移后全部行 rowid 对齐");
+        let version: i64 = store
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1, "版本标记推进,迁移只发生一次");
+        // 对齐后 rowid 删除路径删的是正确的行:删子树后 fts 无 C 残留。
+        store.delete_file_subtree(&id("file:F")).unwrap();
+        let residual: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM entity_fts WHERE entity_id = 'C'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(residual, 0, "被删实体的 fts 行必须清掉(错位则会残留他行)");
+    }
+
+    /// 大仓规模基准(手动跑:`cargo test --release -p repo-intelligence-graph
+    /// -- --ignored large_scale`):mes-activity 量级 3 万文件 × 15 实体 = 45 万实体,
+    /// 全量重提的删除阶段。修复前(逐文件 × FTS 全表扫)外推约小时级;修复后
+    /// 应在分钟内。不断言硬时限(防 CI flaky),打印耗时供人工判读。
+    #[test]
+    #[ignore]
+    fn large_scale_delete_bench() {
+        use repo_intelligence_model::{Entity, EntityKind};
+        use std::time::Instant;
+        let mut store = SqliteGraphStore::open_in_memory().unwrap();
+        const FILES: usize = 30_000;
+        const CHILDREN: usize = 15;
+        let t_build = Instant::now();
+        for batch in 0..(FILES / 1_000) {
+            let mut entities = Vec::with_capacity(1_000 * (CHILDREN + 1));
+            let mut edges = Vec::with_capacity(1_000 * CHILDREN);
+            for f in (batch * 1_000)..((batch + 1) * 1_000) {
+                let file_id = id(&format!("file:F{f}"));
+                entities.push(Entity::new(
+                    file_id.clone(),
+                    EntityKind::File,
+                    format!("F{f}.java"),
+                    format!("F{f}.java"),
+                ));
+                for c in 0..CHILDREN {
+                    let child = id(&format!("C{f}_{c}"));
+                    entities.push(Entity::new(
+                        child.clone(),
+                        EntityKind::Class,
+                        format!("Class{f}_{c}"),
+                        format!("pkg{}.Class{f}_{c}", f % 500),
+                    ));
+                    edges.push(Edge::new(file_id.clone(), child, EdgeKind::Contains));
+                }
+            }
+            store.apply_patch(GraphPatch::add(entities, edges)).unwrap();
+        }
+        let fts_of = |store: &SqliteGraphStore| -> i64 {
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM entity_fts", [], |row| row.get(0))
+                .unwrap()
+        };
+        let (entity_count, _) = store.counts().unwrap();
+        eprintln!(
+            "[bench] built {entity_count} entities / {} fts rows in {:.1}s",
+            fts_of(&store),
+            t_build.elapsed().as_secs_f32()
+        );
+        assert_eq!(entity_count, (FILES * (CHILDREN + 1)) as u64);
+
+        let file_ids: Vec<_> = (0..FILES).map(|f| id(&format!("file:F{f}"))).collect();
+        let t_del = Instant::now();
+        let mut deleted = 0usize;
+        for chunk in file_ids.chunks(2_000) {
+            deleted += store.delete_file_subtrees_batch(chunk).unwrap();
+        }
+        eprintln!(
+            "[bench] deleted {deleted} entities ({} files) in {:.1}s",
+            FILES,
+            t_del.elapsed().as_secs_f32()
+        );
+        let (entity_count, _) = store.counts().unwrap();
+        assert_eq!(entity_count, 0);
+        assert_eq!(fts_of(&store), 0, "fts 无孤儿残留");
     }
 }
