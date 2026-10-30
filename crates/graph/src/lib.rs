@@ -137,6 +137,24 @@ impl SqliteGraphStore {
         Self::open_with_fts(path, true)
     }
 
+    /// 只读窥探 (entities, edges) 计数,不建库不迁移(review 六轮 #5:fail-loud
+    /// 报错信息要带主库规模,`open` 会创建缺失文件 + 跑 initialize 迁移,大库还有
+    /// FTS reconcile 的 22s 级副作用——只为报个数不值得)。不存在/不可读 → None。
+    pub fn peek_counts(path: impl AsRef<Path>) -> Option<(usize, usize)> {
+        use rusqlite::OpenFlags;
+        let connection =
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+        let entities = connection
+            .query_row("SELECT COUNT(*) FROM entity", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .ok()? as usize;
+        let edges = connection
+            .query_row("SELECT COUNT(*) FROM edge", [], |row| row.get::<_, i64>(0))
+            .ok()? as usize;
+        Some((entities, edges))
+    }
+
     /// 显式控制 FTS 开关。CLI/MCP 先 `IndexerConfig::load` 再据此 open。
     pub fn open_with_fts(path: impl AsRef<Path>, fts_enabled: bool) -> Result<Self> {
         let connection = Connection::open(path)?;

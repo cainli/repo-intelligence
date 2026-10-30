@@ -21,14 +21,17 @@ use repo_intelligence_protocol::Envelope;
     about = "Local cross-stack repository intelligence"
 )]
 struct Cli {
-    #[arg(
-        long,
-        default_value = ".repo-intelligence/workspace.sqlite",
-        global = true
-    )]
-    database: PathBuf,
+    /// 主库路径。**显式传入**才生效为「单库绑定」;省略时各子命令回退默认
+    /// `.repo-intelligence/workspace.sqlite`,`mcp` 子命令则进入多库模式
+    /// (repository 参数路由 <base>/repos/<id>.sqlite)——显式与否是两种部署
+    /// 形态的分界(review 六轮 #1:default_value 让 mcp 永远拿到 Some,
+    /// 多库模式在真实二进制中不可达)。
+    #[arg(long, global = true)]
+    database: Option<PathBuf>,
     /// 多仓库 base 目录(一个 MCP server 管多库);默认 ~/.repo-intelligence/。
-    /// Mcp 模式下,工具带 repository 参数时路由到 <base>/repos/<id>.sqlite。
+    /// 多仓库 base 目录。`mcp` 子命令**不带 --database** 时为多库模式:工具的
+    /// repository 参数路由到 <base>/repos/<id>.sqlite;显式带 --database 则绑定
+    /// 单主库,repository 对查询类工具 fail-loud(scan_workspace 仍可登记新库)。
     #[arg(long, global = true)]
     base: Option<PathBuf>,
     #[command(subcommand)]
@@ -158,11 +161,20 @@ fn default_base() -> PathBuf {
     PathBuf::from(home).join(".repo-intelligence")
 }
 
+/// 未显式传 --database 时的默认主库路径(与历史 default_value 一致)。
+const DEFAULT_DATABASE: &str = ".repo-intelligence/workspace.sqlite";
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    // mcp 子命令不折算默认值:None = 多库模式(repository 路由),显式 = 单库绑定。
+    // 其余子命令折算默认(行为与历史 default_value 完全一致)。
+    let database = cli
+        .database
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DATABASE));
     // 裸文件名(如 --database my.sqlite)的 parent() 返回 Some(""),create_dir_all("")
     // 会失败且错误信息是空串。仅当 parent 非空(确有目录成分)时才建目录。
-    if let Some(parent) = cli.database.parent()
+    if let Some(parent) = database.parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent)
@@ -174,12 +186,12 @@ fn run() -> Result<()> {
             repo_intelligence_mcp::serve(
                 io::stdin().lock(),
                 io::stdout().lock(),
-                Some(&cli.database),
+                cli.database.as_deref(),
                 &base,
             )
         }
         Command::Init { workspace, format } => {
-            let _store = SqliteGraphStore::open(&cli.database)?;
+            let _store = SqliteGraphStore::open(&database)?;
             // 智能脚手架：workspace 无配置时按机器规格生成 .repo-intelligence.toml
             // （低配机默认限速 embedding，防推理打满；高配机全速并留注释模板）。
             // 已存在则不动——用户手改过的配置不被覆盖。
@@ -198,7 +210,7 @@ fn run() -> Result<()> {
                 format,
                 serde_json::json!({
                     "workspace": workspace,
-                    "database": cli.database,
+                    "database": database,
                     "initialized": true,
                     "config_file": config_file
                 }),
@@ -210,12 +222,11 @@ fn run() -> Result<()> {
             takeover,
         } => {
             // 同库互斥:先拿 scanlock 再开库——否则并发冲突以裸 database is locked 暴露。
-            let _scanlock = ScanLock::acquire(&cli.database, takeover)?;
+            let _scanlock = ScanLock::acquire(&database, takeover)?;
             // 配置跟 workspace 走:从 workspace 根目录发现 .repo-intelligence.toml,
             // 无文件则 builtin default(scan 行为与历史一致)。
             let config = IndexerConfig::load(&workspace)?;
-            let mut store =
-                SqliteGraphStore::open_with_fts(&cli.database, config.index.fts5_fulltext)?;
+            let mut store = SqliteGraphStore::open_with_fts(&database, config.index.fts5_fulltext)?;
             let summary = WorkspaceIndexer.scan_with_config(
                 &workspace,
                 &mut store,
@@ -250,7 +261,7 @@ fn run() -> Result<()> {
             format,
             limit,
         } => {
-            let store = SqliteGraphStore::open(&cli.database)?;
+            let store = SqliteGraphStore::open(&database)?;
             let matches = store.search(SearchQuery::new(query).with_limit(limit))?;
             let entities: Vec<_> = matches.into_iter().map(|matched| matched.entity).collect();
             emit(format, entities)
@@ -261,7 +272,7 @@ fn run() -> Result<()> {
             min_value,
             format,
         } => {
-            let store = SqliteGraphStore::open(&cli.database)?;
+            let store = SqliteGraphStore::open(&database)?;
             let metric = metric.as_deref().unwrap_or("transitive_loop_depth");
             let hits = hotspots_items(&store, metric, min_value, limit)?;
             emit(format, hits)
@@ -318,11 +329,10 @@ fn run() -> Result<()> {
                      示例见 README)"
                 ),
             };
-            let store = SqliteGraphStore::open(&cli.database)?;
+            let store = SqliteGraphStore::open(&database)?;
             // [analysis] 分页上限等从 .repo-intelligence.toml 读(库文件上两级为项目根);
             // 无配置文件时 IndexerConfig::load 返回默认值。
-            let analysis = cli
-                .database
+            let analysis = database
                 .parent()
                 .and_then(std::path::Path::parent)
                 .map(|root| IndexerConfig::load(root).map(|c| c.analysis))
@@ -335,19 +345,19 @@ fn run() -> Result<()> {
             }
         }
         Command::Status { format } => {
-            let store = SqliteGraphStore::open(&cli.database)?;
+            let store = SqliteGraphStore::open(&database)?;
             let (entities, edges) = store.counts()?;
             emit(
                 format,
                 serde_json::json!({
-                    "database": cli.database,
+                    "database": database,
                     "entities": entities,
                     "edges": edges
                 }),
             )
         }
         Command::Overview { view, format } => {
-            let store = SqliteGraphStore::open(&cli.database)?;
+            let store = SqliteGraphStore::open(&database)?;
             // Return a bounded distribution, not every entity: a large index
             // would otherwise dump megabytes of JSON to stdout for a command
             // whose purpose is a quick summary.
@@ -363,13 +373,13 @@ fn run() -> Result<()> {
             )
         }
         Command::Doctor { format } => {
-            let sqlite = SqliteGraphStore::open(&cli.database).is_ok();
+            let sqlite = SqliteGraphStore::open(&database).is_ok();
             // 索引健康度(第五轮反馈 F1/F5):「resolve 阶段有没有跑全」「embedding 覆盖
             // 如何」「fts 是否同步」三个最常见盲区一眼可判——此前 doctor 只有静态布尔,
             // 大仓的 resolve 回归只能靠 sqlite 手查才看得见。
             let index = if sqlite {
                 match || -> anyhow::Result<serde_json::Value> {
-                    let store = SqliteGraphStore::open(&cli.database)?;
+                    let store = SqliteGraphStore::open(&database)?;
                     let (entities, edges) = store.counts()?;
                     let (entity_count, embedded, fts_rows) = store.health_counts()?;
                     Ok(serde_json::json!({
@@ -405,7 +415,7 @@ fn run() -> Result<()> {
             )
         }
         Command::Relay { qn, depth, format } => {
-            let store = SqliteGraphStore::open(&cli.database)?;
+            let store = SqliteGraphStore::open(&database)?;
             let doc = build_relay(&store, &qn, depth, true)?;
             emit(format, doc)
         }
@@ -414,7 +424,7 @@ fn run() -> Result<()> {
             limit,
             format,
         } => {
-            let store = SqliteGraphStore::open(&cli.database)?;
+            let store = SqliteGraphStore::open(&database)?;
             let items = semantic_search_items(&store, &query, limit)?;
             emit(format, items)
         }
@@ -780,6 +790,26 @@ fn http_join_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// review 六轮 #1:--database 的「显式 vs 默认」是单库/多库部署的分界——
+    /// 此前 default_value 让 mcp 永远拿到 Some,多库模式在真实二进制中不可达
+    /// (CI 绿是因为测试直接用 None 调 serve)。锁 CLI 形态:不传 = None(多库),
+    /// 显式传 = Some(单库绑定)。
+    #[test]
+    fn mcp_database_explicitness_decides_deployment_mode() {
+        use clap::Parser as _;
+        let cli = Cli::parse_from(["repo-intelligence", "mcp"]);
+        assert!(cli.database.is_none(), "不带 --database = 多库模式");
+        let cli = Cli::parse_from(["repo-intelligence", "mcp", "--database", "ws.sqlite"]);
+        assert_eq!(
+            cli.database.as_deref(),
+            Some(std::path::Path::new("ws.sqlite")),
+            "显式 --database = 单库绑定"
+        );
+        // 其他子命令不受影响:run() 折算默认,行为与历史 default_value 一致。
+        let cli = Cli::parse_from(["repo-intelligence", "status"]);
+        assert!(cli.database.is_none());
+    }
 
     #[test]
     fn http_join_matches_and_aggregates_same_endpoint_calls() {

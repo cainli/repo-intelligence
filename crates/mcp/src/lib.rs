@@ -526,7 +526,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "get_index_status",
-            description: "Local index status: database path + entity/edge counts.",
+            description: "Local index status: database path + entity/edge counts + health (embedding coverage, fts sync, scan meta).",
             input_schema: json!({"type": "object", "additionalProperties": false, "properties": {}}),
             output_schema: json!({
                 "type": "object",
@@ -536,6 +536,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                     "indexed": {"type": "boolean"},
                     "entity_count": {"type": "integer", "minimum": 0},
                     "edge_count": {"type": "integer", "minimum": 0},
+                    "health": {"type": "object"},
                     "hint": {"type": "string"}
                 },
                 "required": ["database", "indexed", "entity_count", "edge_count"]
@@ -543,7 +544,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_repositories",
-            description: "Multi-repo mode: manifest + per-repo counts under --base.",
+            description: "Repositories the server can query: main database first (--database-bound servers), then per-repo databases under --base (multi-repo mode).",
             input_schema: json!({"type": "object", "additionalProperties": false, "properties": {}}),
             output_schema: json!({
                 "type": "object",
@@ -626,9 +627,9 @@ fn tool_specs() -> Vec<ToolSpec> {
         {
             props.insert(
                 "repository".to_string(),
-                // 不带 description(参数名自释;route 规则见 list_repositories 工具描述):
-                // 此项注入全部工具,文案逐份重复是 tools/list 固定税。
-                json!({ "type": "string" }),
+                // 显式单库服务器上会 fail-loud(review 六轮 #6:声明侧要让调用方
+                // 预知,而不是调了才炸);文案压到一行,tools/list 固定税可控。
+                json!({ "type": "string", "description": "multi-repo routing only; errors on --database-bound servers" }),
             );
         }
     }
@@ -787,20 +788,33 @@ fn manifest_path_matches(stored: &str, repo: &str) -> bool {
 /// repository 约定是 scan_workspace 时的仓库根路径;尾段短名(mes/mos)也接受。
 /// mes-activity 反馈(P0-2):传 "mes" 曾被 canonicalize 吞错 → 哈希成无关空库 →
 /// 静默返回 0 结果且污染 manifest。现在无法解析即 fail-loud 并列出可用值。
+///
+/// `tool` 区分 repository 的两种语义(review 六轮 #2):对 `scan_workspace`/`verify_edge`
+/// 它是 **workspace/源码根参数**(不是 DB 路由)——scan_workspace 保留多库路由(显式
+/// 登记独立库是合法操作),verify_edge 单库绑定时回主库(验证对象=主库);其余工具在
+/// 单库绑定下一律 fail-loud(第六轮反馈 P1-1:静默路由到旧库读作「实体不存在」)。
 fn resolve_database(
+    tool: &str,
     arguments: &Value,
     base: &Path,
     fallback: Option<&Path>,
 ) -> Result<std::path::PathBuf> {
     if let Some(repo) = arguments["repository"].as_str().filter(|s| !s.is_empty()) {
-        // 单库部署(serve 带 --database 绑定主库):repository 参数会路由到 base/repos
-        // 的独立库(多库模式语义)——主库内查询返回 0 或旧格式结果,读起来像
-        // 「实体不存在」(第六轮反馈 P1-1:mes 子目录旧库残留即此)。在任何 manifest
-        // 匹配之前 fail-loud:报主库规模,引导去掉 repository / 用 qn 路径前缀。
-        if let Some(fb) = fallback {
-            let (entities, _) = SqliteGraphStore::open(fb)
-                .and_then(|s| s.counts())
-                .unwrap_or((0, 0));
+        if tool == "verify_edge" {
+            // repository = 验证的源码根;查询对象是当前绑定库——单库绑定即主库,
+            // 多库模式照旧按 repository 路由到对应库(历史行为)。
+            if let Some(fb) = fallback {
+                return Ok(std::path::PathBuf::from(fb));
+            }
+        }
+        // 单库绑定(显式 --database)且 repository 是纯路由提示的工具:fail-loud。
+        // 计数用只读窥探(不 open——open 会建库+migrate,大库还有 FTS reconcile 副作用)。
+        if tool != "scan_workspace"
+            && let Some(fb) = fallback
+        {
+            let entities = SqliteGraphStore::peek_counts(fb)
+                .map(|(entities, _)| entities.to_string())
+                .unwrap_or_else(|| "not yet scanned".into());
             anyhow::bail!(
                 "this server is bound to a single main database ({}, {} entities) and always \
                  queries it; the `repository` parameter belongs to multi-repo mode and would \
@@ -887,13 +901,13 @@ fn record_manifest(base: &Path, id: &str, repo_path: &Path) {
 /// 不与 hash id 冲突)。
 fn list_repositories(base: &Path, fallback: Option<&Path>) -> Result<Value> {
     let mut repos = Vec::new();
-    // 主库(serve 绑定的 --database)总是列出且排第一——此前仅 manifest 为空才给
+    // 主库(serve 显式绑定的 --database)总是列出且排第一——此前仅 manifest 为空才给
     // default 条目,单库部署 + 历史残留的 manifest 条目并存时主库缺席,14 万实体
     // 「无归属」(第六轮反馈 P2-5)。name 字段给 repository 参数的可读短名(尾段)。
+    // 多库模式(fallback=None)无主库,manifest 条目即全部可达仓库(review 六轮 #3:
+    // 不可达的 note 只对单库绑定说)。
     if let Some(db) = fallback {
-        let (entity_count, edge_count) = SqliteGraphStore::open(db)
-            .and_then(|s| s.counts())
-            .unwrap_or((0, 0));
+        let (entity_count, edge_count) = SqliteGraphStore::peek_counts(db).unwrap_or((0, 0));
         repos.push(json!({
             "repo_id": "default",
             "name": "default",
@@ -905,21 +919,25 @@ fn list_repositories(base: &Path, fallback: Option<&Path>) -> Result<Value> {
     }
     for (id, repo_path) in read_manifest(base) {
         let db = base.join("repos").join(format!("{id}.sqlite"));
-        let (entity_count, edge_count) = SqliteGraphStore::open(&db)
-            .and_then(|s| s.counts())
-            .unwrap_or((0, 0));
+        let (entity_count, edge_count) = SqliteGraphStore::peek_counts(&db).unwrap_or((0, 0));
         let name = std::path::Path::new(&repo_path)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| repo_path.clone());
-        repos.push(json!({
+        let mut entry = json!({
             "repo_id": id,
             "name": name,
             "repo_path": repo_path,
             "entity_count": entity_count,
             "edge_count": edge_count,
-            "note": "separate per-repo database (multi-repo mode); unreachable from a --database-bound server — see resolve_database",
-        }));
+        });
+        if fallback.is_some() {
+            entry["note"] = json!(
+                "separate per-repo database (multi-repo mode); NOT queried by this \
+                 --database-bound server — the repository parameter fails loud here"
+            );
+        }
+        repos.push(entry);
     }
     Ok(json!({ "repositories": repos, "count": repos.len() }))
 }
@@ -928,7 +946,13 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
     let params = &request["params"];
     let name = params["name"].as_str().unwrap_or_default();
     let arguments = &params["arguments"];
-    let path = resolve_database(arguments, base, database)?;
+    let path = if name == "list_repositories" {
+        // list 不查库只列库,不需要路由——多库模式(无 --database)下走 resolve 会
+        // 误报「no database configured」,恰好堵死「发现可用 repository 值」的入口。
+        std::path::PathBuf::new()
+    } else {
+        resolve_database(name, arguments, base, database)?
+    };
     let data = match name {
         "search_entities" => {
             let store = SqliteGraphStore::open(&path)?;
@@ -1290,11 +1314,15 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
                 // 第六轮反馈 P2-3:ambiguous_skipped 曾被按「实体数」误读(93805/44万=21%)。
                 // 它是跨文件解析的**尝试次数**(A+ 同名防护拒掉的裸名解析),候选清单在
                 // 实体 metadata.ambiguous_resolution;同一实体可多次计入,与实体数不可比。
-                health["ambiguous_skipped_note"] = json!(
-                    "cross-file resolution ATTEMPTS skipped by the A+ same-name guard (not an \
-                     entity count — one entity can be counted multiple times). Skipped \
-                     candidates are recorded per-entity in metadata.ambiguous_resolution."
-                );
+                // 门控:仅当数值在场才解释(review 六轮 #8——0.1.53 前旧库无 scan_meta,
+                // 只剩 note 没有数,读起来像幽灵)。
+                if health.get("ambiguous_skipped").is_some() {
+                    health["ambiguous_skipped_note"] = json!(
+                        "cross-file resolution ATTEMPTS skipped by the A+ same-name guard (not \
+                         an entity count — one entity can be counted multiple times). Skipped \
+                         candidates are recorded per-entity in metadata.ambiguous_resolution."
+                    );
+                }
                 status["health"] = health;
             }
             if !indexed {
@@ -2121,10 +2149,10 @@ fn trace_graph(
         .iter()
         .filter(|edge| {
             edge.kind == EdgeKind::Calls
-                && edge
-                    .evidence
-                    .first()
-                    .is_some_and(|ev| ev.reason.starts_with("interface dispatch"))
+                && edge.evidence.first().is_some_and(|ev| {
+                    ev.reason
+                        .starts_with(EvidenceClass::DISPATCH_BRIDGE_REASON_PREFIX)
+                })
         })
         .count();
     if dispatch_bridges > 0 {
@@ -2525,6 +2553,7 @@ mod tests {
         let repo_b = tempfile::tempdir().unwrap();
         // repository=A → <base>/repos/<hashA>.sqlite
         let db_a = resolve_database(
+            "search_entities",
             &json!({"repository": repo_a.path().to_string_lossy().to_string()}),
             base.path(),
             None,
@@ -2534,6 +2563,7 @@ mod tests {
         assert_eq!(db_a.extension().unwrap(), "sqlite");
         // repository=B → 不同库(不串)
         let db_b = resolve_database(
+            "search_entities",
             &json!({"repository": repo_b.path().to_string_lossy().to_string()}),
             base.path(),
             None,
@@ -2542,6 +2572,7 @@ mod tests {
         assert_ne!(db_a, db_b);
         // 无 repository → fallback(单库 --database 兼容)
         let db_none = resolve_database(
+            "search_entities",
             &json!({}),
             base.path(),
             Some(std::path::Path::new("fallback.sqlite")),
@@ -2561,11 +2592,18 @@ mod tests {
     #[test]
     fn resolve_database_rejects_unknown_repository() {
         let base = tempfile::tempdir().unwrap();
-        let err = resolve_database(&json!({"repository": "mes"}), base.path(), None).unwrap_err();
+        let err = resolve_database(
+            "search_entities",
+            &json!({"repository": "mes"}),
+            base.path(),
+            None,
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("matched no indexed repository"), "{msg}");
         // 单库绑定:拦在任何 manifest 匹配之前,报主库规模与替代方案。
         let err = resolve_database(
+            "search_entities",
             &json!({"repository": "mes"}),
             base.path(),
             Some(std::path::Path::new("fallback.sqlite")),
@@ -2598,7 +2636,13 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let db = resolve_database(&json!({"repository": short}), base.path(), None).unwrap();
+        let db = resolve_database(
+            "search_entities",
+            &json!({"repository": short}),
+            base.path(),
+            None,
+        )
+        .unwrap();
         assert_eq!(db, base.path().join("repos").join(format!("{id}.sqlite")));
         // 单库模式(无 manifest 时)回退 default 条目
         let empty_base = tempfile::tempdir().unwrap();

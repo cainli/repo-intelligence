@@ -724,6 +724,31 @@ fn repository_parameter_fails_loud_on_single_database_server() {
     );
 }
 
+/// review 六轮 #2:verify_edge 的 repository 是源码根参数(非 DB 路由)——单库绑定
+/// 下回主库执行,不被 fail-loud 拦截。
+#[test]
+fn verify_edge_repository_is_workspace_not_routing_on_single_db() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    index_call_chain(&database);
+
+    let result = call_tool(
+        &database,
+        "verify_edge",
+        serde_json::json!({
+            "source": "S27204",
+            "target": "S27234",
+            "repository": directory.path().to_string_lossy().to_string()
+        }),
+    );
+    // 正常执行(verified 与否是语义结论);被 fail-loud 拦截时 structuredContent
+    // 为 null(call_tool 取不到字段)。
+    assert!(
+        !result.is_null(),
+        "verify_edge 应正常执行(回主库): {result}"
+    );
+}
+
 /// 第六轮反馈 P2-4/P2-5:主库总是列出且排第一(name=default),manifest 条目带
 /// name(路径尾段)——此前单库 + 历史残留 manifest 并存时主库缺席,14 万实体「无归属」。
 #[test]

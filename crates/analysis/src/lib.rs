@@ -1803,11 +1803,20 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
                     continue; // 自环防护(接口与实现分属不同文件,理论不可达,保守保留)
                 }
                 let dispatch_reason = if total > 1 {
-                    format!("interface dispatch to 1 of {total} implementations")
+                    format!(
+                        "{} to 1 of {total} implementations",
+                        EvidenceClass::DISPATCH_BRIDGE_REASON_PREFIX
+                    )
                 } else if mirrored {
-                    "interface dispatch to implementation (mirrored duplicate)".to_string()
+                    format!(
+                        "{} to implementation (mirrored duplicate)",
+                        EvidenceClass::DISPATCH_BRIDGE_REASON_PREFIX
+                    )
                 } else {
-                    "interface dispatch to implementation".to_string()
+                    format!(
+                        "{} to implementation",
+                        EvidenceClass::DISPATCH_BRIDGE_REASON_PREFIX
+                    )
                 };
                 // Calls 桥接(iface method → impl method):默认 trace kinds 即贯通,
                 // 证据锚在接口方法(分发点)。Resolved(消歧后的精确分发,非名字猜测)。

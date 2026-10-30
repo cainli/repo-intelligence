@@ -208,6 +208,11 @@ impl EvidenceClass {
     /// 0.6 的口径:calls 的精确解析档是 0.7(走完消歧阶梯)、裸名匹配 0.5——
     /// 0.6 让前者不 tentative、后者仍 tentative,是「精确解析可信」的分界线。
     pub const RESOLVED_TENTATIVE_BELOW: f32 = 0.6;
+
+    /// 接口分发桥接边(iface method → impl method 的 Calls)的 evidence reason
+    /// 前缀约定:analysis 产边时拼接、mcp 的 trace 桥接 note 靠它识别(review 六轮
+    /// #4:跨 crate 字符串协议必须常量单源,改文案只动这里,两侧编译期连接)。
+    pub const DISPATCH_BRIDGE_REASON_PREFIX: &str = "interface dispatch";
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
