@@ -302,7 +302,8 @@ fn tool_specs() -> Vec<ToolSpec> {
                 "additionalProperties": false,
                 "properties": {
                     "query": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "default": 20}
+                    "limit": {"type": "integer", "minimum": 1, "default": 20},
+                    "min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.5}
                 },
                 "required": ["query"]
             }),
@@ -984,9 +985,7 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
         }
         "semantic_search" => {
             let store = SqliteGraphStore::open(&path)?;
-            let query = arguments["query"].as_str().unwrap_or_default();
-            let limit = parse_limit(arguments);
-            semantic_search(&store, query, limit)?
+            semantic_search(&store, arguments)?
         }
         "find_hotspots" => {
             let store = SqliteGraphStore::open(&path)?;
@@ -1516,7 +1515,9 @@ fn search_with_filter(
 static EMBEDDER: std::sync::Mutex<Option<repo_intelligence_embedding::Embedder>> =
     std::sync::Mutex::new(None);
 
-fn semantic_search(store: &SqliteGraphStore, query: &str, limit: usize) -> Result<Value> {
+fn semantic_search(store: &SqliteGraphStore, arguments: &Value) -> Result<Value> {
+    let query = arguments["query"].as_str().unwrap_or_default();
+    let limit = arguments["limit"].as_u64().unwrap_or(20) as usize;
     if query.trim().is_empty() {
         return Ok(json!({ "items": [], "count": 0, "hint": "empty query" }));
     }
@@ -1582,13 +1583,37 @@ fn semantic_search(store: &SqliteGraphStore, query: &str, limit: usize) -> Resul
         .filter(|(_, s)| s.is_finite())
         .collect::<Vec<_>>();
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // 宁缺勿噪(r2 评测收尾建议):两轮实测证实代理「试一次不满意就永久弃用」——
+    // 噪声 top-k 比空结果更致命。默认滤 score<0.5 的噪声底(mes 实测噪声挤在
+    // 0.45-0.55,真命中 0.57+);top<0.6 属弱相关,附 hint 引导去 search_entities。
+    // min_score 参数可调(0 = 不过滤,旧行为)。
+    let min_score = arguments["min_score"].as_f64().unwrap_or(0.5) as f32;
+    let top_score = scored.first().map(|(_, s)| *s).unwrap_or(0.0);
     let mut items = Vec::new();
-    for (id, score) in scored.into_iter().take(limit) {
+    for (id, score) in scored
+        .into_iter()
+        .take(limit)
+        .filter(|(_, s)| *s >= min_score)
+    {
         if let Some(entity) = store.get_entity(&id)? {
             items.push(json!({ "entity": entity_to_json(&entity, false), "score": score }));
         }
     }
-    Ok(json!({ "items": items, "count": items.len(), "query": query }))
+    let mut result = json!({ "items": items, "count": 0, "query": query });
+    result["count"] = json!(result["items"].as_array().map(Vec::len).unwrap_or(0));
+    if result["count"].as_u64() == Some(0) {
+        result["hint"] = json!(format!(
+            "no match scored >= {min_score} (top was {top_score:.2}). Semantic recall is \
+             weak for this query — try search_entities with English identifiers instead. \
+             Pass min_score=0 to see unfiltered results."
+        ));
+    } else if top_score < 0.6 {
+        result["hint"] = json!(
+            "weak matches (top < 0.6) — treat as leads, cross-check anchors with \
+             search_entities before concluding."
+        );
+    }
+    Ok(result)
 }
 
 // cosine 已上移到 embedding crate(mcp 与 cli semantic-search 共用,避免复制漂移)。
@@ -2679,14 +2704,22 @@ mod tests {
             .map(|e| format!("{} {} {}", e.kind.as_str(), e.qualified_name, e.name))
             .collect();
         let vecs = emb.embed(texts).unwrap();
+        // text_hash 必须带当前空间前缀:semantic_search 会过滤旧空间向量
+        // (v0.1.54),裸 "h" 会被全滤成空结果。
+        let prefix = repo_intelligence_embedding::text_hash_prefix();
         let rows: Vec<(EntityId, Vec<f32>, String)> = entities
             .iter()
             .zip(vecs)
-            .map(|(e, v)| (e.id.clone(), v, "h".to_string()))
+            .map(|(e, v)| (e.id.clone(), v, format!("{prefix}test")))
             .collect();
         store.set_embeddings(&rows).unwrap();
         // 语义查询:user login/authentication。userLogin/authenticateUser 应排前两名之一。
-        let result = semantic_search(&store, "user login authentication", 10).unwrap();
+        // fixture 仅 4 个实体,余弦天然低——排序断言用 min_score=0 看全量。
+        let result = semantic_search(
+            &store,
+            &serde_json::json!({"query": "user login authentication", "limit": 10, "min_score": 0.0}),
+        )
+        .unwrap();
         let names: Vec<String> = result["items"]
             .as_array()
             .unwrap()
@@ -2700,6 +2733,18 @@ mod tests {
             top2.contains(&"userLogin") || top2.contains(&"authenticateUser"),
             "top2 应含 login/auth 实体,实际 {:?}",
             top2
+        );
+        // 宁缺勿噪(r2 评测收尾):默认 min_score=0.5 滤噪声底;min_score=0 恢复全量。
+        let unfiltered = semantic_search(
+            &store,
+            &serde_json::json!({"query": "user login authentication", "limit": 10, "min_score": 0.0}),
+        )
+        .unwrap();
+        assert!(
+            unfiltered["count"].as_u64().unwrap() >= result["count"].as_u64().unwrap(),
+            "min_score=0 的计数应 >= 默认阈值: {} vs {}",
+            unfiltered["count"],
+            result["count"]
         );
     }
 

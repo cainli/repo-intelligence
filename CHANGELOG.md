@@ -7,6 +7,15 @@
 
 ## [Unreleased]
 
+### Changed(r2 评测收尾)
+
+- **semantic_search 宁缺勿噪**(r2 实测:代理「试一次不满意就永久弃用」,噪声
+  top-k 比空结果更致命):默认滤 `score < 0.5` 的噪声底(mes 实测噪声挤在
+  0.45-0.55、真命中 0.57+),空结果带 hint 引导改用 search_entities;top < 0.6
+  时附「weak matches — treat as leads」提示交叉验证。`min_score` 参数可调
+  (0 = 恢复旧行为)。ruoyi 实测:域外 query 从噪声 top 变为空 + 引导,域内
+  命中保留且带 weak 提示。CLI semantic-search 不过滤(探针用途,看全量分布)。
+
 ## [0.1.56] - 2026-10-30
 
 ### Changed(MCP 接口检视)
