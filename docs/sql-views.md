@@ -25,9 +25,20 @@ SELECT source, target FROM v_edge
 | `source` / `target` | JOIN entity 的 qualified_name | **API 同名**;qn 格式 `{相对路径}#{名称}`(v0.1.48 起全 kind 路径化,Windows 分隔符归一 `/`) |
 | `kind` | edge.kind | snake_case,与 API `edge_kind` 一致(calls / injects / implements / implements_method / superclass_of / reads_table …) |
 | `confidence` | `json.evidence[0].confidence` | 0-1 |
-| `tentative` | 由 evidence 分类派生 | Fact 且 <0.8 为 false 等 |
+| `evidence_class` | `json.evidence[0].classification` | fact / resolved / inferred(原文) |
+| `tentative` | 由 evidence_class + confidence 派生 | v0.1.53 起真计算(此前提取不存在的 `$.tentative` 恒 NULL)。判定与 API edge_view 同源:fact → 0;resolved 且 confidence ≥0.6 → 0;其余 → 1 |
 | `source_id` / `target_id` | 底表列 | EntityId(blake3 哈希) |
-| `resolved` / `start_line` / `end_line` | 底表列 | resolved=1 表示跨文件消解边 |
+| `resolved` / `start_line` / `end_line` | 底表列 | **簿记列,不是验证等级**(见下) |
+
+### 两列语义辨析(易混,务必读)
+
+- **`resolved` 是增量扫描的内部簿记**:`0` = 提取层同文件事实边(最高可信,直接来自
+  tree-sitter 解析);`1` = analysis 层跨文件推断边(每轮 scan 全删全重算)。两者都
+  是正常的边,**`resolved=0` 绝不意味着「未解析/低质量」**——恰恰相反,事实边最硬。
+- **可信度请看 `evidence_class` + `confidence` + `tentative`**:fact(提取事实)>
+  resolved(走完消歧阶梯的跨文件精确解析,如 calls 0.7)> inferred(名字匹配推断,
+  如 calls 0.5 裸名)。
+- 视图每次开库 DROP+CREATE 重建(v0.1.53 起),旧库打开一次即得新定义。
 
 ## v_entity
 
@@ -57,5 +68,6 @@ SELECT json_extract(json,'$.evidence[0].confidence') FROM edge WHERE kind='calls
   `LIKE '%/system/user%'` 而非 `'/system/user%'`。
 - 动态菜单路由(constantRoutes 之外)的项目,静态索引只含静态路由——查「页面属于
   哪个路由」为空是预期,不是缺陷。
-- 视图是 `CREATE VIEW IF NOT EXISTS`,RI 工具每次开库都会补建;若你的库从没被
-  0.1.47+ 的二进制打开过,先跑一次任意 CLI 命令(如 `repo-intelligence search`)即可。
+- 视图是每次开库重建(v0.1.53 起 DROP+CREATE,v_edge 定义随版本更新;v_entity 仍
+  `CREATE VIEW IF NOT EXISTS`);若你的库从没被 0.1.47+ 的二进制打开过,先跑一次任意
+  CLI 命令(如 `repo-intelligence search`)即可。

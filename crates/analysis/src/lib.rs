@@ -18,7 +18,9 @@ use serde_json::json;
 /// 通道)必须强制全量重提,否则增量扫描会让旧 id 实体与新方案边(id 不匹配)并存,边
 /// 悬空。做法:file_state 的值带版本前缀,版本变更后首次扫描新旧哈希不等 → 全量重提,
 /// 之后稳定回增量。
-const INDEX_FORMAT: u32 = 6;
+/// v7(第五轮反馈 F1):同文件 calls 边 evidence 分类 Inferred→Resolved(提取层
+/// 边,evidence JSON 变化,不重提则新旧口径混存)。配合向量保留,重提不重嵌。
+const INDEX_FORMAT: u32 = 7;
 
 #[derive(Clone, Debug, Default)]
 pub struct ScanSummary {
@@ -642,6 +644,39 @@ impl WorkspaceIndexer {
         });
         let new_state_vec: Vec<(String, String)> = new_state.into_iter().collect();
         store.set_file_state(&new_state_vec)?;
+
+        // scan 摘要落库(第五轮反馈 F5):get_index_status/doctor 的健康度数据源。
+        // finished_at 用 epoch 秒(与 file_state.indexed_at 同口径),duration 含全流程。
+        let meta: Vec<(String, String)> = vec![
+            (
+                "finished_at".into(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs().to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "duration_ms".into(),
+                started.elapsed().as_millis().to_string(),
+            ),
+            ("index_format".into(), INDEX_FORMAT.to_string()),
+            ("files_indexed".into(), summary.files_indexed.to_string()),
+            (
+                "files_extracted".into(),
+                summary.files_extracted.to_string(),
+            ),
+            (
+                "files_unchanged".into(),
+                summary.files_unchanged.to_string(),
+            ),
+            (
+                "ambiguous_skipped".into(),
+                summary.ambiguous_skipped.to_string(),
+            ),
+            ("embedded_count".into(), summary.embedded_count.to_string()),
+            ("embedding_ms".into(), summary.embedding_ms.to_string()),
+        ];
+        store.set_scan_meta(&meta)?;
 
         report(ScanProgress {
             phase: ScanPhase::Completed,
@@ -1510,12 +1545,21 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
             if let Some(callee_id) = resolved
                 && let Some(ev) = entity.evidence.first()
             {
+                // 分类按档:0.7(注入字段/静态类型,走完消歧阶梯的精确解析)= Resolved,
+                // 0.5(裸名注入匹配)= Inferred。此前统一 Inferred,展示层最好调用边也恒
+                // tentative:true——代理无法区分精确解析与名字猜测,宁可退回 grep(第五轮
+                // 反馈 F1)。confidence 数值保持 0.7/0.5 不变(历史基线口径)。
+                let classification = if confidence >= 0.7 {
+                    EvidenceClass::Resolved
+                } else {
+                    EvidenceClass::Inferred
+                };
                 edges.push(
                     Edge::new(entity.id.clone(), callee_id.clone(), EdgeKind::Calls).with_evidence(
                         &ev.file,
                         line,
                         line,
-                        EvidenceClass::Inferred,
+                        classification,
                         confidence,
                         &reason,
                     ),
@@ -1696,14 +1740,14 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
                     "interface dispatch to implementation".to_string()
                 };
                 // Calls 桥接(iface method → impl method):默认 trace kinds 即贯通,
-                // 证据锚在接口方法(分发点)。
+                // 证据锚在接口方法(分发点)。Resolved(消歧后的精确分发,非名字猜测)。
                 let mut bridge = Edge::new(edge.target.clone(), impl_m_id.clone(), EdgeKind::Calls);
                 if let Some(ev) = m.evidence.first() {
                     bridge = bridge.with_evidence(
                         &ev.file,
                         ev.start_line,
                         ev.end_line,
-                        EvidenceClass::Inferred,
+                        EvidenceClass::Resolved,
                         0.7,
                         &dispatch_reason,
                     );
@@ -1711,7 +1755,8 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
                 edges.push(bridge);
                 // ImplementsMethod 层级边(impl method → iface method):显式查询词汇
                 // (接口方法找实现:trace_callers + edge_kinds=["implements_method"]),
-                // 证据锚在实现方法(覆写点)。
+                // 证据锚在实现方法(覆写点)。Resolved:实现类方法表精确匹配(镜像
+                // 组内已按 fqn 收敛),非名字猜测。
                 let overrides_reason = if mirrored {
                     "method overrides interface method (mirrored duplicate)"
                 } else {
@@ -1730,7 +1775,7 @@ fn resolve_cross_stack(entities: &[Entity], input_edges: &[Edge]) -> Resolution 
                         &ev.file,
                         ev.start_line,
                         ev.end_line,
-                        EvidenceClass::Inferred,
+                        EvidenceClass::Resolved,
                         0.8,
                         overrides_reason,
                     );
@@ -2937,6 +2982,37 @@ mod tests {
                 .any(|(s, t)| **s == h1_handle && **t == impl_handle.id),
             "接口分发应桥到 ImplA.handle: {calls:?}"
         );
+        // 第五轮反馈 F1:evidence 分类按档——字段路径 0.7(走完消歧阶梯)= Resolved
+        // (此前统一 Inferred,展示层最好的 calls 边也恒 tentative,代理无法信任);
+        // 接口分发桥接 0.7 与 implements_method 0.8 同为 Resolved。
+        let classified = |source: &EntityId, target: &EntityId| {
+            r.patch
+                .add_edges
+                .iter()
+                .find(|e| e.source == *source && e.target == *target)
+                .map(|e| {
+                    (
+                        e.kind,
+                        e.evidence[0].classification,
+                        e.evidence[0].confidence,
+                    )
+                })
+        };
+        let field = classified(&run.id, &h1_handle)
+            .expect("run→iface handle 边存在(字段路径解析到接口方法)");
+        assert_eq!(field.0, EdgeKind::Calls);
+        assert_eq!(field.1, EvidenceClass::Resolved);
+        assert!((field.2 - 0.7).abs() < 1e-6);
+        let bridge =
+            classified(&h1_handle, &impl_handle.id).expect("iface method→impl method 桥接边存在");
+        assert_eq!(bridge.0, EdgeKind::Calls);
+        assert_eq!(bridge.1, EvidenceClass::Resolved);
+        assert!((bridge.2 - 0.7).abs() < 1e-6, "confidence 口径不变");
+        let overrides =
+            classified(&impl_handle.id, &h1_handle).expect("implements_method 层级边存在");
+        assert_eq!(overrides.0, EdgeKind::ImplementsMethod);
+        assert_eq!(overrides.1, EvidenceClass::Resolved);
+        assert!((overrides.2 - 0.8).abs() < 1e-6);
     }
 
     /// P0-A(第三轮反馈):多实现(不同 FQCN)是接口的正常形态而非歧义——全连,

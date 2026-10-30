@@ -364,12 +364,43 @@ fn run() -> Result<()> {
         }
         Command::Doctor { format } => {
             let sqlite = SqliteGraphStore::open(&cli.database).is_ok();
+            // 索引健康度(第五轮反馈 F1/F5):「resolve 阶段有没有跑全」「embedding 覆盖
+            // 如何」「fts 是否同步」三个最常见盲区一眼可判——此前 doctor 只有静态布尔,
+            // 大仓的 resolve 回归只能靠 sqlite 手查才看得见。
+            let index = if sqlite {
+                match || -> anyhow::Result<serde_json::Value> {
+                    let store = SqliteGraphStore::open(&cli.database)?;
+                    let (entities, edges) = store.counts()?;
+                    let (entity_count, embedded, fts_rows) = store.health_counts()?;
+                    Ok(serde_json::json!({
+                        "entity_count": entities,
+                        "edge_count": edges,
+                        "embedding": {
+                            "embedded_entities": embedded,
+                            "coverage_pct": if entity_count > 0 {
+                                (embedded as f64 * 100.0 / entity_count as f64).round()
+                            } else { 0.0 },
+                        },
+                        "fts": { "rows": fts_rows, "in_sync": fts_rows == entity_count },
+                        "scan_meta": store.get_scan_meta()?,
+                        // kind × resolved × classification 计数;resolved 列语义见
+                        // docs/sql-views.md(0=提取层事实边,1=analysis 跨文件推断边)。
+                        "edge_health": store.edge_health()?,
+                    }))
+                }() {
+                    Ok(value) => value,
+                    Err(err) => serde_json::json!({ "error": err.to_string() }),
+                }
+            } else {
+                serde_json::Value::Null
+            };
             emit(
                 format,
                 serde_json::json!({
                     "sqlite": sqlite,
                     "tree_sitter_java": true,
-                    "mcp_stdio": true
+                    "mcp_stdio": true,
+                    "index": index,
                 }),
             )
         }

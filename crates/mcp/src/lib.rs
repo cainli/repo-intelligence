@@ -193,6 +193,8 @@ fn tool_specs() -> Vec<ToolSpec> {
             "limit": {"type": "integer", "minimum": 0},
             "offset": {"type": "integer", "minimum": 0},
             "has_more": {"type": "boolean"},
+            "total_count": {"type": "integer", "minimum": 0, "description": "Pre-filter hits."},
+            "kind_facets": {"type": "object", "description": "kind → pre-filter hit count."},
             "hint": {"type": "string"}
         },
         "required": ["items", "count", "limit", "offset", "has_more"]
@@ -213,8 +215,8 @@ fn tool_specs() -> Vec<ToolSpec> {
             "edge_kinds": {
                 "type": "array",
                 "items": {"type": "string"},
-                "default": ["calls", "injects", "declares", "superclass_of"],
-                "description": "Edge kinds to follow (see trace defaults)."
+                "default": ["calls", "injects", "superclass_of"],
+                "description": "Edge kinds to follow. Default adds declares for outbound (class drill-down) only; pass [\"calls\",\"injects\",\"declares\"] to group callers back into classes."
             },
             "min_confidence": {
                 "type": "number",
@@ -282,7 +284,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "search_entities",
-            description: "Substring search across indexed entities. Semantic/concept matching: use semantic_search instead.",
+            description: "Substring search across indexed entities. Query with English identifiers (class/method/field names), not Chinese business words; returns kind_facets to narrow. Concept matching: semantic_search.",
             input_schema: search_input.clone(),
             output_schema: search_output.clone(),
         },
@@ -294,7 +296,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "semantic_search",
-            description: "Meaning-based search (bundled local ONNX embeddings, cosine top-k). Needs embedding enabled + prior scan.",
+            description: "Meaning-based search (local ONNX embeddings, cosine top-k). For concept/description queries when you don't know the identifier; known names → search_entities instead. Works best when code has doc comments.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -409,7 +411,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "trace_callers",
-            description: "Inbound BFS (who reaches X). Default kinds: calls/injects/declares/superclass_of. Class starts auto-expand to declared methods. Cross-file links are inferred; ground with verify_edge.",
+            description: "Inbound BFS (who reaches X). Default kinds: calls/injects/superclass_of (no declares — declaring class is not a caller). Class starts auto-expand to declared methods. Cross-file links are inferred; ground with verify_edge.",
             input_schema: trace_input.clone(),
             output_schema: trace_output.clone(),
         },
@@ -421,7 +423,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "trace_table_access",
-            description: "One-shot: readers/writers of a table + upstream chain. BFS along reads/writes_table + calls + injects.",
+            description: "First choice for column-consumption audit / add-column impact: readers/writers of a table + upstream call chain (reads/writes_column feeds it).",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -1006,7 +1008,7 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
         "trace_callers" => {
             let name = arguments["name"].as_str().unwrap_or_default();
             let depth = parse_depth(arguments, DEFAULT_TRACE_DEPTH);
-            let kinds = parse_edge_kinds(arguments)?;
+            let kinds = parse_edge_kinds(arguments, false)?;
             let min_confidence = arguments["min_confidence"]
                 .as_f64()
                 .unwrap_or(0.0)
@@ -1032,7 +1034,7 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
         "trace_callees" => {
             let name = arguments["name"].as_str().unwrap_or_default();
             let depth = parse_depth(arguments, DEFAULT_TRACE_DEPTH);
-            let kinds = parse_edge_kinds(arguments)?;
+            let kinds = parse_edge_kinds(arguments, true)?;
             let min_confidence = arguments["min_confidence"]
                 .as_f64()
                 .unwrap_or(0.0)
@@ -1106,6 +1108,19 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0) as f32;
             let kinds = match &arguments["edge_kinds"] {
+                Value::Null if !outbound => vec![
+                    // inbound 默认不含 declares(同 parse_edge_kinds 的方向感知默认):
+                    // 反向溯源时声明类不是「到达者」,含它是半页噪声。要聚合回声明类,
+                    // 显式传 edge_kinds。
+                    EdgeKind::Calls,
+                    EdgeKind::Injects,
+                    EdgeKind::SuperclassOf,
+                    EdgeKind::BindsToStatement,
+                    EdgeKind::ReadsTable,
+                    EdgeKind::WritesTable,
+                    EdgeKind::Exposes,
+                    EdgeKind::MatchesEndpoint,
+                ],
                 Value::Null => vec![
                     EdgeKind::Calls,
                     EdgeKind::Injects,
@@ -1216,6 +1231,37 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
                 "entity_count": entity_count,
                 "edge_count": edge_count,
             });
+            // 健康度(第五轮反馈 F5):scan 元数据 + embedding 覆盖 + fts 同步。
+            // scan_meta 为空 = 0.1.53 前的旧库未重扫,照实显示(数据在下次 scan 落)。
+            if indexed {
+                let meta = store.get_scan_meta().unwrap_or_default();
+                let (entities, embedded, fts_rows) = store.health_counts().unwrap_or((0, 0, 0));
+                let mut health = json!({
+                    "embedded_entities": embedded,
+                    "embedding_coverage": if entities > 0 {
+                        (embedded as f64 / entities as f64).round() * 100.0 / 100.0
+                    } else {
+                        0.0
+                    },
+                    "fts_rows": fts_rows,
+                    "fts_in_sync": fts_rows == entities,
+                });
+                for key in [
+                    "finished_at",
+                    "duration_ms",
+                    "index_format",
+                    "files_indexed",
+                    "files_extracted",
+                    "files_unchanged",
+                    "ambiguous_skipped",
+                    "embedded_count",
+                ] {
+                    if let Some(value) = meta.get(key) {
+                        health[key] = json!(value);
+                    }
+                }
+                status["health"] = health;
+            }
             if !indexed {
                 status["hint"] =
                     json!("index is empty; run `scan_workspace` to populate it before querying");
@@ -1353,6 +1399,14 @@ fn parse_offset(arguments: &Value) -> usize {
 /// For `search_entities` (no filter) this is exact; for `find_endpoint` the window
 /// is over pre-filter candidates, so `has_more` may under-report — but it never
 /// drops data, it only stops paging a step early.
+/// search_with_filter 的产物:本页实体 / 本页条数 / has_more / 过滤前 kind 分面。
+struct SearchResultPage {
+    entities: Vec<repo_intelligence_model::Entity>,
+    count: usize,
+    has_more: bool,
+    facets: Vec<(String, usize)>,
+}
+
 fn search_with_filter(
     store: &SqliteGraphStore,
     query: &str,
@@ -1360,7 +1414,7 @@ fn search_with_filter(
     offset: usize,
     filter: Option<&[EntityKind]>,
     cx: &ComplexityFilter,
-) -> Result<(Vec<repo_intelligence_model::Entity>, usize, bool)> {
+) -> Result<SearchResultPage> {
     // 复杂度过滤/排序时放大候选窗口:FTS 按 relevance 排序会把高复杂度方法截断在
     // peek 窗口外(它文本相关性可能靠后)。放大到 min(1000, limit*10) 保证筛排样本充足。
     let window = if cx.any() {
@@ -1368,11 +1422,14 @@ fn search_with_filter(
     } else {
         limit.saturating_add(1)
     };
-    let matches = store.search(
-        SearchQuery::new(query)
-            .with_limit(window)
-            .with_offset(offset),
-    )?;
+    let search_query = SearchQuery::new(query)
+        .with_limit(window)
+        .with_offset(offset);
+    let matches = store.search(search_query.clone())?;
+    // 命中分面(第五轮反馈 F4):过滤前口径的 per-kind 计数——宽词命中数千实体时
+    // 只有 has_more 无从决策,调用方拿 total + facet 判断「翻页还是收窄 kind」。
+    // 失败不阻塞搜索(分面是锦上添花)。
+    let facets = store.search_facets(&search_query).unwrap_or_default();
     let mut entities: Vec<_> = matches
         .into_iter()
         .map(|matched| matched.entity)
@@ -1399,7 +1456,12 @@ fn search_with_filter(
         entities.truncate(limit);
     }
     let count = entities.len();
-    Ok((entities, count, has_more))
+    Ok(SearchResultPage {
+        entities,
+        count,
+        has_more,
+        facets,
+    })
 }
 
 /// 语义检索:用本地 ONNX 给 query 生成 embedding,与全部 entity embedding 算余弦相似度,
@@ -1490,7 +1552,7 @@ fn run_search(
         min_loop_depth: arguments["min_loop_depth"].as_u64().map(|v| v as u32),
         sort_by: arguments["sort_by"].as_str().map(|s| s.to_string()),
     };
-    let (entities, count, has_more) = search_with_filter(
+    let page = search_with_filter(
         store,
         query,
         limit,
@@ -1498,9 +1560,22 @@ fn run_search(
         filter.or(parsed_kinds.as_deref()),
         &cx,
     )?;
+    let SearchResultPage {
+        entities,
+        count,
+        has_more,
+        facets,
+    } = page;
     let items: Vec<Value> = entities
         .iter()
         .map(|entity| entity_to_json(entity, verbose))
+        .collect();
+    // 命中分面(过滤前口径):total_count = 各 kind 之和。调用方带 kind 过滤时
+    // total 与本页 count 不同属预期——total 回答「这个子串一共命中多少」。
+    let total_count: usize = facets.iter().map(|(_, n)| n).sum();
+    let kind_facets: serde_json::Map<String, Value> = facets
+        .iter()
+        .map(|(kind, n)| (kind.clone(), json!(n)))
         .collect();
     Ok(json!({
         "items": items,
@@ -1508,6 +1583,8 @@ fn run_search(
         "limit": limit,
         "offset": offset,
         "has_more": has_more,
+        "total_count": total_count,
+        "kind_facets": kind_facets,
     }))
 }
 
@@ -1672,12 +1749,23 @@ fn parse_depth(arguments: &Value, default: usize) -> usize {
 /// Resolve `edge_kinds` from arguments. Defaults to the `Calls` edge so the
 /// trace tools answer "call chain" out of the box instead of dragging in
 /// containment or table-read edges; an explicit array overrides it.
-fn parse_edge_kinds(arguments: &Value) -> Result<Vec<EdgeKind>> {
+///
+/// 方向感知默认(第五轮反馈 F3):outbound 保留 declares(类起点下钻方法、
+/// 类→方法→Mapper→表 的既有链路);inbound(callers)默认**不含** declares——
+/// 「谁调用 X」的语义里声明类不是调用者,含它会让回包一半是 declares 噪声
+/// (实测 22 边中 11 条)。要从方法聚合回声明类,显式传 edge_kinds 含 declares。
+/// 注意类起点展开(P2-E)是名字解析语义,与 edge_kinds 正交,不受此影响。
+fn parse_edge_kinds(arguments: &Value, outbound: bool) -> Result<Vec<EdgeKind>> {
     match &arguments["edge_kinds"] {
-        Value::Null => Ok(vec![
+        Value::Null if outbound => Ok(vec![
             EdgeKind::Calls,
             EdgeKind::Injects,
             EdgeKind::Declares,
+            EdgeKind::SuperclassOf,
+        ]),
+        Value::Null => Ok(vec![
+            EdgeKind::Calls,
+            EdgeKind::Injects,
             EdgeKind::SuperclassOf,
         ]),
         value => Ok(serde_json::from_value(value.clone())?),
@@ -1703,9 +1791,10 @@ fn kinds_label(kinds: &[EdgeKind]) -> String {
 fn edge_view(edge: &Edge, verbose: bool) -> Value {
     let evidence = edge.evidence.first();
     let confidence = evidence.map(|item| item.confidence).unwrap_or(1.0);
+    // 阈值常量与 graph 的 v_edge 视图共用(model 层单源,防两套口径漂移)。
     let tentative = match evidence.map(|item| item.classification) {
         Some(EvidenceClass::Fact) => false,
-        Some(EvidenceClass::Resolved) => confidence < 0.8,
+        Some(EvidenceClass::Resolved) => confidence < EvidenceClass::RESOLVED_TENTATIVE_BELOW,
         Some(_) | None => true,
     };
     let mut view = json!({
@@ -1939,9 +2028,11 @@ fn trace_graph(
         "start_count": starts.len(),
     });
     // mes-activity 反馈(P1-4):紧凑档边只有 hash id,裸名多实体合并时要人工对照尾部
-    // items[] 才能读。顶层加 nodes 查找表 {hash: {name, qualified_name, kind, file}},
+    // items[] 才能读。顶层加 nodes 查找表 {hash: {name, qualified_name, kind}},
     // 只为当前边页引用的端点建条目(上限 2×limit,重度去重);verbose 不发(items 全量
     // 自带名字)。端点必在到达集内(traverse 不变式),查不到即被 to_kind 过滤,可缺席。
+    // v0.1.53(第五轮反馈 F3)去掉条目里的 file:qn 路径化(v0.1.48)后已含归一化
+    // 路径前缀,与 file 完全冗余——每条目省 ~40B,大分页回包可观。
     if !verbose && !page_edges.is_empty() {
         let by_id: HashMap<&EntityId, &Entity> = items.iter().map(|e| (&e.id, e)).collect();
         let mut nodes = serde_json::Map::new();
@@ -1957,7 +2048,6 @@ fn trace_graph(
                             "name": e.name,
                             "qualified_name": e.qualified_name,
                             "kind": e.kind.as_str(),
-                            "file": e.evidence.first().map(|ev| ev.file.clone()),
                         }),
                     );
                 }
@@ -2536,13 +2626,24 @@ mod tests {
             "resolved",
         );
         assert_eq!(edge_view(&resolved_hi, true)["tentative"], false);
-        // Resolved 低置信 → tentative
+        // Resolved@0.7(calls 精确解析档)→ 不 tentative(第五轮反馈 F1:阈值 0.8→0.6,
+        // 最好的 calls 边不再恒 tentative,与 0.5 裸名档可区分)
+        let resolved_calls = Edge::new(id("a"), id("b"), EdgeKind::Calls).with_evidence(
+            "F.java",
+            1,
+            1,
+            EvidenceClass::Resolved,
+            0.7,
+            "cross-file call via injected field receiver",
+        );
+        assert_eq!(edge_view(&resolved_calls, true)["tentative"], false);
+        // Resolved 低置信 → tentative(阈值 0.6)
         let resolved_lo = Edge::new(id("a"), id("b"), EdgeKind::MatchesEndpoint).with_evidence(
             "F.java",
             1,
             1,
             EvidenceClass::Resolved,
-            0.6,
+            0.55,
             "low",
         );
         assert_eq!(edge_view(&resolved_lo, true)["tentative"], true);
@@ -2754,11 +2855,11 @@ mod tests {
         .unwrap();
         let nodes = compact["nodes"].as_object().expect("nodes 查找表存在");
         assert_eq!(nodes.len(), 2, "一条边两个端点: {nodes:?}");
-        assert!(
-            nodes
-                .values()
-                .all(|n| n["qualified_name"].is_string() && n["file"].is_string())
-        );
+        // v0.1.53(第五轮反馈 F3):条目去 file——qn 路径化后已含路径前缀,file 冗余。
+        assert!(nodes.values().all(|n| n["qualified_name"].is_string()
+            && n["name"].is_string()
+            && n["kind"].is_string()));
+        assert!(nodes.values().all(|n| n["file"].is_null()));
         // verbose 档:items 已全量带名字,nodes 不发
         let verbose = trace_graph(&store, "Svc", 1, kinds, true, 0.0, 50, 0, None, true).unwrap();
         assert!(verbose["nodes"].is_null(), "verbose 档不重复发 nodes");

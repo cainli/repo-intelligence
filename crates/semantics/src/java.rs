@@ -427,7 +427,10 @@ fn extract_java(
                 path,
                 inv.line,
                 inv.line,
-                EvidenceClass::Inferred,
+                // Resolved(第五轮反馈 F1):caller/callee 都在本文件方法表内唯一命中,
+                // 是直接解析而非名字猜测——与跨文件 0.7 档同分类,展示层不再恒
+                // tentative(此前 790/790 同文件边全显 tentative,最可信的边最像不可信)。
+                EvidenceClass::Resolved,
                 0.7,
                 "same-file method call",
             ),

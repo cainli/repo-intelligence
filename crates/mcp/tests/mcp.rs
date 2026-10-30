@@ -886,6 +886,22 @@ fn search_entities_filters_by_kind() {
         only_methods["count"].as_u64().unwrap_or(0) >= 3,
         "kind=method should keep all S27* methods: {only_methods}"
     );
+
+    // 第五轮反馈 F4:total_count + kind_facets(过滤前口径)——调用方带 kind 过滤时
+    // total 仍反映全集,据此判断「翻页还是收窄」。
+    let faceted = call_tool(
+        &database,
+        "search_entities",
+        serde_json::json!({"query": "S27", "kind": ["class"]}),
+    );
+    let facets = faceted["kind_facets"].as_object().expect("facets 存在");
+    let method_hits = facets.get("method").and_then(|v| v.as_u64()).unwrap_or(0);
+    assert!(method_hits >= 3, "method facet 应计过滤前命中: {faceted}");
+    assert_eq!(
+        faceted["total_count"].as_u64().unwrap_or(0),
+        facets.values().filter_map(|v| v.as_u64()).sum::<u64>(),
+        "total_count = facet 之和"
+    );
 }
 
 #[test]
@@ -950,9 +966,11 @@ fn trace_tools_declare_typed_schemas() {
             "{tool_name} must take a name"
         );
         assert_eq!(input_props["depth"]["default"], 2);
+        // v0.1.53(第五轮反馈 F3):inbound 默认不含 declares(声明类不是调用者);
+        // schema 的 default 展示 inbound 口径,description 说明 outbound 会补 declares。
         assert_eq!(
             input_props["edge_kinds"]["default"],
-            serde_json::json!(["calls", "injects", "declares", "superclass_of"])
+            serde_json::json!(["calls", "injects", "superclass_of"])
         );
         assert_eq!(tool["inputSchema"]["additionalProperties"], false);
         assert_eq!(tool["outputSchema"]["type"], "object");

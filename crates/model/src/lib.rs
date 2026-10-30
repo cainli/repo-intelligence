@@ -118,6 +118,78 @@ impl EntityKind {
             Self::Route => "route",
         }
     }
+
+    /// 子串搜索的展示权重(小者靠前)。覆盖**全部** kind——此前 graph 层的 SQL CASE
+    /// 只列了 6 个 Java kind,前端仓(function/vue_page/route…)全落 ELSE 档,排序
+    /// 退化为字母序(第五轮反馈 F4)。语义:业务结构实体(类/接口/方法/函数/页面/
+    /// 端点)优先,数据成员(field/column 族)沉底——宽词命中几十个同名 field 时
+    /// 方法实体不该被挤出第一页。权重第一、精确同名第二:搜 "LoanTerm" 时一堆精确
+    /// 叫 loanTerm 的 field 不再霸占页首(想精确找字段用 kind 过滤)。
+    pub fn search_rank(self) -> i64 {
+        match self {
+            Self::Class => 1,
+            Self::Interface => 2,
+            Self::Method | Self::MapperMethod => 3,
+            Self::Function => 4,
+            Self::VuePage | Self::VueComponent => 5,
+            // file 与 bean 同档:搜目录/通用词(如 "user")时 40+ 文件不该霸榜,
+            // 业务结构实体先出;按文件名找文件仍命中(排在类/方法后)或加 kind 过滤。
+            Self::File | Self::SpringBean => 6,
+            Self::HttpEndpoint | Self::HttpClientCall => 7,
+            Self::Mapper | Self::Table | Self::Route | Self::Enum | Self::TypeAlias => 8,
+            Self::Annotation | Self::Job | Self::XmlStatement | Self::ResultMap => 9,
+            Self::Package | Self::TestCase | Self::ConfigFile => 10,
+            Self::Workspace
+            | Self::Repository
+            | Self::Submodule
+            | Self::Datasource
+            | Self::Database => 11,
+            // 数据成员族:宽词的最大命中面,默认沉底
+            Self::Field | Self::FrontendField | Self::ApiField | Self::SqlField | Self::Column => {
+                12
+            }
+        }
+    }
+
+    /// `search_rank` 的 SQL 投影((kind_str, rank) 对,graph 层拼 ORDER BY CASE 用)。
+    /// 与 search_rank 是同一决策的两种表达——`search_rank_matches_sql_table` 测试锁
+    /// 一致;新增 EntityKind variant 忘同步时,该 kind 落 SQL 的 ELSE 99 档(排序
+    /// 退化但不炸),测试的长度断言会提醒补表。
+    pub const SEARCH_RANK_SQL: &[(&str, i64)] = &[
+        ("class", 1),
+        ("interface", 2),
+        ("method", 3),
+        ("mapper_method", 3),
+        ("function", 4),
+        ("vue_page", 5),
+        ("vue_component", 5),
+        ("file", 6),
+        ("spring_bean", 6),
+        ("http_endpoint", 7),
+        ("http_client_call", 7),
+        ("mapper", 8),
+        ("table", 8),
+        ("route", 8),
+        ("enum", 8),
+        ("type_alias", 8),
+        ("annotation", 9),
+        ("job", 9),
+        ("xml_statement", 9),
+        ("result_map", 9),
+        ("package", 10),
+        ("test_case", 10),
+        ("config_file", 10),
+        ("workspace", 11),
+        ("repository", 11),
+        ("submodule", 11),
+        ("datasource", 11),
+        ("database", 11),
+        ("field", 12),
+        ("frontend_field", 12),
+        ("api_field", 12),
+        ("sql_field", 12),
+        ("column", 12),
+    ];
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +199,15 @@ pub enum EvidenceClass {
     Resolved,
     Inferred,
     RuntimeUnknown,
+}
+
+impl EvidenceClass {
+    /// `Resolved` 边低于该置信度仍展示 `tentative:true`。集中在一处:mcp 的
+    /// edge_view 与 graph 的 v_edge 视图 SQL 共用,两边手写会漂移(第五轮反馈
+    /// F1:v_edge 提取 `$.tentative` 恒 NULL,正是因为视图与 edge_view 各自为政)。
+    /// 0.6 的口径:calls 的精确解析档是 0.7(走完消歧阶梯)、裸名匹配 0.5——
+    /// 0.6 让前者不 tentative、后者仍 tentative,是「精确解析可信」的分界线。
+    pub const RESOLVED_TENTATIVE_BELOW: f32 = 0.6;
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -577,6 +658,19 @@ pub struct ClusterInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_rank_matches_sql_table() {
+        // SEARCH_RANK_SQL 与 search_rank 是同一决策的两种表达,条目逐一锁一致;
+        // 长度锁当前全部 33 个 kind——新增 variant 忘同步表时此断言提醒(该 kind
+        // 在 SQL 侧落 ELSE 99 档,排序退化但不炸)。
+        assert_eq!(EntityKind::SEARCH_RANK_SQL.len(), 33);
+        for (kind_str, rank) in EntityKind::SEARCH_RANK_SQL {
+            let kind: EntityKind =
+                serde_json::from_value(serde_json::json!(kind_str)).expect(kind_str);
+            assert_eq!(kind.search_rank(), *rank, "mismatch for {kind_str}");
+        }
+    }
 
     #[test]
     fn impact_report_compact_value_omits_metadata_and_evidence_arrays() {

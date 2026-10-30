@@ -3,7 +3,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use repo_intelligence_model::{
-    ClusterInfo, Edge, Entity, EntityId, GraphPatch, QueryResult, SearchQuery, TraverseQuery,
+    ClusterInfo, Edge, Entity, EntityId, EntityKind, EvidenceClass, GraphPatch, QueryResult,
+    SearchQuery, TraverseQuery,
 };
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
@@ -41,6 +42,13 @@ pub trait GraphStore {
     fn apply_patch(&mut self, patch: GraphPatch) -> Result<()>;
     fn replace_snapshot(&mut self, patch: GraphPatch) -> Result<()>;
     fn search(&self, query: SearchQuery) -> Result<Vec<EntityMatch>>;
+    /// 子串搜索的命中分面:同 `search` 的召回口径,按 kind 分组计数(过滤前)。
+    /// 消费端(mcp search_entities)用它组装 total_count + kind facet,让调用方
+    /// 判断「值不值得翻页/要不要加 kind 过滤」——此前只有 has_more,宽词命中
+    /// 数千实体时无从决策(第五轮反馈 F4)。默认无实现(空 = 无分面能力)。
+    fn search_facets(&self, _query: &SearchQuery) -> Result<Vec<(String, usize)>> {
+        Ok(Vec::new())
+    }
     /// 精确名匹配(大小写敏感,走 entity_name 索引)。analyze 要 name == source_name,
     /// 不是子串——用这个替代 search 的 LIKE %text% 省内存。
     fn search_exact_name(&self, name: &str, limit: usize) -> Result<Vec<Entity>>;
@@ -88,6 +96,26 @@ pub trait GraphStore {
     }
     /// 聚类汇总:读取全部簇标注(按 size 降序)。旧库无表/未重扫时返回空。
     fn get_cluster_info(&self) -> Result<Vec<ClusterInfo>> {
+        Ok(Vec::new())
+    }
+    /// 索引健康度元数据(第五轮反馈 F5):scan 收尾把摘要落库(finished_at/duration/
+    /// files/entities/edges/embedded…),get_index_status/doctor 读出——此前只有裸
+    /// entity/edge 计数,「该不该重建」「这次重建质量如何」无从判断。默认 no-op。
+    fn set_scan_meta(&mut self, _meta: &[(String, String)]) -> Result<()> {
+        Ok(())
+    }
+    /// 读取全部 scan 元数据;未 scan 的库返回空 map。
+    fn get_scan_meta(&self) -> Result<HashMap<String, String>> {
+        Ok(HashMap::new())
+    }
+    /// 索引健康度三计数:(实体数, 有向量的实体数, entity_fts 行数)。embedding 覆盖
+    /// 与 fts 同步是「重建质量」的两个最常见盲区(向量中断残留、fts 漂移)。
+    fn health_counts(&self) -> Result<(usize, usize, usize)> {
+        Ok((0, 0, 0))
+    }
+    /// 边健康度分布:kind × resolved × evidence classification → 计数。doctor 用来
+    /// 一眼判断索引健康(如「calls 全部低分类」= resolve 层未跑全)。
+    fn edge_health(&self) -> Result<Vec<(String, i64, String, usize)>> {
         Ok(Vec::new())
     }
 }
@@ -390,7 +418,10 @@ impl SqliteGraphStore {
     }
 
     fn initialize(&mut self) -> Result<()> {
-        self.connection.execute_batch(
+        // {resolved_below_threshold}:v_edge.tentative 计算列的 Resolved 置信阈值,
+        // 与 mcp edge_view 共用 model 层常量(单源,防两套口径漂移)。
+        let resolved_below_threshold = EvidenceClass::RESOLVED_TENTATIVE_BELOW;
+        self.connection.execute_batch(&format!(
             "
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
@@ -442,15 +473,32 @@ impl SqliteGraphStore {
                 top_nodes TEXT NOT NULL DEFAULT '[]',
                 size INTEGER NOT NULL DEFAULT 0
             );
+            -- scan 收尾摘要(第五轮反馈 F5):get_index_status/doctor 的健康度数据源。
+            CREATE TABLE IF NOT EXISTS scan_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             -- API 同名字段兼容视图(大仓反馈 P1-2:trace/query 回包是 source/target/
             -- confidence/tentative,裸 SQL 直连却是 source_id/target_id/json,两套词汇
-            -- 表只能靠踩坑习得)。v_edge 直接暴露 API 字段名;旧库 execute 时一并建。
-            CREATE VIEW IF NOT EXISTS v_edge AS
+            -- 表只能靠踩坑习得)。v_edge 直接暴露 API 字段名。
+            -- v2(第五轮反馈 F1):tentative 不再提取 `$.tentative`(edge JSON 无顶层
+            -- 字段,恒 NULL 的死列曾让直查者误读「injects 100% tentative」)——改按
+            -- evidence[0].classification 复算,与 mcp edge_view 同一判定;阈值常量
+            -- 由 Rust 侧 format 注入(model 单源)。视图无数据,每次 DROP+CREATE
+            -- 保证旧库也拿到最新定义(IF NOT EXISTS 救不了定义变更)。
+            DROP VIEW IF EXISTS v_edge;
+            CREATE VIEW v_edge AS
             SELECT e.source_id, e.target_id, e.kind, e.resolved,
                    e.start_line, e.end_line,
                    s.qualified_name AS source, t.qualified_name AS target,
                    json_extract(e.json, '$.evidence[0].confidence') AS confidence,
-                   json_extract(e.json, '$.tentative') AS tentative
+                   json_extract(e.json, '$.evidence[0].classification') AS evidence_class,
+                   CASE
+                     WHEN json_extract(e.json, '$.evidence[0].classification') = 'fact' THEN 0
+                     WHEN json_extract(e.json, '$.evidence[0].classification') = 'resolved'
+                          AND json_extract(e.json, '$.evidence[0].confidence') >= {resolved_below_threshold} THEN 0
+                     ELSE 1
+                   END AS tentative
             FROM edge e
             JOIN entity s ON s.id = e.source_id
             JOIN entity t ON t.id = e.target_id;
@@ -460,7 +508,7 @@ impl SqliteGraphStore {
                    json_extract(json, '$.metadata') AS metadata
             FROM entity;
             ",
-        )?;
+        ))?;
         // 旧库迁移:为已存在的 edge 表补 `resolved` 列(新库已在 CREATE 中带)。
         self.ensure_edge_resolved_column()?;
         // 旧库迁移:为 entity/edge 表补 `start_line`/`end_line` 顶层冗余列
@@ -820,6 +868,74 @@ impl SqliteGraphStore {
         }
         Ok(())
     }
+
+    /// search/search_facets 共享:拆词 + FTS/LIKE 谓词构造(fts 决策 + 转义规则)。
+    /// 返回 (where_clause, 绑定参数 terms)。
+    fn search_predicates(&self, query: &SearchQuery) -> (String, Vec<String>) {
+        // 拆词 OR:多词查询(如 "user login")任一词命中即召回,与历史行为一致。
+        let raw_words: Vec<String> = {
+            let split: Vec<&str> = query.text.split_whitespace().collect();
+            if split.len() <= 1 {
+                vec![query.text.clone()]
+            } else {
+                split.into_iter().map(String::from).collect()
+            }
+        };
+        // 决策:fts_enabled 且所有词 ≥3 字符 → trigram MATCH(索引化,告别 leading-wildcard
+        // 全表扫描);否则 LIKE 兜底。trigram 对 <3 字符查询无法产生 3-gram,实测召回失败
+        // (如查 "eq" 找不到 eqUser),故含 <3 字符词时必须回退 LIKE。
+        let use_fts = self.fts_enabled
+            && self.fts_populated
+            && raw_words.iter().all(|w| w.chars().count() >= 3);
+        let (clauses, terms): (Vec<String>, Vec<String>) = if use_fts {
+            let clauses = raw_words
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    let idx = i + 1;
+                    format!(
+                        "e.id IN (SELECT entity_id FROM entity_fts WHERE entity_fts MATCH ?{idx})"
+                    )
+                })
+                .collect();
+            // 短语包裹('"word"')避免 FTS5 特殊字符(* : " 等)被当操作符解析;
+            // trigram 短语仍做 3-gram 子串匹配,召回与子串 LIKE 等价。
+            // 词内 " 需转义为 ""(FTS5 短语内字面引号),否则 `foo"bar` 产出
+            // `"foo"bar"` 是未闭合引号 → MATCH 报错,整个搜索失败。
+            let terms = raw_words
+                .iter()
+                .map(|w| format!("\"{}\"", w.replace('"', "\"\"")))
+                .collect();
+            (clauses, terms)
+        } else {
+            // LIKE 通配符 % _ 未转义会让查询过宽(如查 "100%" 匹配含 "100" 的任何串)。
+            // ESCAPE '\' 后 \\% / \\_ 当字面量。
+            let terms: Vec<String> = raw_words
+                .iter()
+                .map(|w| {
+                    format!(
+                        "%{}%",
+                        w.replace('\\', "\\\\")
+                            .replace('%', "\\%")
+                            .replace('_', "\\_")
+                    )
+                })
+                .collect();
+            let clauses = terms
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    let idx = i + 1;
+                    format!(
+                        "(lower(e.name) LIKE lower(?{idx}) ESCAPE '\\' OR lower(e.qualified_name) LIKE lower(?{idx}) ESCAPE '\\')"
+                    )
+                })
+                .collect();
+            (clauses, terms)
+        };
+        let where_clause = clauses.join(" OR ");
+        (where_clause, terms)
+    }
 }
 
 impl GraphStore for SqliteGraphStore {
@@ -1082,6 +1198,69 @@ impl GraphStore for SqliteGraphStore {
             .map_err(Into::into)
     }
 
+    fn set_scan_meta(&mut self, meta: &[(String, String)]) -> Result<()> {
+        // UPSERT:重复 scan 幂等覆盖同键。
+        let transaction = self.connection.transaction()?;
+        let mut stmt = transaction.prepare(
+            "INSERT INTO scan_meta(key, value) VALUES (?1, ?2)
+                      ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        )?;
+        for (key, value) in meta {
+            stmt.execute(params![key, value])?;
+        }
+        drop(stmt);
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn get_scan_meta(&self) -> Result<HashMap<String, String>> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT key, value FROM scan_meta")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<HashMap<_, _>>>()
+            .map_err(Into::into)
+    }
+
+    fn health_counts(&self) -> Result<(usize, usize, usize)> {
+        // 有向量实体按 entity JOIN 计数而非 entity_embedding 行数:孤儿向量(实体已删,
+        // P1-C′ 断点续扫的有意保留)不算覆盖。fts 行数同理对照 entity 行数。
+        self.connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM entity),
+                    (SELECT COUNT(*) FROM entity_embedding ee JOIN entity e ON e.id = ee.entity_id),
+                    (SELECT COUNT(*) FROM entity_fts)",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as usize,
+                        row.get::<_, i64>(1)? as usize,
+                        row.get::<_, i64>(2)? as usize,
+                    ))
+                },
+            )
+            .map_err(Into::into)
+    }
+
+    fn edge_health(&self) -> Result<Vec<(String, i64, String, usize)>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT kind, resolved, COALESCE(json_extract(json, '$.evidence[0].classification'), 'none'), COUNT(*)
+             FROM edge GROUP BY kind, resolved, 3 ORDER BY kind, resolved",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, usize>(3)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     fn apply_patch(&mut self, patch: GraphPatch) -> Result<()> {
         let transaction = self.connection.transaction()?;
         Self::write_patch(&transaction, patch, false, self.fts_enabled)?;
@@ -1100,78 +1279,23 @@ impl GraphStore for SqliteGraphStore {
     }
 
     fn search(&self, query: SearchQuery) -> Result<Vec<EntityMatch>> {
-        // 拆词 OR:多词查询(如 "user login")任一词命中即召回,与历史行为一致。
-        let raw_words: Vec<String> = {
-            let split: Vec<&str> = query.text.split_whitespace().collect();
-            if split.len() <= 1 {
-                vec![query.text.clone()]
-            } else {
-                split.into_iter().map(String::from).collect()
-            }
-        };
-        // 决策:fts_enabled 且所有词 ≥3 字符 → trigram MATCH(索引化,告别 leading-wildcard
-        // 全表扫描);否则 LIKE 兜底。trigram 对 <3 字符查询无法产生 3-gram,实测召回失败
-        // (如查 "eq" 找不到 eqUser),故含 <3 字符词时必须回退 LIKE。
-        let use_fts = self.fts_enabled
-            && self.fts_populated
-            && raw_words.iter().all(|w| w.chars().count() >= 3);
-        let (clauses, terms): (Vec<String>, Vec<String>) = if use_fts {
-            let clauses = raw_words
-                .iter()
-                .enumerate()
-                .map(|(i, _)| {
-                    let idx = i + 1;
-                    format!(
-                        "e.id IN (SELECT entity_id FROM entity_fts WHERE entity_fts MATCH ?{idx})"
-                    )
-                })
-                .collect();
-            // 短语包裹('"word"')避免 FTS5 特殊字符(* : " 等)被当操作符解析;
-            // trigram 短语仍做 3-gram 子串匹配,召回与子串 LIKE 等价。
-            // 词内 " 需转义为 ""(FTS5 短语内字面引号),否则 `foo"bar` 产出
-            // `"foo"bar"` 是未闭合引号 → MATCH 报错,整个搜索失败。
-            let terms = raw_words
-                .iter()
-                .map(|w| format!("\"{}\"", w.replace('"', "\"\"")))
-                .collect();
-            (clauses, terms)
-        } else {
-            // LIKE 通配符 % _ 未转义会让查询过宽(如查 "100%" 匹配含 "100" 的任何串)。
-            // ESCAPE '\' 后 \\% / \\_ 当字面量。
-            let terms: Vec<String> = raw_words
-                .iter()
-                .map(|w| {
-                    format!(
-                        "%{}%",
-                        w.replace('\\', "\\\\")
-                            .replace('%', "\\%")
-                            .replace('_', "\\_")
-                    )
-                })
-                .collect();
-            let clauses = terms
-                .iter()
-                .enumerate()
-                .map(|(i, _)| {
-                    let idx = i + 1;
-                    format!(
-                        "(lower(e.name) LIKE lower(?{idx}) ESCAPE '\\' OR lower(e.qualified_name) LIKE lower(?{idx}) ESCAPE '\\')"
-                    )
-                })
-                .collect();
-            (clauses, terms)
-        };
-        let where_clause = clauses.join(" OR ");
+        let (where_clause, terms) = self.search_predicates(&query);
         let name_idx = terms.len() + 1;
         let limit_idx = terms.len() + 2;
         let offset_idx = terms.len() + 3;
+        // kind 权重第一关键字、精确同名第二(第五轮反馈 F4):此前精确同名优先 + CASE
+        // 只列 6 个 Java kind,搜 "LoanTerm" 时一堆同名 field 霸占页首,前端仓
+        // (function/vue_page…)全落 ELSE 档退化为字母序。权重表来自 model 的
+        // search_rank(全 kind 覆盖),数据成员族默认沉底——精确找字段用 kind 过滤。
+        let kind_case = EntityKind::SEARCH_RANK_SQL
+            .iter()
+            .map(|(kind, rank)| format!("WHEN '{kind}' THEN {rank}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let sql = format!(
             "SELECT e.json FROM entity e WHERE {where_clause} \
-             ORDER BY CASE WHEN lower(e.name) = lower(?{name_idx}) THEN 0 ELSE 1 END, \
-             CASE e.kind \
-               WHEN 'file' THEN 0 WHEN 'class' THEN 1 WHEN 'interface' THEN 2 \
-               WHEN 'method' THEN 3 WHEN 'spring_bean' THEN 4 WHEN 'http_endpoint' THEN 5 \
-               ELSE 9 END, \
+             ORDER BY CASE e.kind {kind_case} ELSE 99 END, \
+             CASE WHEN lower(e.name) = lower(?{name_idx}) THEN 0 ELSE 1 END, \
              e.name \
              LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
         );
@@ -1188,6 +1312,22 @@ impl GraphStore for SqliteGraphStore {
         let rows = statement.query_map(params_vec.as_slice(), Self::row_entity)?;
         rows.map(|result| result.map(|entity| EntityMatch { entity, score: 1.0 }))
             .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    fn search_facets(&self, query: &SearchQuery) -> Result<Vec<(String, usize)>> {
+        // 与 search 完全同口径的召回(共享谓词),仅把 SELECT json…LIMIT 换成按 kind
+        // 分组计数——返回的是「过滤前」分面:kind/复杂度过滤是调用方的展示决策,
+        // 分面回答的是「这个子串一共命中了什么」,帮调用方决定翻页还是收窄。
+        let (where_clause, terms) = self.search_predicates(query);
+        let sql = format!(
+            "SELECT e.kind, COUNT(*) FROM entity e WHERE {where_clause} GROUP BY e.kind ORDER BY 2 DESC"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(terms.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
@@ -1353,6 +1493,88 @@ mod tests {
     }
 
     #[test]
+    fn v_edge_tentative_is_computed_not_null() {
+        // 第五轮反馈 F1:v_edge.tentative 曾提取不存在的 `$.tentative` 恒 NULL,直查者
+        // 把 NULL 当「全部 tentative」误读(injects 明明是 fact)。v0.1.53 起按
+        // classification 复算,与 mcp edge_view 同一判定(阈值常量同源)。
+        let mut store = SqliteGraphStore::open_in_memory().unwrap();
+        let mk = |name: &str| {
+            Entity::new(id(name), EntityKind::Method, name, format!("a/{name}")).with_evidence(
+                "a.java",
+                1,
+                1,
+                EvidenceClass::Fact,
+                1.0,
+                "m",
+            )
+        };
+        let entities = vec![mk("m1"), mk("m2"), mk("m3"), mk("m4")];
+        let edge = |target: &str, class: EvidenceClass, confidence: f32| {
+            Edge::new(id("m1"), id(target), EdgeKind::Calls)
+                .with_evidence("a.java", 1, 1, class, confidence, "t")
+        };
+        let edges = vec![
+            edge("m2", EvidenceClass::Fact, 1.0),
+            edge("m3", EvidenceClass::Resolved, 0.7), // calls 精确解析档 → 不 tentative
+            edge("m4", EvidenceClass::Inferred, 0.5), // 裸名档 → tentative
+        ];
+        store.apply_patch(GraphPatch::add(entities, edges)).unwrap();
+        let qr = store
+            .read_only_query(
+                "SELECT target, evidence_class, tentative FROM v_edge WHERE kind='calls' ORDER BY target",
+                10,
+            )
+            .unwrap();
+        let col = |name: &str| qr.columns.iter().position(|c| c == name).unwrap();
+        let row = |i: usize| {
+            (
+                qr.rows[i][col("target")].as_str().unwrap().to_string(),
+                qr.rows[i][col("evidence_class")]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                qr.rows[i][col("tentative")].as_i64().unwrap(),
+            )
+        };
+        assert_eq!(row(0), ("a/m2".into(), "fact".into(), 0));
+        assert_eq!(row(1), ("a/m3".into(), "resolved".into(), 0));
+        assert_eq!(row(2), ("a/m4".into(), "inferred".into(), 1));
+    }
+
+    #[test]
+    fn search_ranks_structure_kinds_above_fields_and_facets_count_hits() {
+        // 第五轮反馈 F4:kind 权重第一关键字——精确同名 field 不再霸占页首,前端
+        // kind(function)有明确权重不再落 ELSE 档;facet 给 total + per-kind 计数。
+        let mut store = SqliteGraphStore::open_in_memory().unwrap();
+        let field = Entity::new(
+            id("f"),
+            EntityKind::Field,
+            "LoanTerm",
+            "a/Dto.java#LoanTerm",
+        )
+        .with_evidence("a/Dto.java", 1, 1, EvidenceClass::Fact, 1.0, "f");
+        let class = Entity::new(id("c"), EntityKind::Class, "LoanTermConfig", "b/Cfg.java")
+            .with_evidence("b/Cfg.java", 1, 1, EvidenceClass::Fact, 1.0, "c");
+        let func = Entity::new(id("fn"), EntityKind::Function, "useLoanTerm", "c/u.ts")
+            .with_evidence("c/u.ts", 1, 1, EvidenceClass::Fact, 1.0, "fn");
+        store
+            .apply_patch(GraphPatch::add(vec![field, class, func], Vec::new()))
+            .unwrap();
+        let hits = store
+            .search(SearchQuery::new("LoanTerm").with_limit(10))
+            .unwrap();
+        let kinds: Vec<&str> = hits.iter().map(|m| m.entity.kind.as_str()).collect();
+        // class(1) < function(4) < field(12):结构实体在前,精确同名 field 沉底
+        assert_eq!(kinds, vec!["class", "function", "field"], "排序: {kinds:?}");
+        // facet:过滤前口径的 per-kind 计数,总和 = 命中总数
+        let facets = store.search_facets(&SearchQuery::new("LoanTerm")).unwrap();
+        let total: usize = facets.iter().map(|(_, n)| n).sum();
+        assert_eq!(total, 3);
+        assert!(facets.contains(&("class".to_string(), 1)));
+        assert!(facets.contains(&("field".to_string(), 1)));
+    }
+
+    #[test]
     fn file_state_roundtrips_and_replaces() {
         let mut store = SqliteGraphStore::open_in_memory().unwrap();
         assert!(store.get_file_state().unwrap().is_empty());
@@ -1374,6 +1596,81 @@ mod tests {
         assert_eq!(state.len(), 1);
         assert!(!state.contains_key("a.java"));
         assert_eq!(state.get("c.java").unwrap(), "h3");
+    }
+
+    #[test]
+    fn scan_meta_roundtrips_and_health_counts_track_coverage() {
+        // 第五轮反馈 F5:scan 摘要落库 + 健康度三计数。空库 meta 为空;写入后 UPSERT
+        // 幂等;embedding 覆盖按 entity JOIN 计数(孤儿向量不算),fts 行数对照实体数。
+        let mut store = SqliteGraphStore::open_in_memory().unwrap();
+        assert!(store.get_scan_meta().unwrap().is_empty());
+        store
+            .set_scan_meta(&[
+                ("finished_at".to_string(), "1770000000".to_string()),
+                ("files_indexed".to_string(), "790".to_string()),
+            ])
+            .unwrap();
+        // 同键覆盖
+        store
+            .set_scan_meta(&[("files_indexed".to_string(), "791".to_string())])
+            .unwrap();
+        let meta = store.get_scan_meta().unwrap();
+        assert_eq!(meta.get("files_indexed").unwrap(), "791");
+        assert_eq!(meta.len(), 2);
+
+        // 健康计数:2 实体、1 向量(悬空向量指向不存在实体,不计)、fts 应与实体同步
+        let a = Entity::new(id("a"), EntityKind::Class, "A", "a/A").with_evidence(
+            "a.java",
+            1,
+            1,
+            EvidenceClass::Fact,
+            1.0,
+            "c",
+        );
+        let b = Entity::new(id("b"), EntityKind::Class, "B", "a/B").with_evidence(
+            "a.java",
+            1,
+            1,
+            EvidenceClass::Fact,
+            1.0,
+            "c",
+        );
+        store
+            .apply_patch(GraphPatch::add(vec![a, b], Vec::new()))
+            .unwrap();
+        store
+            .set_embeddings(&[
+                (id("a"), vec![0.1, 0.2], "model:h1".to_string()),
+                (id("ghost"), vec![0.3, 0.4], "model:h2".to_string()),
+            ])
+            .unwrap();
+        let (entities, embedded, fts_rows) = store.health_counts().unwrap();
+        assert_eq!(entities, 2);
+        assert_eq!(embedded, 1, "孤儿向量不计覆盖");
+        assert_eq!(fts_rows, entities, "apply_patch 后 fts 与实体同步");
+
+        // 边健康分布:kind × resolved × classification
+        let call = Edge::new(id("a"), id("b"), EdgeKind::Calls).with_evidence(
+            "a.java",
+            2,
+            2,
+            EvidenceClass::Resolved,
+            0.7,
+            "t",
+        );
+        store
+            .apply_patch(GraphPatch::add(Vec::new(), vec![call]))
+            .unwrap();
+        let health = store.edge_health().unwrap();
+        assert!(
+            health
+                .iter()
+                .any(|(kind, resolved, class, count)| kind == "calls"
+                    && *resolved == 0
+                    && class == "resolved"
+                    && *count == 1),
+            "edge_health: {health:?}"
+        );
     }
 
     #[test]
