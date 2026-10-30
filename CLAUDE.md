@@ -73,7 +73,21 @@ sqlite3 "$DB" "SELECT json_extract(json,'\$.evidence[0].confidence'), COUNT(*) F
 ## 构建 / 测试
 
 - `cargo test` —— 全 workspace 单元/集成测试(**不替代**上面的真实项目验证)。
-- 版本号:根 `Cargo.toml` `[workspace.package] version`(当前 0.1.50),所有 crate `version.workspace = true`。
+- 版本号:根 `Cargo.toml` `[workspace.package] version`(当前 0.1.53),所有 crate `version.workspace = true`。
+
+### 大仓反馈五轮:对照测试修复——展示层可信度 + 回包经济 + 健康度(v0.1.53,2026-10-30)
+
+用户侧 A/B 对照测试(原生工具 vs +RI,B 组 122 调用仅 3% 用索引)+ 5 发探针的反馈复核:七项中 **F1/F2 成立、F3/F4 成立、F5 大概率可解释(submodule 未 checkout 的 3,981 文件消失,~21.6 实体/文件与 8.6万 缺口吻合)、F6/F7 低成本已做**;F1 的「resolved 率回归」为误诊。核心判读:B 组低采纳不是「工具没用」,是三个质量问题(tentative 全红/semantic 无区分度/回包低密度)让代理「调了不敢用」。
+
+- **calls 分类按档(F1,真 bug)**:同文件 calls、跨文件 calls 0.7 档、接口分发桥接、implements_method 0.8 此前全 `EvidenceClass::Inferred` → edge_view 恒 tentative:true——最可信的边与裸名(0.5)不可区分。现 0.7/0.8 = Resolved、0.5 = Inferred;**阈值 0.8→0.6 且常量单源**(`EvidenceClass::RESOLVED_TENTATIVE_BELOW`,mcp edge_view 与 v_edge 视图 SQL 共用,勿只改一边)。confidence 数值口径不变。ruoyi 终态:calls 3021 中 2993 tentative=false + 28 裸名 true。
+- **v_edge tentative 曾是死列**(F1 误诊源头):提取不存在的 `$.tentative` 恒 NULL,直查者读出「injects 100% tentative」(实际 fact@1.0)。现按 classification 复算 + `evidence_class` 原文列;视图每次开库 DROP+CREATE(IF NOT EXISTS 救不了定义变更)。**`resolved` 列是增量簿记**(0=提取层事实边,1=analysis 跨文件边每轮全删全重算),不是验证等级——语义辨析写在 docs/sql-views.md。
+- **INDEX_FORMAT 6→7**:同文件 calls 是提取层边,分类修正需强制全量重提;配合向量保留 ruoyi 重提 1.6s/embedded_count=0。
+- **search 排序(F4)**:kind 权重第一关键字、全 33 kind 覆盖(`EntityKind::search_rank` + `SEARCH_RANK_SQL` 投影表,测试锁两表一致+长度 33——新增 variant 忘同步会落 ELSE 99 档)。field/column/frontend_field 与 **file** 默认沉底(file 降权:搜 'user' 时 43 个文件霸榜同样有害);精确找字段/文件用 kind 过滤。宽词回包新增 `total_count` + `kind_facets`(过滤前口径,`search_facets` trait 方法与 search 共享谓词构造)。
+- **trace inbound 默认去 declares(F3)**:callers 语义里声明类不是调用者(实测 22 边 11 条噪声);outbound 保留(类下钻依赖)。类起点展开是名字解析语义与 edge_kinds 正交,已有测试锁定。nodes 条目去 file(qn 已含路径)。
+- **健康度(F5)**:`scan_meta` 表落 scan 摘要(finished_at/duration/index_format/files/embedded_count);`get_index_status` 增 health 段(embedding 覆盖率按 entity JOIN 计数、孤儿向量不算;fts 同步);CLI `doctor` 从三布尔升级为 edge_health(kind×resolved×classification)+ 覆盖率 + fts 同步。
+- **F2 排下版**:semantic_search 区分度失效在 ruoyi 复现(英文 query top 全噪声 0.45-0.47),根因 = embedding 文本 `"{kind} {qn} {name} {@anns} {doc}"` camelCase 不分词;中文通道没坏(「用户登录认证」0.61,靠 doc)。修法 = 标识符分词(camelCase/snake_case → 空格词)→ text_hash 变化全量重嵌(mes 44万 ≈1.5-2h,断点续扫在)——用户已裁决直接做+发版说明写清。
+- 工具描述场景锚(F6)与 git 历史边界声明(F7,README)已做;token 预算守卫仍绿。
+- 回归基线:ruoyi 7128/15321/calls 3021(implements_method 415/implements 68/superclass_of 75/mapped_from 1460/fts=entity)**零漂移**;plus-ui 3876/56/0/490 + embedded_count=0;三闸全绿。
 
 ### mes-activity 反馈六项修复(v0.1.43,2026-09-22)
 
