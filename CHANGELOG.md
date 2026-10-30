@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.1.56] - 2026-10-30
+
 ### Changed(MCP 接口检视)
 
 - **移除 `analyze_requirement` 工具(接口变更)**:实现与 `search_entities` 完全
