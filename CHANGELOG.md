@@ -44,6 +44,27 @@
   (source/target/confidence/tentative/evidence_class),0.1.53 修活 tentative 列;
   直查 `edge` 底表才是 API 字段——见 docs/sql-views.md。
 
+### Fixed(发版前 code review 补强)
+
+- **(致命)多库模式在真实二进制不可达**:`--database` 的 default_value 让 mcp
+  分支永远拿到 `Some`,单库 fail-loud 会拦掉**所有**真实部署的 repository 参数
+  (CI 全绿是因为测试直接用 None 调 serve)。CLI Option 化:**显式**传
+  `--database` = 单库绑定(查询类工具 repository fail-loud),省略 = 多库模式
+  (repository 路由照旧);其余子命令折算默认路径,行为与历史一致。
+- **repository 的工具语义分化**:`scan_workspace`/`verify_edge` 的 repository 是
+  workspace/源码根参数(非 DB 路由)——scan 豁免 fail-loud(显式登记独立库是
+  合法操作),verify_edge 单库绑定回主库;此前 fail-loud 的「Drop the repository」
+  建议会诱导扫描器扫到 cwd,比原 bug 更糟。
+- 多库模式 `list_repositories` 不再被 resolve 误拦「no database configured」
+  (list 不查库只列库——恰好是发现 repository 合法值的入口);per-repo 条目的
+  「不可达」标注仅在单库绑定时出现。
+- fail-loud/list 的库计数改 `peek_counts` 只读窥探(`open` 会创建缺失文件 +
+  跑迁移,大库还有 FTS reconcile 的 22s 级副作用)。
+- 桥接 reason 前缀常量化(`DISPATCH_BRIDGE_REASON_PREFIX`,model 单源——跨
+  crate 字符串协议不再靠文案巧合);get_index_status 的 outputSchema 补 `health`
+  声明;`ambiguous_skipped_note` 门控数值在场;`--base` help 与 repository 参数
+  description 与新行为对齐(token 预算守卫仍绿)。
+
 ## [0.1.54] - 2026-10-30
 
 0.1.53 code review 补强版。无格式变更、无重提/重嵌成本(存量 0.1.53 库直接升级)。
