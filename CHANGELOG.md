@@ -7,6 +7,43 @@
 
 ## [Unreleased]
 
+## [0.1.55] - 2026-10-30
+
+第六轮反馈(0.1.54 实测验证)修复版。无格式变更、无重提/重嵌成本。
+
+### Fixed
+
+- **P1-1 单库部署下 `repository` 参数静默路由到独立库**:该参数是多库模式的
+  per-repo 库路由,serve 绑定 `--database` 时它会把查询切到 `base/repos` 下的
+  旧库/空库(如 mes 子目录早期单独 scan 的 0.1.48 前旧格式库),返回 0 且读作
+  「实体不存在」。现在单库绑定下**任何** repository 值一律 fail-loud:报主库
+  路径与实体规模,引导「去掉 repository;主库内按仓过滤用 qn 路径前缀
+  (mes/、mos/)」。多库模式(无 --database)行为不变。
+- **P2-5/P2-4 list_repositories 主库缺席 + 无 name**:主库(default)此前仅在
+  manifest 为空时列出——单库部署 + 历史残留 manifest 并存时 14 万实体「无归属」。
+  现在主库总是列第一(repo_id/name=default + 主库计数),manifest 条目带 `name`
+  (路径尾段短名)与「per-repo 库,单库服务器不可达」note。
+
+### Added
+
+- **P2-6 trace 桥接边可见性**:impl 方法反向 trace 第一跳到达接口同名方法是
+  接口分发桥接(iface method → impl method)的拓扑,不是起点被归并——compact
+  档此前只见 kind=calls 无从分辨。现回包顶层在有桥接边时上浮 `note` 说明
+  (verbose=true 可看逐边 reason)。
+- **P2-3 ambiguous_skipped 语义说明**:get_index_status health 补
+  `ambiguous_skipped_note`——它是跨文件解析的**尝试次数**(A+ 同名防护拒绝的
+  裸名解析;候选清单在实体 metadata.ambiguous_resolution),同一实体可多次
+  计入,与实体数不可比(此前被按「21% 实体被跳过」误读)。
+- **P1-2(部分)semantic_search 边界声明**:description 补「相近领域词
+  (loan TERM vs DAY)可能混淆——用 search_entities 交叉验证锚点」。hybrid
+  检索(语义+子串混合分数)排后续版本。
+
+### 澄清(未改)
+
+- P2-7「SQL 列名与 API 不一致」:0.1.47 起已有 `v_edge`/`v_entity` 兼容视图
+  (source/target/confidence/tentative/evidence_class),0.1.53 修活 tentative 列;
+  直查 `edge` 底表才是 API 字段——见 docs/sql-views.md。
+
 ## [0.1.54] - 2026-10-30
 
 0.1.53 code review 补强版。无格式变更、无重提/重嵌成本(存量 0.1.53 库直接升级)。

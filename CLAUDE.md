@@ -89,6 +89,17 @@ sqlite3 "$DB" "SELECT json_extract(json,'\$.evidence[0].confidence'), COUNT(*) F
 - 工具描述场景锚(F6)与 git 历史边界声明(F7,README)已做;token 预算守卫仍绿。
 - 回归基线:ruoyi 7128/15321/calls 3021(implements_method 415/implements 68/superclass_of 75/mapped_from 1460/fts=entity)**零漂移**;plus-ui 3876/56/0/490。**embedded_count 验收口径(v8 后)**:升 v8 首扫 = 全量重嵌(ruoyi 7128/plus-ui 3876);此后稳态增量 scan = embedded_count=0(files_unchanged=全量且 reconcile 零触发)——若首扫 embedded_count=0 说明重嵌静默失效,是回归信号(F2 症状,勿当正常基线)。
 
+### 大仓反馈六轮:0.1.54 实测验证修复(v0.1.55,2026-10-30)
+
+mes-activity 升 0.1.54 后的验证反馈(44.05万实体/29min 重建/coverage=1,四条正面确认 = 前两轮修复的实战验收)。七项:P1-1 成立、P1-2 半成立、P2-3/4/5/6 成立已修、P2-7 误诊(v_edge 早已在,直查了底表)。
+
+- **P1-1 repository 参数部署语义错位(根因)**:该参数是多库模式的 per-repo 库路由(`base/repos/{hash}.sqlite`),serve 绑定 `--database` 的单库部署下会静默切到独立库(实测:mes 子目录早期 scan 的 0.1.48 前旧格式库,qn 未路径化 → 精确匹配失败 → 「实体不存在」)。**单库绑定现在任何 repository 值一律 fail-loud**(报主库规模 + 引导 qn 前缀 mes/、mos/);多库模式不变。**教训:repository 参数只在无 --database 的 serve 下有意义——文档与 fail-loud 都要讲清两种部署形态**。
+- **P2-5/P2-4**:list_repositories 主库(default)此前仅 manifest 为空才列——**现在总是排第一**(单库+残留 manifest 并存时 14 万实体「无归属」即此);条目带 `name`(尾段短名)。
+- **P2-6 桥接可见性**:impl 方法 trace_callers 第一跳到接口方法是分发桥接拓扑(不是归并);回包有桥接边时顶层 `note` 说明,判定 = evidence reason 前缀 `"interface dispatch"`(analysis 桥接段的约定,改 reason 前缀要同步)。
+- **P2-3**:ambiguous_skipped 是**解析尝试次数**非实体数(被误读「21% 实体被跳过」);health 补 `ambiguous_skipped_note`。
+- **P1-2 中文概念混淆(半成立)**:query 混合概念(「最低最高」恰是 checkLoanDays 的 MIN/MAX 语义,模型对了一半)+ mes 无 javadoc 无中文锚;description 已声明边界,**hybrid 检索(语义+子串混合分)排后续**。
+- 回归:ruoyi/plus-ui 基线零漂移;新增三测试(单库 fail-loud / 主库排第一 / 桥接 note);三闸全绿。
+
 ### mes-activity 反馈六项修复(v0.1.43,2026-09-22)
 
 40 万实体 git submodule 双 SDK 拷贝仓库实测反馈的六项修复,验收基线:

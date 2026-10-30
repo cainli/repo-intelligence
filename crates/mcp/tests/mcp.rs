@@ -682,6 +682,129 @@ fn call_tool(
     response["result"]["structuredContent"].clone()
 }
 
+/// 第六轮反馈 P1-1:单库部署(serve 带 --database)下,repository 参数会静默路由到
+/// base/repos 的独立库(旧格式/空)——查询返回 0 且 hint 误读为「实体不存在」。
+/// 现在 fail-loud:报双库对比,引导去掉 repository / 用 qn 路径前缀。
+#[test]
+fn repository_parameter_fails_loud_on_single_database_server() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    index_call_chain(&database);
+
+    // serve 把错误写进 JSON-RPC error(不 panic),读回包 error 字段贴近线上形态。
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 99,
+        "method": "tools/call",
+        "params": {"name": "search_entities",
+                   "arguments": {"query": "S27", "repository": "mes"}}
+    });
+    let mut output = Vec::new();
+    let line = format!("{request}\n");
+    repo_intelligence_mcp::serve(
+        std::io::Cursor::new(line.as_bytes()),
+        &mut output,
+        Some(&database),
+        directory.path(),
+    )
+    .unwrap();
+    let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
+    // MCP tool 错误形态:result.isError + content[0].text(非 JSON-RPC error)。
+    assert_eq!(response["result"]["isError"], true, "response: {response}");
+    let message = response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        message.contains("single main database"),
+        "fail-loud 报错应说明单库绑定: {message}"
+    );
+    assert!(
+        message.contains("Drop the `repository` parameter"),
+        "{message}"
+    );
+}
+
+/// 第六轮反馈 P2-4/P2-5:主库总是列出且排第一(name=default),manifest 条目带
+/// name(路径尾段)——此前单库 + 历史残留 manifest 并存时主库缺席,14 万实体「无归属」。
+#[test]
+fn list_repositories_shows_main_database_first_with_names() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    index_call_chain(&database);
+
+    let listed = call_tool(&database, "list_repositories", serde_json::json!({}));
+    let repos = listed["repositories"].as_array().unwrap();
+    assert!(!repos.is_empty(), "主库必须列出: {listed}");
+    assert_eq!(repos[0]["repo_id"], "default");
+    assert_eq!(repos[0]["name"], "default");
+    assert!(
+        repos[0]["entity_count"].as_u64().unwrap_or(0) > 0,
+        "主库计数非零: {repos:?}"
+    );
+    for repo in repos.iter().skip(1) {
+        assert!(
+            repo["name"].is_string() && !repo["name"].as_str().unwrap().is_empty(),
+            "manifest 条目带 name: {repo}"
+        );
+    }
+}
+
+/// 第六轮反馈 P2-6:接口分发桥接边(iface method → impl method 的 calls,reason 以
+/// "interface dispatch" 开头)上浮 note——impl 方法反向 trace 第一跳到接口方法是
+/// 分发拓扑,不是起点被归并。
+#[test]
+fn trace_notes_interface_dispatch_bridges() {
+    use repo_intelligence_model::{
+        Edge, EdgeKind, Entity, EntityId, EntityKind, EvidenceClass, GraphPatch,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    let mut store = repo_intelligence_graph::SqliteGraphStore::open(&database).unwrap();
+    let iface_m = Entity::new(
+        EntityId::stable(
+            "workspace",
+            "a/IHandler.java",
+            EntityKind::Method,
+            "handle",
+            "",
+        ),
+        EntityKind::Method,
+        "handle",
+        "a/IHandler.java#handle",
+    )
+    .with_evidence("a/IHandler.java", 5, 5, EvidenceClass::Fact, 1.0, "m");
+    let impl_m = Entity::new(
+        EntityId::stable("workspace", "a/Impl.java", EntityKind::Method, "handle", ""),
+        EntityKind::Method,
+        "handle",
+        "a/Impl.java#handle",
+    )
+    .with_evidence("a/Impl.java", 8, 8, EvidenceClass::Fact, 1.0, "m");
+    let bridge = Edge::new(iface_m.id.clone(), impl_m.id.clone(), EdgeKind::Calls).with_evidence(
+        "a/IHandler.java",
+        5,
+        5,
+        EvidenceClass::Resolved,
+        0.7,
+        "interface dispatch to implementation",
+    );
+    store
+        .apply_patch(GraphPatch::add(vec![iface_m, impl_m], vec![bridge]))
+        .unwrap();
+    drop(store);
+
+    let traced = call_tool(
+        &database,
+        "trace_callers",
+        serde_json::json!({"name": "a/Impl.java#handle"}),
+    );
+    let note = traced["note"].as_str().unwrap_or_default();
+    assert!(
+        note.contains("interface-dispatch bridges"),
+        "桥接 note 应上浮: {traced}"
+    );
+}
+
 fn entity_names(structured: &serde_json::Value) -> Vec<String> {
     structured["items"]
         .as_array()
