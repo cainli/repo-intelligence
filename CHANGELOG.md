@@ -7,6 +7,67 @@
 
 ## [Unreleased]
 
+## [0.1.53] - 2026-10-30
+
+第五轮评测反馈(r1-1030 对照测试 + 补充探针)修复版:对照测试发现「B 组加载了
+索引工具但 3% 使用率」——根因不是工具没用,而是三个质量问题叠加让代理「调了也不敢
+采纳」。本轮修展示层可信度与回包经济;semantic_search 区分度(标识符分词重嵌)排
+下版。**INDEX_FORMAT 6→7**(同文件 calls 边分类修正,提取层变更),升级后首扫全量
+重提——配合向量保留,ruoyi 实测 790 文件重提 1.6s、embedded_count=0,大仓分钟级无感。
+
+### Fixed
+
+- **calls 边展示层恒 tentative(P0,反馈 F1)**:跨文件 calls(0.7 精确解析)、同文件
+  calls、接口分发桥接、implements_method 此前全部 `EvidenceClass::Inferred`——
+  `edge_view` 对 Inferred 恒置 tentative:true,最好的调用边与裸名匹配(0.5)展示
+  不可区分,代理宁可退回 grep。现按档分类:0.7(走完消歧阶梯)= Resolved、0.5
+  (裸名)= Inferred;Resolved 阈值 0.8→0.6(常量单源 `EvidenceClass::
+  RESOLVED_TENTATIVE_BELOW`,mcp edge_view 与 v_edge 视图共用)。confidence 数值
+  口径不变(0.7/0.5,历史基线可比)。ruoyi 实测:3021 条 calls 中 2993 条
+  tentative=false、28 条裸名保持 true。
+- **v_edge.tentative 死列(P0,F1 误诊的直接源头)**:视图提取不存在的 `$.tentative`
+  恒 NULL,直查者据此得出「injects 100% tentative」(实际 fact@1.0)。视图改为按
+  evidence classification 复算(与 edge_view 同判定)+ 新增 `evidence_class` 原文
+  列;每次开库 DROP+CREATE 保证旧库拿到新定义。docs/sql-views.md 补两列语义辨析
+  (`resolved` 是增量簿记 0=提取层事实边/1=analysis 跨文件边,不是验证等级)。
+- **search 排序失衡(P1,F4)**:精确同名档优先于 kind 权重(搜 `LoanTerm` 时同名
+  field 霸占页首)+ kind CASE 只列 6 个 Java kind(前端仓全落 ELSE 档退化字母序)。
+  现 kind 权重提为第一关键字、全 33 kind 覆盖(`EntityKind::search_rank` 单源,
+  SQL 投影表测试锁一致),数据成员族(field/column/frontend_field…)与 file 默认
+  沉底。ruoyi 实测搜 `user`:class 28→interface 7→method 15,文件/字段不再霸榜。
+- **trace_callers 回包 declares 噪声(P1,F3)**:inbound 默认 kinds 含 declares,把
+  「声明它的类」当一跳收进(实测 22 边中 11 条)。inbound 默认改为
+  calls/injects/superclass_of(outbound 保留 declares——类下钻链路依赖;要聚合回
+  声明类显式传 edge_kinds)。类起点展开(P2-E)是名字解析语义,不受影响。nodes
+  查找表条目去 file(qn 路径化后已含路径,每条省 ~40B)。ruoyi 实测
+  trace_callers(selectUserById):7 边全 calls、零 declares、全 resolved。
+- **过时 README**:「文件级增量更新尚未实现」删去(0.1.2x 已实现);补 git 历史
+  边界声明(F7:索引只覆盖当前工作区状态,历史考古用 `git log -S`)。
+
+### Added
+
+- **search 命中分面(F4)**:search_entities/find_endpoint/analyze_requirement 回包
+  新增 `total_count` + `kind_facets`(过滤前口径,一条 GROUP BY)——宽词命中数千
+  实体时调用方可判断「翻页还是收窄 kind」。
+- **索引健康度(F5)**:scan 收尾摘要落库(新表 scan_meta:finished_at/duration/
+  index_format/files/embedded_count 等);`get_index_status` 增 `health` 段
+  (embedding 覆盖率 + fts 同步 + scan 元数据);CLI `doctor` 从三个静态布尔升级为
+  真健康度(edge_health:kind×resolved×classification 分布一眼判读索引质量)。
+- **工具描述场景锚(F6,预算内)**:search_entities(英文标识符而非中文业务词)/
+  semantic_search(概念查询用,知名用 search_entities)/trace_table_access(字段
+  消费盘点/加列影响面首选)。token 预算守卫测试仍绿(≤24576)。
+
+### 复核澄清(未改)
+
+- F1「resolved 率 50% 回归」:误诊——`resolved` 列是增量簿记(0=提取层事实边,
+  1=analysis 跨文件边),ruoyi 基线 26%/74% 同构,非回归。
+- F5「索引缩水 16-21%」:大概率可解释——0.1.52 会话已诊断该仓 3,981 文件
+  (submodule 未 checkout)从工作区消失,~21.6 实体/文件与缺口吻合,属工作区状态
+  变化而非提取回归(建议用户侧确认 submodule checkout 状态)。
+- F2「semantic_search 中英文双双失效」:成立但本轮不修(标识符分词重嵌,下版);
+  中文通道本身没坏(ruoyi「用户登录认证」0.61 命中),mes 失效根源是无 javadoc +
+  概念查询撞上 camelCase 不分词。
+
 ## [0.1.43] - 2026-09-22
 
 mes-activity 实测反馈(40 万实体 git submodule 双 SDK 拷贝仓库,以「独立事件执行
