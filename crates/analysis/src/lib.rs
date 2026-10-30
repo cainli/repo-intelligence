@@ -19,8 +19,12 @@ use serde_json::json;
 /// 悬空。做法:file_state 的值带版本前缀,版本变更后首次扫描新旧哈希不等 → 全量重提,
 /// 之后稳定回增量。
 /// v7(第五轮反馈 F1):同文件 calls 边 evidence 分类 Inferred→Resolved(提取层
-/// 边,evidence JSON 变化,不重提则新旧口径混存)。配合向量保留,重提不重嵌。
-const INDEX_FORMAT: u32 = 7;
+/// 边,evidence JSON 变化,不重提则新旧口径混存)。
+/// v8(第五轮反馈 F2):embedding 文本构造 v2(word_split 标识符分词)。文本变化
+/// 只改 text_hash 不够——存量实体不进 embed_inputs(embed 管道只收本轮变更文件
+/// 的实体),必须全量重提让全部实体重走管道,配合 EMBED_TEXT_FORMAT 指纹全部
+/// miss → 一次重嵌到位。大仓成本 = 全量重提(分钟级)+ 全量重嵌(与单独重嵌同)。
+const INDEX_FORMAT: u32 = 8;
 
 #[derive(Clone, Debug, Default)]
 pub struct ScanSummary {
@@ -78,6 +82,11 @@ pub struct ScanProgress {
 pub struct WorkspaceIndexer;
 
 impl WorkspaceIndexer {
+    /// embedding 文本构造格式指纹(参与 text_hash 前缀)。与 MODEL_ID 前缀同理:
+    /// 构造变化后旧向量自动失效。注意指纹只对**进入 embed 管道的实体**生效——
+    /// 存量实体要靠 INDEX_FORMAT 升级全量重提带进管道,两者必须配套(见 F2 教训)。
+    const EMBED_TEXT_FORMAT: &str = "v2";
+
     pub fn scan(&self, root: &Path, store: &mut dyn GraphStore) -> Result<ScanSummary> {
         self.scan_with_progress(root, store, |_| {})
     }
@@ -261,7 +270,16 @@ impl WorkspaceIndexer {
                 .iter()
                 .filter(|e| embed_seen.insert(e.id.0.clone()))
                 .map(|e| {
-                    let mut text = format!("{} {} {}", e.kind.as_str(), e.qualified_name, e.name);
+                    // 标识符分词(第五轮反馈 F2):qn/name 的 camelCase 经 WordPiece 切成
+                    // 碎片,与整句概念 query 的余弦低而平(ruoyi 实测英文 query top 全
+                    // 0.45-0.47 噪声)。分词后与 query 侧(word_split 同函数)进入同一
+                    // 语义空间。注意:文本变化 → text_hash 变 → 升级后首扫全量重嵌。
+                    let mut text = format!(
+                        "{} {} {}",
+                        e.kind.as_str(),
+                        repo_intelligence_embedding::word_split(&e.qualified_name),
+                        repo_intelligence_embedding::word_split(&e.name)
+                    );
                     if let Some(anns) = anns_by_owner.get(&e.id)
                         && !anns.is_empty()
                     {
@@ -270,7 +288,7 @@ impl WorkspaceIndexer {
                         text.push_str(
                             &anns
                                 .iter()
-                                .map(|a| format!("@{a}"))
+                                .map(|a| format!("@{}", repo_intelligence_embedding::word_split(a)))
                                 .collect::<Vec<_>>()
                                 .join(" "),
                         );
@@ -538,8 +556,9 @@ impl WorkspaceIndexer {
             let t = Instant::now();
             let text_hash = |text: &str| -> String {
                 format!(
-                    "{}:{}",
+                    "{}:{}:{}",
                     repo_intelligence_embedding::Embedder::MODEL_ID,
+                    Self::EMBED_TEXT_FORMAT,
                     blake3::hash(text.as_bytes()).to_hex()
                 )
             };

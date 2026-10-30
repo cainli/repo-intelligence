@@ -578,8 +578,10 @@ fn semantic_search_items(
     }
     let mut embedder =
         repo_intelligence_embedding::Embedder::new().context("加载 embedding 模型失败")?;
+    // query 侧同 word_split(第五轮反馈 F2):与实体侧分词文本同一语义空间;自然
+    // 语言 query 幂等无害(空格已分词,再跑不变)。
     let qvec = embedder
-        .embed(vec![query.to_string()])?
+        .embed(vec![repo_intelligence_embedding::word_split(query)])?
         .into_iter()
         .next()
         .ok_or_else(|| anyhow::anyhow!("query embedding 为空"))?;

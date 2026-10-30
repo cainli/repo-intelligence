@@ -11,12 +11,26 @@
 
 第五轮评测反馈(r1-1030 对照测试 + 补充探针)修复版:对照测试发现「B 组加载了
 索引工具但 3% 使用率」——根因不是工具没用,而是三个质量问题叠加让代理「调了也不敢
-采纳」。本轮修展示层可信度与回包经济;semantic_search 区分度(标识符分词重嵌)排
-下版。**INDEX_FORMAT 6→7**(同文件 calls 边分类修正,提取层变更),升级后首扫全量
-重提——配合向量保留,ruoyi 实测 790 文件重提 1.6s、embedded_count=0,大仓分钟级无感。
+采纳」。本轮一次修齐:展示层可信度 + 回包经济 + semantic_search 区分度。**INDEX_FORMAT
+6→8**(7=同文件 calls 分类修正;8=embedding 文本 v2)——升级后首扫全量重提 + **全量
+重嵌**(ruoyi 7128 实体重提 1.6s + 重嵌 32.6s;mes 级大仓重嵌 ≈1.5-2h,断点续扫
+兜底,`embedding_batch_delay_ms` 可控速)。
 
 ### Fixed
 
+- **semantic_search 概念查询区分度失效(P0,反馈 F2)**:embedding 文本此前原样拼
+  qn/name,camelCase 标识符经 WordPiece 切成碎片,与整句概念 query 的余弦低而平
+  (ruoyi 实测英文 query top 全是 0.45-0.47 无关噪声,目标方法零上榜)。新增
+  `word_split` 标识符分词(camelCase/Pascal/SNAKE/kebab/路径 → 空格词;不拆字母-
+  数字边界,`S27204`/`base64` 保持同形;中文透传),实体侧文本与 query 侧同函数
+  处理。ruoyi 实测:concept query 全部命中正确目标("generate captcha image" →
+  `WaveAndCircleCaptcha.createImage` 第一 0.553;"export table data to excel" →
+  `convertToExcelData`×3 0.61;"reset user password" → `resetUserPwd` 上榜);
+  plus-ui 前端("user list page table" → `listUser` 0.639)。中文 query 排序不变、
+  分数略降(0.614→0.542,分词文本稀释;排序仍正确,接受)。**INDEX_FORMAT 7→8 +
+  EMBED_TEXT_FORMAT v2 指纹**:只改文本不改指纹对存量库静默不生效(存量实体不进
+  embed 管道)——指纹 + 全量重提双保险,升级后首扫全量重嵌(ruoyi 7128 实体
+  32.6s;mes 级大仓 ≈1.5-2h,断点续扫兜底,可 `embedding_batch_delay_ms` 控速)。
 - **calls 边展示层恒 tentative(P0,反馈 F1)**:跨文件 calls(0.7 精确解析)、同文件
   calls、接口分发桥接、implements_method 此前全部 `EvidenceClass::Inferred`——
   `edge_view` 对 Inferred 恒置 tentative:true,最好的调用边与裸名匹配(0.5)展示
@@ -64,9 +78,9 @@
 - F5「索引缩水 16-21%」:大概率可解释——0.1.52 会话已诊断该仓 3,981 文件
   (submodule 未 checkout)从工作区消失,~21.6 实体/文件与缺口吻合,属工作区状态
   变化而非提取回归(建议用户侧确认 submodule checkout 状态)。
-- F2「semantic_search 中英文双双失效」:成立但本轮不修(标识符分词重嵌,下版);
-  中文通道本身没坏(ruoyi「用户登录认证」0.61 命中),mes 失效根源是无 javadoc +
-  概念查询撞上 camelCase 不分词。
+- F2「semantic_search 中英文双双失效」:成立,已修(见 Fixed);归因修正——
+  不是「中文弱」(中文通道靠 doc 在 ruoyi 一直可用),是 embedding 文本不分词对
+  **概念查询**(中英文皆是)的系统性失效。
 
 ## [0.1.43] - 2026-09-22
 

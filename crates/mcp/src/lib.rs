@@ -1495,7 +1495,9 @@ fn semantic_search(store: &SqliteGraphStore, query: &str, limit: usize) -> Resul
         }
         match guard.as_mut() {
             Some(e) => e
-                .embed(vec![query.to_string()])?
+                // query 侧同 word_split(第五轮反馈 F2):camelCase query 与实体侧
+                // 分词文本进入同一语义空间;自然语言 query 幂等无害。
+                .embed(vec![repo_intelligence_embedding::word_split(query)])?
                 .into_iter()
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("query embedding 为空"))?,

@@ -103,9 +103,93 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     if score.is_finite() { score } else { 0.0 }
 }
 
+/// 标识符分词(第五轮反馈 F2):camelCase/PascalCase/SNAKE/kebab/路径复合串拆成
+/// 空格分隔词,让「概念 query」与「标识符向量」进入同一语义空间。
+///
+/// 背景:embedding 文本此前原样拼 qn/name——`checkLoanTerms` 经 WordPiece 切成碎片,
+/// 与整句 query「check loan terms validation」的余弦低而平(ruoyi 实测英文概念 query
+/// top 全是 0.45-0.47 的噪声,核心方法零上榜)。分词后实体侧与 query 侧同函数处理,
+/// 幂等(已分词文本再跑不变,词内无 case/分隔符边界)。
+///
+/// 规则:①按非字母数字字符(`/ _ - . : # $ @` 与空白等)切段;②段内拆 case 边界
+/// (小写→大写;大写 run 后跟小写时,run 末位大写归下一段,`XMLHttpRequest` →
+/// `XML Http Request`);③**不拆字母-数字边界**(`base64`/`S27204`/`utf8` 保持原样,
+/// 哈希串/交易码拆了反而破坏与 query 的一致性);④中文等无 case 文字原样透传。
+pub fn word_split(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut current_word = String::new();
+    fn flush(out: &mut String, word: &mut String) {
+        if !word.is_empty() {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(word);
+            word.clear();
+        }
+    }
+    for ch in text.chars() {
+        if !ch.is_alphanumeric() {
+            flush(&mut out, &mut current_word);
+            continue;
+        }
+        // case 边界判定只对 ASCII 大小写有意义;非 ASCII(中文等)与数字只追加不触发。
+        let prev = current_word.chars().last();
+        let prev_lower = prev.is_some_and(|c| c.is_ascii_lowercase());
+        let prev_upper = prev.is_some_and(|c| c.is_ascii_uppercase());
+        if prev_lower && ch.is_ascii_uppercase() {
+            // 小写→大写:checkLoan → check | Loan
+            flush(&mut out, &mut current_word);
+            current_word.push(ch);
+        } else if prev_upper && ch.is_ascii_lowercase() && current_word.len() > 1 {
+            // 大写 run(≥2)后跟小写:run 末位大写归新词。XMLHttp → XML | Http;
+            // run 长度 1 时是普通 PascalCase 词首(Loan),不拆。
+            let last = current_word.pop();
+            flush(&mut out, &mut current_word);
+            current_word.push(last.unwrap_or(ch));
+            current_word.push(ch);
+        } else {
+            current_word.push(ch);
+        }
+    }
+    flush(&mut out, &mut current_word);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_split_camel_snake_kebab_and_paths() {
+        // camel / Pascal / 缩写 run
+        assert_eq!(word_split("checkLoanTerms"), "check Loan Terms");
+        assert_eq!(word_split("XMLHttpRequest"), "XML Http Request");
+        assert_eq!(word_split("getUserVO"), "get User VO");
+        assert_eq!(word_split("Loan"), "Loan");
+        // 分隔符族:snake / kebab / 路径 / qn 的 # 与 . 与 $
+        assert_eq!(word_split("user_name"), "user name");
+        assert_eq!(
+            word_split("ruoyi-modules/ruoyi-system"),
+            "ruoyi modules ruoyi system"
+        );
+        assert_eq!(
+            word_split(
+                "ruoyi-system/src/main/java/org/dromara/SysUserServiceImpl.java#selectUserById"
+            ),
+            "ruoyi system src main java org dromara Sys User Service Impl java select User By Id"
+        );
+        // 字母-数字边界不拆(哈希串/交易码/base64 与 query 保持同形)
+        assert_eq!(word_split("S27204"), "S27204");
+        assert_eq!(word_split("base64"), "base64");
+        assert_eq!(word_split("md5Hash"), "md5 Hash");
+        // 中文透传;幂等(已分词文本再跑不变)
+        assert_eq!(word_split("用户登录认证"), "用户登录认证");
+        assert_eq!(word_split("check Loan Terms"), "check Loan Terms");
+        assert_eq!(word_split("XML Http Request"), "XML Http Request");
+        // 空与纯分隔符
+        assert_eq!(word_split(""), "");
+        assert_eq!(word_split("---"), "");
+    }
 
     #[test]
     #[ignore] // 加载 ONNX 重,手动跑估算耗时。
