@@ -103,6 +103,18 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     if score.is_finite() { score } else { 0.0 }
 }
 
+/// embedding 文本构造格式指纹(v2 = word_split 标识符分词)。参与 text_hash 前缀,
+/// 与 MODEL_ID 共同标识「向量空间」——改文本构造**必须**同步升此值,旧向量随
+/// hash 失配自动失效(analysis 的 scan reconcile 段据此重嵌存量实体)。
+pub const EMBED_TEXT_FORMAT: &str = "v2";
+
+/// 当前向量空间的 text_hash 前缀(`{MODEL_ID}:{EMBED_TEXT_FORMAT}:`)。三处共用
+/// 单源:analysis 写入 text_hash、scan reconcile 粗筛、mcp/cli 查询过滤旧空间向量
+/// (旧向量与新版 query 余弦错标,宁可滤掉返回空 + hint)。
+pub fn text_hash_prefix() -> String {
+    format!("{}:{}:", Embedder::MODEL_ID, EMBED_TEXT_FORMAT)
+}
+
 /// 标识符分词(第五轮反馈 F2):camelCase/PascalCase/SNAKE/kebab/路径复合串拆成
 /// 空格分隔词,让「概念 query」与「标识符向量」进入同一语义空间。
 ///
@@ -142,10 +154,14 @@ pub fn word_split(text: &str) -> String {
             current_word.push(ch);
         } else if prev_upper && ch.is_ascii_lowercase() && current_word.len() > 1 {
             // 大写 run(≥2)后跟小写:run 末位大写归新词。XMLHttp → XML | Http;
-            // run 长度 1 时是普通 PascalCase 词首(Loan),不拆。
+            // run 长度 1 时是普通 PascalCase 词首(Loan),不拆。已知取舍:两字母
+            // 缩写后跟小写的形状无法规则区分 IDCard(→ID Card,对)与 IPv4(→
+            // I Pv4,不理想)——取拆,因 IDCard/VOList 类更常见;锁定见测试。
             let last = current_word.pop();
             flush(&mut out, &mut current_word);
-            current_word.push(last.unwrap_or(ch));
+            // prev_upper 分支前提:word 非空且末位是 ASCII 大写,pop 必成功;
+            // unwrap 而非兜底,前提被未来改动破坏时立刻炸而不是静默重字符。
+            current_word.push(last.expect("prev_upper guarantees a last char"));
             current_word.push(ch);
         } else {
             current_word.push(ch);
@@ -166,6 +182,10 @@ mod tests {
         assert_eq!(word_split("XMLHttpRequest"), "XML Http Request");
         assert_eq!(word_split("getUserVO"), "get User VO");
         assert_eq!(word_split("Loan"), "Loan");
+        // 两字母缩写 + 小写的形状:IDCard 拆对、IPv4 拆坏(I Pv4)——启发式固有
+        // 取舍(无法规则区分),锁定现状;若未来改规则,这条断言是决策点。
+        assert_eq!(word_split("IDCard"), "ID Card");
+        assert_eq!(word_split("IPv4Address"), "I Pv4 Address");
         // 分隔符族:snake / kebab / 路径 / qn 的 # 与 . 与 $
         assert_eq!(word_split("user_name"), "user name");
         assert_eq!(

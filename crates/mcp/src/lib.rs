@@ -1476,11 +1476,30 @@ fn semantic_search(store: &SqliteGraphStore, query: &str, limit: usize) -> Resul
         return Ok(json!({ "items": [], "count": 0, "hint": "empty query" }));
     }
     let all = store.get_all_embeddings()?;
+    // 旧向量空间过滤:换模型/文本格式升级后,未重嵌完(或 embedding=false 期间)的
+    // 存量向量与新版 query 余弦**错标**——分数看着合理但语义无关。宁可缺席:
+    // 只参与当前空间(text_hash 前缀)的向量,被滤掉时 hint 提示重扫。
+    let prefix = repo_intelligence_embedding::text_hash_prefix();
+    let stale = all
+        .iter()
+        .filter(|(_, _, h)| !h.starts_with(&prefix))
+        .count();
+    let all: Vec<_> = all
+        .into_iter()
+        .filter(|(_, _, h)| h.starts_with(&prefix))
+        .collect();
     if all.is_empty() {
+        let hint = if stale > 0 {
+            format!(
+                "{stale} 条旧空间向量被过滤(模型/文本格式升级后未重嵌)。重跑 scan 触发 reconcile。"
+            )
+        } else {
+            "无 embedding:未 scan 或 [index] embedding=false。scan 后再查。".to_string()
+        };
         return Ok(json!({
             "items": [],
             "count": 0,
-            "hint": "无 embedding:未 scan 或 [index] embedding=false。scan 后再查。"
+            "hint": hint
         }));
     }
     let qvec = {
@@ -1512,7 +1531,7 @@ fn semantic_search(store: &SqliteGraphStore, query: &str, limit: usize) -> Resul
     };
     let mut scored = all
         .into_iter()
-        .map(|(id, v)| (id, cosine(&qvec, &v)))
+        .map(|(id, v, _)| (id, cosine(&qvec, &v)))
         // 过滤非有限 score(双保险:cosine 已归 NaN→0):损坏 embedding 不会既破坏
         // 排序(NaN 与一切比 Equal)又让 json! 序列化 NaN 致 server panic。
         .filter(|(_, s)| s.is_finite())

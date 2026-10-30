@@ -82,10 +82,36 @@ pub struct ScanProgress {
 pub struct WorkspaceIndexer;
 
 impl WorkspaceIndexer {
-    /// embedding 文本构造格式指纹(参与 text_hash 前缀)。与 MODEL_ID 前缀同理:
-    /// 构造变化后旧向量自动失效。注意指纹只对**进入 embed 管道的实体**生效——
-    /// 存量实体要靠 INDEX_FORMAT 升级全量重提带进管道,两者必须配套(见 F2 教训)。
-    const EMBED_TEXT_FORMAT: &str = "v2";
+    /// 实体的向量化文本(增量 embed_inputs 与存量 reconcile 共用,防两处口径漂移)。
+    /// 标识符分词(第五轮反馈 F2):qn/name 的 camelCase 经 WordPiece 切成碎片,与
+    /// 整句概念 query 的余弦低而平;分词后与 query 侧(word_split 同函数)进入同一
+    /// 语义空间。
+    fn embed_text(entity: &Entity, anns: &[&str]) -> String {
+        let mut text = format!(
+            "{} {} {}",
+            entity.kind.as_str(),
+            repo_intelligence_embedding::word_split(&entity.qualified_name),
+            repo_intelligence_embedding::word_split(&entity.name)
+        );
+        if !anns.is_empty() {
+            // 带 @ 前缀,贴近 Java 源码与用户查询习惯。
+            text.push(' ');
+            text.push_str(
+                &anns
+                    .iter()
+                    .map(|a| format!("@{}", repo_intelligence_embedding::word_split(a)))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+        }
+        // 声明前置注释(mes-activity P2-5:业务语义全在中文注释里)。
+        // extract 层已 160 chars 硬截断,这里不再截。
+        if let Some(doc) = entity.metadata.get("doc").and_then(|v| v.as_str()) {
+            text.push(' ');
+            text.push_str(doc);
+        }
+        text
+    }
 
     pub fn scan(&self, root: &Path, store: &mut dyn GraphStore) -> Result<ScanSummary> {
         self.scan_with_progress(root, store, |_| {})
@@ -270,36 +296,11 @@ impl WorkspaceIndexer {
                 .iter()
                 .filter(|e| embed_seen.insert(e.id.0.clone()))
                 .map(|e| {
-                    // 标识符分词(第五轮反馈 F2):qn/name 的 camelCase 经 WordPiece 切成
-                    // 碎片,与整句概念 query 的余弦低而平(ruoyi 实测英文 query top 全
-                    // 0.45-0.47 噪声)。分词后与 query 侧(word_split 同函数)进入同一
-                    // 语义空间。注意:文本变化 → text_hash 变 → 升级后首扫全量重嵌。
-                    let mut text = format!(
-                        "{} {} {}",
-                        e.kind.as_str(),
-                        repo_intelligence_embedding::word_split(&e.qualified_name),
-                        repo_intelligence_embedding::word_split(&e.name)
-                    );
-                    if let Some(anns) = anns_by_owner.get(&e.id)
-                        && !anns.is_empty()
-                    {
-                        // 带 @ 前缀,贴近 Java 源码与用户查询习惯。
-                        text.push(' ');
-                        text.push_str(
-                            &anns
-                                .iter()
-                                .map(|a| format!("@{}", repo_intelligence_embedding::word_split(a)))
-                                .collect::<Vec<_>>()
-                                .join(" "),
-                        );
-                    }
-                    // 声明前置注释(mes-activity P2-5:业务语义全在中文注释里)。
-                    // extract 层已 160 chars 硬截断,这里不再截。
-                    if let Some(doc) = e.metadata.get("doc").and_then(|v| v.as_str()) {
-                        text.push(' ');
-                        text.push_str(doc);
-                    }
-                    (e.id.clone(), text)
+                    let anns = anns_by_owner
+                        .get(&e.id)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[]);
+                    (e.id.clone(), Self::embed_text(e, anns))
                 })
                 .collect()
         } else {
@@ -549,42 +550,88 @@ impl WorkspaceIndexer {
             t.elapsed().as_secs_f64()
         );
 
-        // 向量层:对本次变更实体生成 embedding(增量——仅 text_hash 变化才重新生成)。
-        // text_hash 带模型指纹前缀:换模型(v0.1.37 英文 → 多语)后旧向量自动失效重算,
-        // 防止"新模型查旧向量"的静默错配。
-        if config.index.embedding && !embed_inputs.is_empty() {
+        // 向量层:增量 + reconcile 双路径。
+        // 增量:本次变更实体按 text_hash 比对重嵌。text_hash 带模型/文本格式双指纹
+        // 前缀,换模型(v0.1.37)或改文本构造后旧向量自动失效重算。
+        // reconcile(code review 五轮 #1/#2):存量实体里 text_hash 前缀与当前格式
+        // 不符的(升级换代残留、批失败中止残留、模型加载失败残留)自动重建文本重嵌。
+        // 此前这些实体会**永久滞留旧空间向量**——file_state 已写,后续 scan 的
+        // embed_inputs 恒空,而 query 侧已在新空间,余弦分数静默错标(不是缺席)。
+        // 快路径零成本:前缀相符的实体不重建文本不算 hash,每轮只多一次 map 遍历。
+        if config.index.embedding {
             let t = Instant::now();
             let text_hash = |text: &str| -> String {
                 format!(
-                    "{}:{}:{}",
-                    repo_intelligence_embedding::Embedder::MODEL_ID,
-                    Self::EMBED_TEXT_FORMAT,
+                    "{}{}",
+                    repo_intelligence_embedding::text_hash_prefix(),
                     blake3::hash(text.as_bytes()).to_hex()
                 )
             };
+            let prefix = repo_intelligence_embedding::text_hash_prefix();
             let state = store.get_embedding_state()?;
-            // 筛 text_hash 变化(或新实体)。
-            let to_embed: Vec<(EntityId, String)> = embed_inputs
+            // 增量:变更实体全 hash 比对(文本可能变了)。
+            let mut to_embed: Vec<(EntityId, String)> = embed_inputs
                 .into_iter()
                 .filter(|(id, text)| {
                     let h = text_hash(text);
                     state.get(id).is_none_or(|old| *old != h)
                 })
                 .collect();
+            // reconcile:存量实体前缀粗筛——不符或无行则重建文本重嵌。变更实体
+            // (to_embed 已含)跳过避免重复;孤儿向量(state 有行、实体已删)由
+            // get_all_embeddings 的 JOIN 过滤,不在此处理。
+            let changed: HashSet<&EntityId> = to_embed.iter().map(|(id, _)| id).collect();
+            let mut reconciled = 0usize;
+            let stale: Vec<&Entity> = all_entities
+                .iter()
+                .filter(|e| {
+                    !changed.contains(&e.id)
+                        && state.get(&e.id).is_none_or(|old| !old.starts_with(&prefix))
+                })
+                .collect();
+            if !stale.is_empty() {
+                // 全库注解画像(与 embed_inputs 同构,但来自 store 的 Annotated 边)。
+                let ann_name_by_id: HashMap<&EntityId, &str> = all_entities
+                    .iter()
+                    .filter(|e| e.kind == EntityKind::Annotation)
+                    .map(|e| (&e.id, e.name.as_str()))
+                    .collect();
+                let mut anns_by_owner: HashMap<&EntityId, Vec<&str>> = HashMap::new();
+                for edge in &extract_edges {
+                    if edge.kind == EdgeKind::Annotated
+                        && let Some(name) = ann_name_by_id.get(&edge.target)
+                    {
+                        anns_by_owner.entry(&edge.source).or_default().push(*name);
+                    }
+                }
+                reconciled = stale.len();
+                for entity in stale {
+                    let anns = anns_by_owner
+                        .get(&entity.id)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[]);
+                    to_embed.push((entity.id.clone(), Self::embed_text(entity, anns)));
+                }
+            }
             let n = to_embed.len();
+            if reconciled > 0 {
+                eprintln!(
+                    "[ri-diag] embedding reconcile: {reconciled} entities carry stale-format vectors, re-embedding"
+                );
+            }
+            let mut embedded = 0usize;
             if n > 0 {
                 // 大仓库首扫(数十万实体)推理可达分钟级:分批推理并节流输出进度,
                 // 消除"全量一次调用 + 零中间日志"被误判为卡死。批级容错——单批失败
-                // 记 warning 继续,连续 3 批失败视为模型故障放弃剩余;向量缺席即不参与
-                // 语义检索,与 [index] embedding=false 部分生效同语义,不阻塞 scan。
-                // 每批立即落库(set_embeddings 单事务):内存峰值 O(批) 而非 O(全量)
-                // (56 万实体全量攒向量 ≈ 860MB),中断/放弃时已落库向量保留。
-                // embedding_threads 封顶 ort 线程、embedding_batch_delay_ms 批间休眠,
-                // 组合实现温和后台索引,防止目标机器被推理打满(默认 0 = 全速)。
+                // 记 warning 继续,连续 3 批失败视为模型故障放弃剩余;失败的实体保留
+                // 旧向量,由**下一轮 scan 的 reconcile 段自动重试**(file_state 照写,
+                // 提取层不受向量层故障牵连)。每批立即落库(set_embeddings 单事务):
+                // 内存峰值 O(批) 而非 O(全量)(56 万实体全量攒向量 ≈ 860MB),中断/
+                // 放弃时已落库向量保留。embedding_threads 封顶 ort 线程、
+                // embedding_batch_delay_ms 批间休眠,防目标机器被推理打满(默认 0 全速)。
                 const EMBED_BATCH: usize = 2048;
                 let delay = Duration::from_millis(config.index.embedding_batch_delay_ms);
                 let mut done = 0usize;
-                let mut embedded = 0usize;
                 let mut consecutive_fails = 0u32;
                 let mut last_report = Instant::now();
                 match repo_intelligence_embedding::Embedder::new_with_threads(
@@ -635,20 +682,24 @@ impl WorkspaceIndexer {
                         }
                         if done < n {
                             eprintln!(
-                                "[ri-diag] embedding 放弃剩余 {} 条(连续批次失败,已得 {embedded} 条向量)",
+                                "[ri-diag] embedding 放弃剩余 {} 条(连续批次失败,已得 {embedded} 条向量;下轮 scan reconcile 自动重试)",
                                 n - done
                             );
                         }
                     }
                     Err(e) => {
-                        eprintln!("[ri-diag] embedding 跳过(模型加载失败,不阻塞 scan): {e}")
+                        eprintln!(
+                            "[ri-diag] embedding 跳过(模型加载失败,不阻塞 scan;下轮 scan reconcile 自动重试): {e}"
+                        )
                     }
                 }
             }
             summary.embedding_ms = t.elapsed().as_millis() as u64;
-            summary.embedded_count = n;
+            // 实际成功数而非计划数:批失败/中止时 n 与 embedded 不等,scan_meta 是
+            // 运维判断「重嵌完成没」的依据,虚报 n 会掩盖 reconcile 待办。
+            summary.embedded_count = embedded;
             eprintln!(
-                "[ri-diag] embedding: {n} entities in {:.2}s",
+                "[ri-diag] embedding: {embedded}/{n} entities in {:.2}s",
                 t.elapsed().as_secs_f64()
             );
         }
@@ -2727,6 +2778,48 @@ fn plane_rank(kind: EntityKind) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// code review 五轮 #1:embedding 批失败/模型故障后 file_state 照写,存量实体
+    /// 旧空间向量此前**永久滞留**(query 已换新空间 → 余弦静默错标)。reconcile 段
+    /// 按 text_hash 前缀筛出陈旧行自动重嵌——全 unchanged 的增量 scan 也要触发。
+    #[test]
+    fn scan_reconciles_stale_embedding_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("Svc.java");
+        std::fs::write(
+            &src,
+            "public class Svc {\n  public String greet(String name) { return name; }\n}\n",
+        )
+        .unwrap();
+        let db = dir.path().join("ws.sqlite");
+        let mut store = repo_intelligence_graph::SqliteGraphStore::open(&db).unwrap();
+        let indexer = WorkspaceIndexer;
+        indexer.scan(dir.path(), &mut store).unwrap();
+        // 首扫后应有当前空间向量。
+        let prefix = repo_intelligence_embedding::text_hash_prefix();
+        let state = store.get_embedding_state().unwrap();
+        assert!(!state.is_empty());
+        assert!(state.values().all(|h| h.starts_with(&prefix)));
+
+        // 模拟故障残留:用 set_embeddings upsert 把一条 text_hash 覆写成旧空间前缀。
+        let stale_id = state.iter().next().unwrap().0.clone();
+        store
+            .set_embeddings(&[(stale_id, vec![0.1; 8], "oldmodel:v1:deadbeef".to_string())])
+            .unwrap();
+        // 全 unchanged 重扫(无文件变化,增量路径 embed_inputs 为空)。
+        let summary = indexer.scan(dir.path(), &mut store).unwrap();
+        assert_eq!(summary.files_extracted, 0, "增量无文件变化");
+        assert!(
+            summary.embedded_count >= 1,
+            "reconcile 重嵌陈旧行: {summary:?}"
+        );
+        let state = store.get_embedding_state().unwrap();
+        assert!(
+            state.values().all(|h| h.starts_with(&prefix)),
+            "陈旧前缀应全部修复: {:?}",
+            state.values().take(3).collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn aspectj_regex_handles_recursive_and_suffix_wildcards() {

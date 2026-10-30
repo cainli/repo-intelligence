@@ -570,10 +570,27 @@ fn semantic_search_items(
         return Ok(Vec::new());
     }
     let all = store.get_all_embeddings()?;
+    // 旧向量空间过滤(同 MCP semantic_search):换模型/文本格式升级后未重嵌的存量
+    // 向量与新版 query 余弦错标,宁可缺席。被滤掉时提示重扫触发 reconcile。
+    let prefix = repo_intelligence_embedding::text_hash_prefix();
+    let stale = all
+        .iter()
+        .filter(|(_, _, h)| !h.starts_with(&prefix))
+        .count();
+    let all: Vec<_> = all
+        .into_iter()
+        .filter(|(_, _, h)| h.starts_with(&prefix))
+        .collect();
     if all.is_empty() {
         // 对齐 MCP semantic_search 的降级:输出空结果 + 提示,而非硬报错(失败语义不同:
         // 索引存在但无向量是配置态,不是查询失败)。
-        eprintln!("hint: 无 embedding——未 scan 或配置 [index] embedding=false。scan 后再查。");
+        if stale > 0 {
+            eprintln!(
+                "hint: {stale} 条旧空间向量被过滤(模型/文本格式升级后未重嵌)。重跑 scan 触发 reconcile。"
+            );
+        } else {
+            eprintln!("hint: 无 embedding——未 scan 或配置 [index] embedding=false。scan 后再查。");
+        }
         return Ok(Vec::new());
     }
     let mut embedder =
@@ -587,7 +604,7 @@ fn semantic_search_items(
         .ok_or_else(|| anyhow::anyhow!("query embedding 为空"))?;
     let mut scored: Vec<(EntityId, f32)> = all
         .into_iter()
-        .map(|(id, v)| (id, repo_intelligence_embedding::cosine(&qvec, &v)))
+        .map(|(id, v, _)| (id, repo_intelligence_embedding::cosine(&qvec, &v)))
         .filter(|(_, s)| s.is_finite())
         .collect();
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));

@@ -7,6 +7,25 @@
 
 ## [Unreleased]
 
+### Fixed(0.1.53 code review 补强)
+
+- **embedding 故障后陈旧向量永久滞留(review #1)**:批失败 3 连续中止/模型加载
+  失败后 file_state 照写,后续 scan 的 embed_inputs 恒空——受影响实体保留**旧向量
+  空间**的向量,而 query 侧已在新空间,余弦**静默错标**(分数看着合理但语义无关,
+  比缺席更糟)。新增 scan reconcile 段:按 `text_hash_prefix()`(embedding crate
+  单源:MODEL_ID + EMBED_TEXT_FORMAT)粗筛存量实体,前缀不符即重建文本重嵌;
+  故障中止后下轮 scan 自动重试。快路径零成本(前缀相符不重建文本不算 hash,
+  ruoyi 稳态实测 reconcile 零触发)。**副产物:未来改 embedding 文本构造不再需要
+  INDEX_FORMAT 升级配套**(review #2 的根治方案——reconcile 直接覆盖存量实体)。
+- **旧空间向量参与查询(review #1 连带)**:mcp/cli semantic_search 过滤
+  text_hash 前缀不符的向量(get_all_embeddings 随行返回 text_hash)——宁可缺席
+  + hint(「N 条旧空间向量被过滤,重跑 scan 触发 reconcile」)也不错标。
+- **embedded_count 虚报(review #3)**:scan 摘要/scan_meta 报实际成功数而非计划
+  数——批失败中止时运维据 scan_meta 判断「重嵌完成没」不再被误导。
+- `word_split` 两字母缩写形状(review #4):`IPv4Address` → `I Pv4 Address`(与
+  `IDCard` → `ID Card` 无规则可分),启发式固有取舍,测试锁定现状 + 注释说明;
+  pop 死分支(review #6)改 expect 显式不变量。
+
 ## [0.1.53] - 2026-10-30
 
 第五轮评测反馈(r1-1030 对照测试 + 补充探针)修复版:对照测试发现「B 组加载了

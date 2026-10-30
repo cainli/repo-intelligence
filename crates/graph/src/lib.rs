@@ -85,8 +85,9 @@ pub trait GraphStore {
     fn get_embedding_state(&self) -> Result<HashMap<EntityId, String>> {
         Ok(HashMap::new())
     }
-    /// 向量层:读取全部 entity_id → embedding(语义检索查询用,应用层算余弦)。
-    fn get_all_embeddings(&self) -> Result<Vec<(EntityId, Vec<f32>)>> {
+    /// 向量层:读取全部 entity_id → embedding + text_hash(语义检索查询用,应用层
+    /// 算余弦;text_hash 供调用方过滤旧向量空间)。
+    fn get_all_embeddings(&self) -> Result<Vec<(EntityId, Vec<f32>, String)>> {
         Ok(Vec::new())
     }
 
@@ -1119,11 +1120,12 @@ impl GraphStore for SqliteGraphStore {
         Ok(map)
     }
 
-    fn get_all_embeddings(&self) -> Result<Vec<(EntityId, Vec<f32>)>> {
+    fn get_all_embeddings(&self) -> Result<Vec<(EntityId, Vec<f32>, String)>> {
         // JOIN entity 过滤孤儿向量:delete_file_subtree 不再级联删向量(P1-C′ 断点续扫),
-        // 真删除文件的向量行残留于此,读时排除,不进语义检索候选。
+        // 真删除文件的向量行残留于此,读时排除,不进语义检索候选。text_hash 随行返回,
+        // 供调用方(mcp/cli)过滤旧向量空间——旧空间向量与新版 query 余弦错标,宁可缺席。
         let mut stmt = self.connection.prepare(
-            "SELECT e.entity_id, e.embedding, e.dim FROM entity_embedding e \
+            "SELECT e.entity_id, e.embedding, e.dim, e.text_hash FROM entity_embedding e \
              JOIN entity ON entity.id = e.entity_id",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -1131,11 +1133,12 @@ impl GraphStore for SqliteGraphStore {
                 row.get::<_, String>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
                 row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, blob, dim) = row?;
+            let (id, blob, dim, text_hash) = row?;
             let vec: Vec<f32> = blob
                 .as_chunks::<4>()
                 .0
@@ -1154,7 +1157,7 @@ impl GraphStore for SqliteGraphStore {
                 );
                 continue;
             }
-            out.push((EntityId(id), vec));
+            out.push((EntityId(id), vec, text_hash));
         }
         Ok(out)
     }
@@ -1823,7 +1826,7 @@ mod tests {
 
         let all = store.get_all_embeddings().unwrap();
         assert_eq!(all.len(), 1, "孤儿 C 的向量不进候选: {all:?}");
-        assert!(all.iter().any(|(eid, _)| *eid == id("G")));
+        assert!(all.iter().any(|(eid, _, _)| *eid == id("G")));
     }
 
     /// 批量删除 = 逐个删除的等价性守卫(实体/边/FTS 三层全等)。
