@@ -252,7 +252,7 @@ fn tool_specs() -> Vec<ToolSpec> {
     let mut specs = vec![
         ToolSpec {
             name: "scan_workspace",
-            description: "Index a workspace. Returns counts by kind + excluded dirs.",
+            description: "Index a workspace (repository/workspace arg = scan root, valid on all servers). Returns counts by kind + excluded dirs.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -347,7 +347,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "get_clusters",
-            description: "Architecture communities (label propagation over calls/injects/declares/superclass_of/implements). Omit cluster_id to list clusters; else list members.",
+            description: "Module boundaries / cross-directory coupling: communities over calls/injects/declares. Omit cluster_id to list clusters; else list members.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -368,7 +368,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "analyze_change",
-            description: "Structured change impact (field rename/type/nullability...). Paginated findings with bounded traversal.",
+            description: "Run before field rename/type/nullability changes: structured impact with bounded traversal. Paginated findings.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -402,12 +402,6 @@ fn tool_specs() -> Vec<ToolSpec> {
                 },
                 "required": ["findings", "open_questions", "total", "limit", "offset", "has_more"]
             }),
-        },
-        ToolSpec {
-            name: "analyze_requirement",
-            description: "Requirement-keyword to candidate entities (substring). Not semantic search.",
-            input_schema: search_input,
-            output_schema: search_output,
         },
         ToolSpec {
             name: "trace_callers",
@@ -592,7 +586,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         // (joins/聚合/CTE),写语句与堆叠语句在 graph 层被拒;行数与单元格双重封顶。
         ToolSpec {
             name: "query_sql",
-            description: "Read-only SQL over the index SQLite (entity/edge tables). Full SELECT/WITH freedom incl. joins, aggregates, CTEs. Writes and multiple statements rejected.",
+            description: "Read-only SQL over the index SQLite. Query the v_edge/v_entity VIEWS (API field names: source/target/confidence/tentative), not raw tables. SELECT/WITH/CTEs; writes rejected.",
             input_schema: json!({
                 "type": "object", "additionalProperties": false,
                 "properties": {
@@ -1008,18 +1002,6 @@ fn call_tool(request: &Value, database: Option<&Path>, base: &Path) -> Result<Va
             let cluster_id = arguments["cluster_id"].as_u64();
             let limit = parse_limit(arguments).clamp(1, MAX_PAGE_LIMIT);
             get_clusters(&store, cluster_id, limit)?
-        }
-        "analyze_requirement" => {
-            let store = SqliteGraphStore::open(&path)?;
-            let mut result = run_search(&store, arguments, None)?;
-            if result["count"].as_u64() == Some(0) {
-                result["hint"] = json!(
-                    "No indexed entity name contains this text. This tool matches entity \
-                     names/qualified names (classes, fields, tables, endpoints) by substring, \
-                     not free text or natural language; try a concrete identifier."
-                );
-            }
-            result
         }
         "analyze_change" => {
             let change: ChangeRequest = serde_json::from_value(arguments.clone())?;
@@ -1612,7 +1594,7 @@ fn semantic_search(store: &SqliteGraphStore, query: &str, limit: usize) -> Resul
 // cosine 已上移到 embedding crate(mcp 与 cli semantic-search 共用,避免复制漂移)。
 
 /// Shared body of the three substring-search tools (search_entities,
-/// find_endpoint, analyze_requirement): parse query/limit/offset/verbose, run the
+/// find_endpoint): parse query/limit/offset/verbose, run the
 /// filtered search, and serialize items through the compact-or-verbose view. The
 /// caller still owns the empty-result `hint` — each tool explains a miss differently
 /// (empty index vs. non-Spring endpoint vs. non-substring query).

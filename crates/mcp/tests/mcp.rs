@@ -564,7 +564,7 @@ fn empty_search_attaches_a_hint_instead_of_silent_zero() {
     let database = directory.path().join("graph.sqlite");
     drop(SqliteGraphStore::open(&database).unwrap());
 
-    let input = br#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"analyze_requirement","arguments":{"query":"nonexistent"}}}
+    let input = br#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"search_entities","arguments":{"query":"nonexistent"}}}
 "#;
     let mut output = Vec::new();
     repo_intelligence_mcp::serve(
@@ -577,11 +577,12 @@ fn empty_search_attaches_a_hint_instead_of_silent_zero() {
     let response: serde_json::Value = serde_json::from_slice(output.trim_ascii()).unwrap();
     let structured = &response["result"]["structuredContent"];
     assert_eq!(structured["count"], 0);
+    // 空索引的 hint 指向 scan_workspace(非静默 0);有索引而无命中才是 substring 提示。
     assert!(
         structured["hint"]
             .as_str()
-            .is_some_and(|hint| hint.contains("substring")),
-        "empty result should hint at substring matching, got: {structured}"
+            .is_some_and(|hint| hint.contains("scan_workspace")),
+        "empty-index result should hint at scanning, got: {structured}"
     );
 }
 

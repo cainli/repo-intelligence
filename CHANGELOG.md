@@ -7,6 +7,20 @@
 
 ## [Unreleased]
 
+### Changed(MCP 接口检视)
+
+- **移除 `analyze_requirement` 工具(接口变更)**:实现与 `search_entities` 完全
+  同款(同 filter 同管道,仅空结果 hint 文案不同),占 tools/list 预算 6%——18 工具
+  收敛为 17,预算余量 1050B→2377B。调用方请改用 `search_entities`。
+- **query_sql 描述指路 `v_edge`/`v_entity` 视图**:反馈者两轮直查 `edge` 底表报
+  no such column(第六轮 P2-7),视图早在库里、schema 清单里也有,但工具描述
+  不说——现在首句就是「Query the v_edge/v_entity VIEWS, not raw tables」。
+- **scan_workspace 描述补 repository 新语义**:0.1.55 的单库 fail-loud 只针对
+  查询类工具,scan_workspace 的 repository(扫描根)在所有部署形态下合法——
+  描述现在说清。
+- analyze_change 补场景锚(Run before field rename/type changes)、get_clusters
+  补场景锚(Module boundaries / cross-directory coupling)。
+
 ## [0.1.55] - 2026-10-30
 
 第六轮反馈(0.1.54 实测验证)修复版。无格式变更、无重提/重嵌成本。
